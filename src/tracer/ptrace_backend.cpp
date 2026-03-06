@@ -18,47 +18,10 @@
 #define __WALL 0x40000000
 #endif
 
-#ifndef PTRACE_O_TRACESYSGOOD
-#define PTRACE_O_TRACESYSGOOD 0x00000001
-#endif
-#ifndef PTRACE_O_TRACEFORK
-#define PTRACE_O_TRACEFORK 0x00000002
-#endif
-#ifndef PTRACE_O_TRACEVFORK
-#define PTRACE_O_TRACEVFORK 0x00000004
-#endif
-#ifndef PTRACE_O_TRACECLONE
-#define PTRACE_O_TRACECLONE 0x00000008
-#endif
-#ifndef PTRACE_O_TRACEEXEC
-#define PTRACE_O_TRACEEXEC 0x00000010
-#endif
-#ifndef PTRACE_O_TRACEEXIT
-#define PTRACE_O_TRACEEXIT 0x00000040
-#endif
-
-#ifndef PTRACE_EVENT_FORK
-#define PTRACE_EVENT_FORK 1
-#endif
-#ifndef PTRACE_EVENT_VFORK
-#define PTRACE_EVENT_VFORK 2
-#endif
-#ifndef PTRACE_EVENT_CLONE
-#define PTRACE_EVENT_CLONE 3
-#endif
-#ifndef PTRACE_EVENT_EXEC
-#define PTRACE_EVENT_EXEC 4
-#endif
-#ifndef PTRACE_EVENT_EXIT
-#define PTRACE_EVENT_EXIT 6
-#endif
-
-#ifndef PTRACE_SETOPTIONS
-#define PTRACE_SETOPTIONS 0x4200
-#endif
-#ifndef PTRACE_GETEVENTMSG
-#define PTRACE_GETEVENTMSG 0x4201
-#endif
+// Wrapper to cast request to enum __ptrace_request (required by glibc)
+static long bd_ptrace(int request, pid_t pid, void* addr, void* data) {
+    return ptrace(static_cast<__ptrace_request>(request), pid, addr, data);
+}
 
 namespace bdtrace {
 
@@ -90,7 +53,7 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
 
     if (pid == 0) {
         // Child process
-        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        bd_ptrace(PTRACE_TRACEME, 0, 0, 0);
         raise(SIGSTOP);
 
         // Build argv for execvp
@@ -135,7 +98,7 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     LOG_INFO("Tracing PID %d: %s", pid, rec.cmdline.c_str());
 
     // Resume with syscall tracing
-    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
 
     running_ = true;
     return 0;
@@ -149,7 +112,7 @@ void PtraceBackend::setup_child(int pid) {
               | PTRACE_O_TRACEEXEC
               | PTRACE_O_TRACEEXIT;
 
-    if (ptrace(PTRACE_SETOPTIONS, pid, 0, opts) < 0) {
+    if (bd_ptrace(PTRACE_SETOPTIONS, pid, 0, reinterpret_cast<void*>(opts)) < 0) {
         LOG_WARN("PTRACE_SETOPTIONS failed for %d: %s", pid, strerror(errno));
     }
 }
@@ -189,28 +152,28 @@ int PtraceBackend::run_event_loop() {
 
         if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
             handle_fork_event(pid);
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else if (event == PTRACE_EVENT_EXEC) {
             handle_exec_event(pid);
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else if (event == PTRACE_EVENT_EXIT) {
             handle_exit_event(pid, status);
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else if (sig == (SIGTRAP | 0x80)) {
             // Syscall stop
             handle_syscall_stop(pid);
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else if (sig == SIGTRAP) {
             // Generic trap, just continue
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else if (sig == SIGSTOP && !procs_[pid].traced) {
             // Initial stop of new child
             setup_child(pid);
             procs_[pid].traced = true;
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, 0);
         } else {
             // Deliver the signal to the tracee
-            ptrace(PTRACE_SYSCALL, pid, 0, sig);
+            bd_ptrace(PTRACE_SYSCALL, pid, 0, reinterpret_cast<void*>(static_cast<long>(sig)));
         }
     }
 
@@ -231,7 +194,7 @@ void PtraceBackend::handle_syscall_stop(int pid) {
     ProcessState& ps = it->second;
 
     struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
+    if (bd_ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
 
     if (!ps.in_syscall) {
         // Syscall entry
@@ -249,7 +212,7 @@ void PtraceBackend::handle_syscall_stop(int pid) {
 
 void PtraceBackend::handle_syscall_entry(int pid, ProcessState& ps, long syscall_nr) {
     struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
+    if (bd_ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
 
     if (syscall_nr == SYS_OPEN_NR) {
         ps.pending_path_addr = REG_ARG0(regs);
@@ -266,7 +229,7 @@ void PtraceBackend::handle_syscall_exit(int pid, ProcessState& ps) {
     if (nr != SYS_OPEN_NR && nr != SYS_OPENAT_NR) return;
 
     struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
+    if (bd_ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
 
     long retval = REG_RETVAL(regs);
     // Check if syscall failed (fd < 0)
@@ -298,7 +261,7 @@ void PtraceBackend::handle_syscall_exit(int pid, ProcessState& ps) {
 
 void PtraceBackend::handle_fork_event(int pid) {
     unsigned long child_pid = 0;
-    ptrace(PTRACE_GETEVENTMSG, pid, 0, &child_pid);
+    bd_ptrace(PTRACE_GETEVENTMSG, pid, 0, &child_pid);
 
     if (child_pid == 0) return;
 
@@ -319,16 +282,6 @@ void PtraceBackend::handle_exec_event(int pid) {
     std::string cmdline = read_cmdline(pid);
     LOG_DEBUG("Exec: %d -> %s", pid, cmdline.c_str());
 
-    // Update the process record with the new command
-    // We re-insert; the DB will update via INSERT OR REPLACE
-    // Actually we just log it; the original insert has the pid already
-    // For simplicity, we update the cmdline by inserting a new record
-    // but since pid is PRIMARY KEY, we need to use a different approach.
-    // Let's update via direct SQL or just accept the original cmdline.
-    // For now, the cmdline from fork may be the parent's; exec is where
-    // we get the real command. We'll update it.
-
-    // Use a direct update approach
     ProcessRecord rec;
     rec.pid = pid;
     if (procs_.find(pid) != procs_.end()) {
@@ -346,7 +299,7 @@ void PtraceBackend::handle_exec_event(int pid) {
 
 void PtraceBackend::handle_exit_event(int pid, int status) {
     unsigned long exit_status = 0;
-    ptrace(PTRACE_GETEVENTMSG, pid, 0, &exit_status);
+    bd_ptrace(PTRACE_GETEVENTMSG, pid, 0, &exit_status);
     LOG_DEBUG("Exit event: %d status=%lu", pid, exit_status);
 }
 
@@ -356,7 +309,7 @@ std::string PtraceBackend::read_string(int pid, unsigned long addr, size_t max_l
 
     for (size_t i = 0; i < max_len; i += sizeof(long)) {
         errno = 0;
-        long word = ptrace(PTRACE_PEEKDATA, pid, addr + i, 0);
+        long word = bd_ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(addr + i), 0);
         if (errno != 0) break;
 
         const char* p = reinterpret_cast<const char*>(&word);
