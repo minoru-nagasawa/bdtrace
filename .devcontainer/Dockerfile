@@ -1,19 +1,15 @@
-FROM centos:7
+FROM ubuntu:22.04
 
-# Switch to vault repos (CentOS 7 is EOL)
-RUN sed -i 's/^mirrorlist/#mirrorlist/' /etc/yum.repos.d/*.repo && \
-    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/*.repo
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install development tools
-RUN yum install -y \
+RUN apt-get update && apt-get install -y \
     gcc \
-    gcc-c++ \
+    g++ \
     make \
     gdb \
     strace \
     wget \
     unzip \
-    && yum clean all
+    && rm -rf /var/lib/apt/lists/*
 
-# Create workspace
 WORKDIR /workspace
