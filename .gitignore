@@ -8,5 +8,7 @@ bdtrace.db
 *.db
 vendor/sqlite3.c
 vendor/sqlite3.h
-.vscode/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
 .claude

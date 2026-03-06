@@ -10,5 +10,12 @@
         "--cap-add=SYS_PTRACE",
         "--security-opt", "seccomp=unconfined"
     ],
-    "postCreateCommand": "bash scripts/fetch_sqlite.sh && make clean && make"
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools"
+            ]
+        }
+    },
+    "postCreateCommand": "bash scripts/fetch_sqlite.sh && make clean && make DEBUG=1"
 }

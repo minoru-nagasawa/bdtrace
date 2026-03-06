@@ -1,0 +1,29 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build-debug",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean", "&&", "make", "DEBUG=1"],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "build-debug-tests",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean", "&&", "make", "DEBUG=1", "test_database", "test_trace_simple", "test_trace_fork", "test_trace_file_io"],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "build-release",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean", "&&", "make"],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}

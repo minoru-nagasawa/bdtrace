@@ -1,0 +1,68 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "bdtrace - trace command",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/bdtrace",
+            "args": ["/bin/true"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Follow child processes",
+                    "text": "set follow-fork-mode parent",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Detach on fork to allow ptrace of children",
+                    "text": "set detach-on-fork on",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Pretty printing",
+                    "text": "set print pretty on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build-debug"
+        },
+        {
+            "name": "bdview - view trace",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/bdview",
+            "args": ["tree", "bdtrace.db"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Pretty printing",
+                    "text": "set print pretty on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build-debug"
+        },
+        {
+            "name": "test_database",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_database",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "preLaunchTask": "build-debug-tests"
+        }
+    ]
+}

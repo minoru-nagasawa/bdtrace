@@ -1,7 +1,15 @@
 CC  = gcc
 CXX = g++
-CFLAGS   = -Wall -O2
-CXXFLAGS = -Wall -O2 -Ivendor -Isrc
+
+# DEBUG=1 make で デバッグビルド
+ifdef DEBUG
+  CFLAGS   = -Wall -g -O0
+  CXXFLAGS = -Wall -g -O0 -Ivendor -Isrc
+else
+  CFLAGS   = -Wall -O2
+  CXXFLAGS = -Wall -O2 -Ivendor -Isrc
+endif
+
 LDFLAGS  = -lpthread -ldl
 
 # Sources
