@@ -1,0 +1,12 @@
+*.o
+*.d
+bdtrace
+bdview
+test_*
+!tests/test_*
+bdtrace.db
+*.db
+vendor/sqlite3.c
+vendor/sqlite3.h
+.vscode/
+.claude

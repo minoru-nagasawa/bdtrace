@@ -1,0 +1,10 @@
+#ifndef BDTRACE_SCHEMA_H
+#define BDTRACE_SCHEMA_H
+
+namespace bdtrace {
+
+const char* get_schema_sql();
+
+} // namespace bdtrace
+
+#endif // BDTRACE_SCHEMA_H

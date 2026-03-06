@@ -1,0 +1,43 @@
+#ifndef BDTRACE_PTRACE_BACKEND_H
+#define BDTRACE_PTRACE_BACKEND_H
+
+#include "tracer_backend.h"
+#include "process_state.h"
+#include "trace_session.h"
+
+#include <map>
+#include <string>
+
+namespace bdtrace {
+
+class PtraceBackend : public ITracerBackend {
+public:
+    explicit PtraceBackend(TraceSession& session);
+    ~PtraceBackend();
+
+    int start(const std::vector<std::string>& argv);
+    int run_event_loop();
+    void stop();
+
+private:
+    TraceSession& session_;
+    std::map<int, ProcessState> procs_;
+    int root_pid_;
+    volatile bool running_;
+
+    void setup_child(int pid);
+    void handle_syscall_stop(int pid);
+    void handle_syscall_entry(int pid, ProcessState& ps, long syscall_nr);
+    void handle_syscall_exit(int pid, ProcessState& ps);
+    void handle_fork_event(int pid);
+    void handle_exec_event(int pid);
+    void handle_exit_event(int pid, int status);
+
+    std::string read_string(int pid, unsigned long addr, size_t max_len = 4096);
+    std::string read_cmdline(int pid);
+    bool should_filter_path(const std::string& path);
+};
+
+} // namespace bdtrace
+
+#endif // BDTRACE_PTRACE_BACKEND_H
