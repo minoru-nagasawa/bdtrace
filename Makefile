@@ -1,13 +1,13 @@
 CC  = gcc
 CXX = g++
 
-# DEBUG=1 make で デバッグビルド
+# DEBUG=1 make for debug build
 ifdef DEBUG
   CFLAGS   = -Wall -g -O0
-  CXXFLAGS = -Wall -g -O0 -Ivendor -Isrc
+  CXXFLAGS = -Wall -g -O0 -std=c++03 -Ivendor -Isrc
 else
   CFLAGS   = -Wall -O2
-  CXXFLAGS = -Wall -O2 -Ivendor -Isrc
+  CXXFLAGS = -Wall -O2 -std=c++03 -Ivendor -Isrc
 endif
 
 LDFLAGS  = -lpthread -ldl

@@ -1,8 +1,8 @@
-FROM centos:5
+FROM centos:7
 
-# Switch to vault repos (CentOS 5 is EOL)
+# Switch to vault repos (CentOS 7 is EOL)
 RUN sed -i 's/^mirrorlist/#mirrorlist/' /etc/yum.repos.d/*.repo && \
-    sed -i 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/5.11|' /etc/yum.repos.d/*.repo
+    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/*.repo
 
 # Install development tools
 RUN yum install -y \
