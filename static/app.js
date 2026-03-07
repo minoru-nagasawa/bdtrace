@@ -3,7 +3,13 @@
 var App = (function() {
   var currentView = 'summary';
   var cache = {};
-  var viewDom = {};  // cached rendered DOM per view
+  var viewDom = {};
+
+  // Persistent column visibility for process tree
+  var procColumns = {
+    files: true, duration: true, pctTime: true, start: false, end: false,
+    cpu: true, pctCpu: true, rss: true, io: true, fails: true, exit: true
+  };
 
   function api(path, cb) {
     if (cache[path]) { cb(cache[path]); return; }
@@ -58,9 +64,25 @@ var App = (function() {
     return (kb / 1024).toFixed(1) + 'MB';
   }
 
+  function formatPct(val, total) {
+    if (total <= 0 || val <= 0) return '-';
+    var pct = val * 100 / total;
+    if (pct < 0.1) return '<0.1%';
+    if (pct >= 100) return '100%';
+    return pct.toFixed(1) + '%';
+  }
+
   function shortenCmd(cmd, max) {
     if (!max || cmd.length <= max) return cmd;
     return cmd.substr(0, max - 3) + '...';
+  }
+
+  // Create a span with title tooltip if text is truncated
+  function spanWithTitle(text, fullText, className) {
+    var attrs = {};
+    if (className) attrs.className = className;
+    if (fullText && fullText !== text) attrs.title = fullText;
+    return el('span', attrs, text);
   }
 
   function cmdName(cmdline) {
@@ -70,9 +92,7 @@ var App = (function() {
   }
 
   // ---- Tree control helpers ----
-  // registry: array of { expand:fn, collapse:fn, hasChildren:bool }
   function expandAll(registry) {
-    // Repeatedly expand until no new nodes appear (lazy-built children register themselves)
     var prev = 0;
     while (registry.length > prev) {
       prev = registry.length;
@@ -88,8 +108,8 @@ var App = (function() {
     }
   }
 
-  function makeTreeToolbar(registry) {
-    var bar = el('div', {style: 'display:flex;gap:8px;margin-bottom:8px'});
+  function makeTreeToolbar(registry, extras) {
+    var bar = el('div', {style: 'display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center'});
     bar.appendChild(el('span', {
       className: 'tree-btn',
       onclick: function() { expandAll(registry); }
@@ -98,6 +118,7 @@ var App = (function() {
       className: 'tree-btn',
       onclick: function() { collapseAll(registry); }
     }, 'Collapse All'));
+    if (extras) for (var i = 0; i < extras.length; i++) bar.appendChild(extras[i]);
     return bar;
   }
 
@@ -118,7 +139,6 @@ var App = (function() {
       ]);
       app.appendChild(row);
 
-      // Top 5 slowest
       if (s.slowest && s.slowest.length > 0) {
         app.appendChild(el('div', {className: 'section-title'}, 'Slowest Processes'));
         var tbl = makeTable(['PID', 'Duration', 'Command'], s.slowest.map(function(p) {
@@ -127,7 +147,6 @@ var App = (function() {
         app.appendChild(tbl);
       }
 
-      // Parallelism chart
       api('/api/parallelism', function(p) {
         if (p.buckets && p.buckets.length > 0) {
           app.appendChild(el('div', {className: 'section-title', style: 'margin-top:24px'}, 'Parallelism Over Time'));
@@ -141,8 +160,6 @@ var App = (function() {
           drawParallelism(canvas, p);
         }
       });
-
-      viewDom['summary'] = app.innerHTML ? null : null; // summary doesn't need caching
     });
   }
 
@@ -153,7 +170,7 @@ var App = (function() {
     ]);
   }
 
-  function makeTable(headers, rows, sortable) {
+  function makeTable(headers, rows) {
     var tbl = el('table');
     var thead = el('tr');
     var sortCol = -1, sortAsc = true;
@@ -215,7 +232,6 @@ var App = (function() {
       ctx.fillRect(pad.left + i * barW, pad.top + ch - bh, Math.max(barW - 1, 1), bh);
     }
 
-    // Axes
     ctx.strokeStyle = '#45475a';
     ctx.beginPath();
     ctx.moveTo(pad.left, pad.top);
@@ -235,8 +251,49 @@ var App = (function() {
   }
 
   // ---- Process Explorer ----
+  function syncColumnClasses() {
+    for (var key in procColumns) {
+      document.body.classList.toggle('hide-col-' + key, !procColumns[key]);
+    }
+  }
+
+  // Column selector UI - toggles visibility of [data-col] elements via body class
+  function makeColumnSelector() {
+    var btn = el('span', {className: 'tree-btn', style: 'position:relative'}, 'Columns');
+    var menu = el('div', {className: 'col-menu', style: 'display:none'});
+    var colDefs = [
+      ['files','Files'], ['duration','Duration'], ['pctTime','%Time'],
+      ['start','Start'], ['end','End'], ['cpu','CPU'], ['pctCpu','%CPU'],
+      ['rss','RSS'], ['io','I/O'], ['fails','Fails'], ['exit','Exit']
+    ];
+    for (var i = 0; i < colDefs.length; i++) {
+      (function(key, label) {
+        var lbl = el('label');
+        var cb = el('input', {type: 'checkbox'});
+        cb.checked = !!procColumns[key];
+        cb.onchange = function() {
+          procColumns[key] = cb.checked;
+          document.body.classList.toggle('hide-col-' + key, !cb.checked);
+        };
+        lbl.appendChild(cb);
+        lbl.appendChild(document.createTextNode(' ' + label));
+        menu.appendChild(lbl);
+      })(colDefs[i][0], colDefs[i][1]);
+    }
+    btn.onclick = function(e) {
+      e.stopPropagation();
+      menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+    };
+    document.addEventListener('click', function() { menu.style.display = 'none'; });
+    menu.onclick = function(e) { e.stopPropagation(); };
+
+    var wrap = el('span', {style: 'position:relative;display:inline-block'});
+    wrap.appendChild(btn);
+    wrap.appendChild(menu);
+    return wrap;
+  }
+
   function renderProcesses() {
-    // Check for cached DOM
     if (viewDom['processes']) {
       var app = document.getElementById('app');
       app.innerHTML = '';
@@ -250,64 +307,82 @@ var App = (function() {
     api('/api/processes', function(data) {
       app.innerHTML = '';
       var wrapper = el('div');
-      var split = el('div', {className: 'split'});
-      var left = el('div', {className: 'left'});
-      var right = el('div', {className: 'right'});
-
-      left.appendChild(el('div', {className: 'section-title'}, 'Process Tree'));
-      right.appendChild(el('div', {className: 'section-title', id: 'proc-detail-title'}, 'Select a process'));
-
-      var totalDur = 0;
-      var minStart = 0;
-      var procs = data.processes;
-      var procMap = {};
-      for (var i = 0; i < procs.length; i++) {
-        procMap[procs[i].pid] = procs[i];
-        var d = procs[i].end_time_us - procs[i].start_time_us;
-        if (d > totalDur) totalDur = d;
-        if (i === 0 || procs[i].start_time_us < minStart) minStart = procs[i].start_time_us;
-      }
-
-      var nodeRegistry = [];
-
-      // Toolbar
-      left.appendChild(makeTreeToolbar(nodeRegistry));
-
-      // Tree header
-      var hdr = el('div', {className: 'tree-header'});
-      hdr.appendChild(el('span', {className: 'th-tree'}, 'Process'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'Files'));
-      hdr.appendChild(el('span', {className: 'th-col th-dur'}, 'Duration'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'Start'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'End'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'CPU'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'RSS'));
-      hdr.appendChild(el('span', {className: 'th-col'}, 'I/O'));
-      hdr.appendChild(el('span', {className: 'th-col th-exit'}, 'Exit'));
-      left.appendChild(hdr);
-
-      var treeDiv = el('div', {className: 'tree'});
-      var roots = data.roots || [];
-      var rootUl = el('ul');
-      for (var r = 0; r < roots.length; r++) {
-        rootUl.appendChild(buildTreeNode(roots[r], procMap, data.children_map, totalDur, minStart, right, nodeRegistry));
-      }
-      treeDiv.appendChild(rootUl);
-      left.appendChild(treeDiv);
-
-      split.appendChild(left);
-      split.appendChild(right);
-      wrapper.appendChild(split);
-      app.appendChild(wrapper);
       viewDom['processes'] = wrapper;
+      buildProcessView(wrapper, data);
+      app.appendChild(wrapper);
     });
   }
 
-  function buildTreeNode(pid, procMap, childMap, totalDur, minStart, rightPanel, registry) {
-    var proc = procMap[pid];
+  function buildProcessView(wrapper, data) {
+    wrapper.innerHTML = '';
+    var split = el('div', {className: 'split'});
+    var left = el('div', {className: 'left'});
+    var right = el('div', {className: 'right'});
+
+    left.appendChild(el('div', {className: 'section-title'}, 'Process Tree'));
+    right.appendChild(el('div', {className: 'section-title', id: 'proc-detail-title'}, 'Select a process'));
+
+    var totalDur = 0;
+    var totalCpu = 0;
+    var minStart = 0;
+    var procs = data.processes;
+    var procMap = {};
+    for (var i = 0; i < procs.length; i++) {
+      procMap[procs[i].pid] = procs[i];
+      var d = procs[i].end_time_us - procs[i].start_time_us;
+      if (d > totalDur) totalDur = d;
+      totalCpu += (procs[i].user_time_us || 0) + (procs[i].sys_time_us || 0);
+      if (i === 0 || procs[i].start_time_us < minStart) minStart = procs[i].start_time_us;
+    }
+
+    var nodeRegistry = [];
+    var ctx = { procMap: procMap, childMap: data.children_map, totalDur: totalDur, totalCpu: totalCpu, minStart: minStart };
+
+    // Toolbar with column selector
+    var colSelector = makeColumnSelector();
+    left.appendChild(makeTreeToolbar(nodeRegistry, [colSelector]));
+
+    // Tree header - always create all, use data-col for toggling
+    var hdr = el('div', {className: 'tree-header'});
+    hdr.appendChild(el('span', {className: 'th-tree'}, 'Process'));
+    var hdrCols = [
+      ['files', 'th-col', 'Files'],
+      ['fails', 'th-col', 'Fails'],
+      ['duration', 'th-col th-dur', 'Duration'],
+      ['pctTime', 'th-col', '%Time'],
+      ['start', 'th-col', 'Start'],
+      ['end', 'th-col', 'End'],
+      ['cpu', 'th-col', 'CPU'],
+      ['pctCpu', 'th-col', '%CPU'],
+      ['rss', 'th-col', 'RSS'],
+      ['io', 'th-col', 'I/O'],
+      ['exit', 'th-col th-exit', 'Exit']
+    ];
+    for (var hi = 0; hi < hdrCols.length; hi++) {
+      var hc = el('span', {className: hdrCols[hi][1], 'data-col': hdrCols[hi][0]}, hdrCols[hi][2]);
+      hdr.appendChild(hc);
+    }
+    left.appendChild(hdr);
+
+    var treeDiv = el('div', {className: 'tree'});
+    var roots = data.roots || [];
+    var rootUl = el('ul');
+    for (var r = 0; r < roots.length; r++) {
+      rootUl.appendChild(buildTreeNode(roots[r], ctx, right, nodeRegistry));
+    }
+    treeDiv.appendChild(rootUl);
+    left.appendChild(treeDiv);
+
+    split.appendChild(left);
+    split.appendChild(right);
+    wrapper.appendChild(split);
+  }
+
+  function buildTreeNode(pid, ctx, rightPanel, registry) {
+    var proc = ctx.procMap[pid];
     if (!proc) return el('li');
     var dur = proc.end_time_us - proc.start_time_us;
-    var children = childMap[pid] || [];
+    var children = ctx.childMap[pid] || [];
     var hasChildren = children.length > 0;
     var expanded = false;
 
@@ -315,31 +390,34 @@ var App = (function() {
     var node = el('div', {className: 'node'});
     var toggle = el('span', {className: 'toggle'}, hasChildren ? '+' : ' ');
     var pidSpan = el('span', {className: 'pid'}, '[' + pid + ']');
-    var cmdSpan = el('span', {className: 'cmd'}, cmdName(proc.cmdline));
-    if (proc.exit_code !== 0) cmdSpan.className += ' exit-err';
-
-    var filesSpan = el('span', {className: 'col-num'}, proc.file_count != null ? String(proc.file_count) : '-');
-    var durSpan = el('span', {className: 'col-num col-dur' + (dur > totalDur * 0.25 ? ' slow' : '')}, formatDuration(dur));
-    var startSpan = el('span', {className: 'col-num'}, formatRelSec(proc.start_time_us - minStart));
-    var endSpan = el('span', {className: 'col-num'}, formatRelSec(proc.end_time_us - minStart));
-    var cpuTotal = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
-    var cpuSpan = el('span', {className: 'col-num'}, cpuTotal > 0 ? formatDuration(cpuTotal) : '-');
-    var rssSpan = el('span', {className: 'col-num'}, formatRss(proc.peak_rss_kb || 0));
-    var ioTotal = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
-    var ioSpan = el('span', {className: 'col-num'}, ioTotal > 0 ? formatBytes(ioTotal) : '-');
-    var exitSpan = el('span', {className: 'col-num col-exit' + (proc.exit_code !== 0 ? ' exit-err' : '')}, String(proc.exit_code));
+    var cmdText = cmdName(proc.cmdline);
+    var cmdSpan = spanWithTitle(cmdText, proc.cmdline, 'cmd' + (proc.exit_code !== 0 ? ' exit-err' : ''));
 
     node.appendChild(toggle);
     node.appendChild(pidSpan);
     node.appendChild(cmdSpan);
-    node.appendChild(filesSpan);
-    node.appendChild(durSpan);
-    node.appendChild(startSpan);
-    node.appendChild(endSpan);
-    node.appendChild(cpuSpan);
-    node.appendChild(rssSpan);
-    node.appendChild(ioSpan);
-    node.appendChild(exitSpan);
+
+    var cpuTotal = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
+    var ioTotal = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
+    var fc = proc.fail_count || 0;
+
+    var cols = [
+      ['files', 'col-num', proc.file_count != null ? String(proc.file_count) : '-'],
+      ['fails', 'col-num' + (fc > 0 ? ' exit-err' : ''), fc > 0 ? String(fc) : '-'],
+      ['duration', 'col-num col-dur' + (dur > ctx.totalDur * 0.25 ? ' slow' : ''), formatDuration(dur)],
+      ['pctTime', 'col-num', formatPct(dur, ctx.totalDur)],
+      ['start', 'col-num', formatRelSec(proc.start_time_us - ctx.minStart)],
+      ['end', 'col-num', formatRelSec(proc.end_time_us - ctx.minStart)],
+      ['cpu', 'col-num', cpuTotal > 0 ? formatDuration(cpuTotal) : '-'],
+      ['pctCpu', 'col-num', formatPct(cpuTotal, ctx.totalCpu)],
+      ['rss', 'col-num', formatRss(proc.peak_rss_kb || 0)],
+      ['io', 'col-num', ioTotal > 0 ? formatBytes(ioTotal) : '-'],
+      ['exit', 'col-num col-exit' + (proc.exit_code !== 0 ? ' exit-err' : ''), String(proc.exit_code)]
+    ];
+    for (var ci = 0; ci < cols.length; ci++) {
+      var sp = el('span', {className: cols[ci][1], 'data-col': cols[ci][0]}, cols[ci][2]);
+      node.appendChild(sp);
+    }
 
     var childUl = null;
 
@@ -347,7 +425,7 @@ var App = (function() {
       if (!childUl && hasChildren) {
         childUl = el('ul');
         for (var c = 0; c < children.length; c++) {
-          childUl.appendChild(buildTreeNode(children[c], procMap, childMap, totalDur, minStart, rightPanel, registry));
+          childUl.appendChild(buildTreeNode(children[c], ctx, rightPanel, registry));
         }
         li.appendChild(childUl);
       }
@@ -374,13 +452,10 @@ var App = (function() {
 
     node.onclick = function(e) {
       e.stopPropagation();
-      // Select
       var prev = document.querySelector('.tree .node.selected');
       if (prev) prev.className = prev.className.replace(' selected', '');
       node.className += ' selected';
-      showProcessDetail(pid, proc, rightPanel);
-
-      // Toggle expand
+      showProcessDetail(pid, proc, rightPanel, ctx.minStart);
       if (hasChildren) {
         if (expanded) doCollapse(); else doExpand();
       }
@@ -390,55 +465,27 @@ var App = (function() {
     return li;
   }
 
-  function showProcessDetail(pid, proc, panel) {
+  function showProcessDetail(pid, proc, panel, minStart) {
     var titleEl = document.getElementById('proc-detail-title');
     if (titleEl) titleEl.textContent = '[' + pid + '] ' + shortenCmd(proc.cmdline, 60);
 
-    // Remove old detail
     var old = panel.querySelector('.proc-files');
     if (old) old.remove();
 
     var container = el('div', {className: 'proc-files'});
-    container.appendChild(el('div', {style: 'margin-bottom:8px;color:var(--fg2)'}, [
-      el('span', null, 'Exit: '),
-      el('span', {className: proc.exit_code === 0 ? '' : 'exit-err'}, String(proc.exit_code)),
-      el('span', null, '  Duration: ' + formatDuration(proc.end_time_us - proc.start_time_us))
-    ]));
-    var cpuUser = proc.user_time_us || 0, cpuSys = proc.sys_time_us || 0;
-    if (cpuUser > 0 || cpuSys > 0 || (proc.peak_rss_kb || 0) > 0) {
-      container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2)'}, [
-        el('span', null, 'CPU: ' + formatDuration(cpuUser) + ' user, ' + formatDuration(cpuSys) + ' sys'),
-        el('span', null, '  RSS: ' + formatRss(proc.peak_rss_kb || 0)),
-        el('span', null, '  I/O: R:' + formatBytes(proc.io_read_bytes || 0) + ' W:' + formatBytes(proc.io_write_bytes || 0))
-      ]));
-    }
-    container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2);word-break:break-all'}, proc.cmdline));
+    container.appendChild(renderProcInfo(proc, minStart));
     container.appendChild(el('div', {className: 'loading'}, 'Loading files...'));
     panel.appendChild(container);
 
     api('/api/processes/' + pid + '/files', function(files) {
       container.innerHTML = '';
-      container.appendChild(el('div', {style: 'margin-bottom:8px;color:var(--fg2)'}, [
-        el('span', null, 'Exit: '),
-        el('span', {className: proc.exit_code === 0 ? '' : 'exit-err'}, String(proc.exit_code)),
-        el('span', null, '  Duration: ' + formatDuration(proc.end_time_us - proc.start_time_us))
-      ]));
-      var cpuUser2 = proc.user_time_us || 0, cpuSys2 = proc.sys_time_us || 0;
-      if (cpuUser2 > 0 || cpuSys2 > 0 || (proc.peak_rss_kb || 0) > 0) {
-        container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2)'}, [
-          el('span', null, 'CPU: ' + formatDuration(cpuUser2) + ' user, ' + formatDuration(cpuSys2) + ' sys'),
-          el('span', null, '  RSS: ' + formatRss(proc.peak_rss_kb || 0)),
-          el('span', null, '  I/O: R:' + formatBytes(proc.io_read_bytes || 0) + ' W:' + formatBytes(proc.io_write_bytes || 0))
-        ]));
-      }
-      container.appendChild(el('div', {style: 'margin-bottom:8px;color:var(--fg2);word-break:break-all'}, proc.cmdline));
+      container.appendChild(renderProcInfo(proc, minStart));
 
       if (files.length === 0) {
         container.appendChild(el('div', {style: 'color:var(--fg2)'}, 'No file accesses'));
         return;
       }
 
-      // Aggregate files by filename
       var fileMap = {};
       for (var i = 0; i < files.length; i++) {
         var f = files[i];
@@ -450,7 +497,6 @@ var App = (function() {
         if (f.fd >= 0) fileMap[f.filename].fds[f.fd] = true;
       }
 
-      // Build tree structure from aggregated files
       var absTree = {}, relTree = {};
       var filenames = Object.keys(fileMap);
       for (var i = 0; i < filenames.length; i++) {
@@ -468,7 +514,6 @@ var App = (function() {
         }
       }
 
-      // Combine into single tree with / root for absolute paths
       var tree = {};
       if (Object.keys(absTree).length > 0) {
         tree['/'] = {_info: null, _children: absTree};
@@ -478,7 +523,10 @@ var App = (function() {
         tree[relKeys[i]] = relTree[relKeys[i]];
       }
 
-      // Header for proc file tree
+      // Toolbar for proc file tree
+      var pfRegistry = [];
+      container.appendChild(makeTreeToolbar(pfRegistry));
+
       var fileHdr = el('div', {className: 'tree-header'});
       fileHdr.appendChild(el('span', {className: 'th-tree'}, 'File'));
       fileHdr.appendChild(el('span', {className: 'th-col'}, 'Mode'));
@@ -486,14 +534,60 @@ var App = (function() {
       container.appendChild(fileHdr);
 
       var treeDiv = el('div', {className: 'tree'});
-      treeDiv.appendChild(buildProcFileTree(tree));
+      treeDiv.appendChild(buildProcFileTree(tree, pfRegistry));
       container.appendChild(treeDiv);
 
       container.appendChild(el('div', {style: 'margin-top:8px;color:var(--fg2);font-size:11px'}, filenames.length + ' unique files, ' + files.length + ' total accesses'));
     });
   }
 
-  function buildProcFileTree(tree) {
+  // Shared proc info renderer (used in both Processes detail and Files detail)
+  function renderProcInfo(proc, minStart) {
+    var frag = el('div');
+    frag.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2);word-break:break-all', title: proc.cmdline}, proc.cmdline));
+
+    var line1 = el('div', {style: 'margin-bottom:4px;color:var(--fg2)'});
+    var exitSpan = el('span', {'data-col': 'exit'}, [
+      el('span', null, 'Exit: '),
+      el('span', {className: proc.exit_code === 0 ? '' : 'exit-err'}, String(proc.exit_code)),
+      el('span', null, '  ')
+    ]);
+    line1.appendChild(exitSpan);
+
+    var durSpan = el('span', {'data-col': 'duration'}, 'Duration: ' + formatDuration(proc.end_time_us - proc.start_time_us) + '  ');
+    line1.appendChild(durSpan);
+
+    if (minStart != null && proc.start_time_us != null) {
+      var startSpan = el('span', {'data-col': 'start'}, 'Start: ' + formatRelSec(proc.start_time_us - minStart) + '  ');
+      line1.appendChild(startSpan);
+      var endSpan = el('span', {'data-col': 'end'}, 'End: ' + formatRelSec(proc.end_time_us - minStart));
+      line1.appendChild(endSpan);
+    }
+    frag.appendChild(line1);
+
+    var cpuUser = proc.user_time_us || 0, cpuSys = proc.sys_time_us || 0;
+    var line2 = el('div', {style: 'margin-bottom:8px;color:var(--fg2)'});
+    var hasCpu = cpuUser > 0 || cpuSys > 0;
+    var hasRss = (proc.peak_rss_kb || 0) > 0;
+
+    if (hasCpu) {
+      var cpuSpan = el('span', {'data-col': 'cpu'}, 'CPU: ' + formatDuration(cpuUser) + ' user, ' + formatDuration(cpuSys) + ' sys  ');
+      line2.appendChild(cpuSpan);
+    }
+
+    if (hasRss) {
+      var rssSpan = el('span', {'data-col': 'rss'}, 'RSS: ' + formatRss(proc.peak_rss_kb || 0) + '  ');
+      line2.appendChild(rssSpan);
+    }
+
+    var ioSpan = el('span', {'data-col': 'io'}, 'I/O: R:' + formatBytes(proc.io_read_bytes || 0) + ' W:' + formatBytes(proc.io_write_bytes || 0));
+    line2.appendChild(ioSpan);
+
+    if (hasCpu || hasRss) frag.appendChild(line2);
+    return frag;
+  }
+
+  function buildProcFileTree(tree, registry) {
     var ul = el('ul');
     var keys = Object.keys(tree).sort();
     for (var k = 0; k < keys.length; k++) {
@@ -518,16 +612,36 @@ var App = (function() {
         var childUl = null;
         var expanded = false;
 
+        function ensureChildren() {
+          if (!childUl && hasChildren) {
+            childUl = buildProcFileTree(entry._children, registry);
+            li.appendChild(childUl);
+          }
+        }
+
+        function doExpand() {
+          if (!hasChildren || expanded) return;
+          expanded = true;
+          toggle.textContent = '-';
+          ensureChildren();
+          childUl.style.display = '';
+        }
+
+        function doCollapse() {
+          if (!hasChildren || !expanded) return;
+          expanded = false;
+          toggle.textContent = '+';
+          if (childUl) childUl.style.display = 'none';
+        }
+
+        if (registry) {
+          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+        }
+
         node.onclick = function(e) {
           e.stopPropagation();
           if (hasChildren) {
-            expanded = !expanded;
-            toggle.textContent = expanded ? '-' : '+';
-            if (expanded && !childUl) {
-              childUl = buildProcFileTree(entry._children);
-              li.appendChild(childUl);
-            }
-            if (childUl) childUl.style.display = expanded ? '' : 'none';
+            if (expanded) doCollapse(); else doExpand();
           }
         };
 
@@ -540,7 +654,6 @@ var App = (function() {
 
   // ---- File Explorer ----
   function renderFiles() {
-    // Check for cached DOM
     if (viewDom['files']) {
       var app = document.getElementById('app');
       app.innerHTML = '';
@@ -561,7 +674,6 @@ var App = (function() {
       left.appendChild(el('div', {className: 'section-title'}, 'File Tree'));
       right.appendChild(el('div', {className: 'section-title', id: 'file-detail-title'}, 'Select a file'));
 
-      // Build directory tree, separating absolute and relative paths
       var absTree = {};
       var relTree = {};
       for (var i = 0; i < data.length; i++) {
@@ -576,7 +688,6 @@ var App = (function() {
         }
       }
 
-      // Combine: absolute paths under '/' root, relative paths at top level
       var tree = {};
       if (Object.keys(absTree).length > 0) {
         var absTotal = 0;
@@ -590,8 +701,6 @@ var App = (function() {
       }
 
       var nodeRegistry = [];
-
-      // Toolbar
       left.appendChild(makeTreeToolbar(nodeRegistry));
 
       var treeDiv = el('div', {className: 'tree'});
@@ -612,7 +721,6 @@ var App = (function() {
     for (var k = 0; k < keys.length; k++) {
       var name = keys[k];
       var entry = tree[name];
-      // Build fullPath to match DB paths exactly
       var fullPath;
       if (name === '/') {
         fullPath = '/';
@@ -669,9 +777,7 @@ var App = (function() {
           var prev = document.querySelector('.tree .node.selected');
           if (prev) prev.className = prev.className.replace(' selected', '');
           node.className += ' selected';
-
           showFileDetail(fullPath, rightPanel);
-
           if (hasChildren) {
             if (expanded) doCollapse(); else doExpand();
           }
@@ -698,7 +804,6 @@ var App = (function() {
     api('/api/files/by-path?path=' + encodeURIComponent(path), function(data) {
       container.innerHTML = '';
       if (!data || data.length === 0) {
-        // Try prefix search (for directories)
         var prefixUrl = '/api/files/by-prefix?prefix=' + encodeURIComponent(path);
         delete cache[prefixUrl];
         api(prefixUrl, function(d2) {
@@ -707,31 +812,84 @@ var App = (function() {
             container.appendChild(el('div', {style: 'color:var(--fg2)'}, 'No accesses found'));
             return;
           }
-          var tbl = makeTable(['PID', 'Command', 'Mode', 'Duration', 'CPU', 'RSS', 'I/O', 'Filename'], d2.map(function(a) {
-            var cpu = (a.user_time_us || 0) + (a.sys_time_us || 0);
-            var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
-            return [a.pid, shortenCmd(a.cmdline || '', 40), a.mode_str,
-                    a.duration_us != null ? formatDuration(a.duration_us) : '-',
-                    cpu > 0 ? formatDuration(cpu) : '-',
-                    formatRss(a.peak_rss_kb || 0),
-                    io > 0 ? formatBytes(io) : '-',
-                    a.filename];
-          }));
-          container.appendChild(tbl);
+          container.appendChild(buildFileAccessTable(d2, true));
         });
         return;
       }
-      var tbl = makeTable(['PID', 'Command', 'Mode', 'Duration', 'CPU', 'RSS', 'I/O'], data.map(function(a) {
-        var cpu = (a.user_time_us || 0) + (a.sys_time_us || 0);
-        var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
-        return [a.pid, shortenCmd(a.cmdline || '', 50), a.mode_str,
-                a.duration_us != null ? formatDuration(a.duration_us) : '-',
-                cpu > 0 ? formatDuration(cpu) : '-',
-                formatRss(a.peak_rss_kb || 0),
-                io > 0 ? formatBytes(io) : '-'];
-      }));
-      container.appendChild(tbl);
+      container.appendChild(buildFileAccessTable(data, false));
     });
+  }
+
+  function buildFileAccessTable(data, showFilename) {
+    // Compute minStart for relative times
+    var minStart = 0;
+    for (var i = 0; i < data.length; i++) {
+      if (data[i].start_time_us != null) {
+        if (minStart === 0 || data[i].start_time_us < minStart) minStart = data[i].start_time_us;
+      }
+    }
+
+    // Column definitions: [label, data-col key or null (always visible)]
+    // Order matches Processes tree: Duration, Start, End, Exit, CPU, RSS, I/O
+    var colDefs = [
+      ['PID', null],
+      ['Command', null],
+      ['Mode', null],
+      ['Duration', 'duration'],
+      ['Start', 'start'],
+      ['End', 'end'],
+      ['Exit', 'exit'],
+      ['CPU', 'cpu'],
+      ['RSS', 'rss'],
+      ['I/O', 'io']
+    ];
+    if (showFilename) colDefs.push(['Filename', null]);
+
+    var tbl = el('table');
+
+    // Header
+    var thead = el('tr');
+    for (var h = 0; h < colDefs.length; h++) {
+      var th = el('th', null, colDefs[h][0]);
+      if (colDefs[h][1]) {
+        th.setAttribute('data-col', colDefs[h][1]);
+      }
+      thead.appendChild(th);
+    }
+    tbl.appendChild(el('thead', null, [thead]));
+
+    // Body
+    var tbody = el('tbody');
+    for (var r = 0; r < data.length; r++) {
+      var a = data[r];
+      var cpu = (a.user_time_us || 0) + (a.sys_time_us || 0);
+      var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
+      var vals = [
+        [String(a.pid), null],
+        [shortenCmd(a.cmdline || '', showFilename ? 30 : 50), null],
+        [a.mode_str, null],
+        [a.duration_us != null ? formatDuration(a.duration_us) : '-', 'duration'],
+        [a.start_time_us != null ? formatRelSec(a.start_time_us - minStart) : '-', 'start'],
+        [a.end_time_us != null ? formatRelSec(a.end_time_us - minStart) : '-', 'end'],
+        [a.exit_code != null ? String(a.exit_code) : '-', 'exit'],
+        [cpu > 0 ? formatDuration(cpu) : '-', 'cpu'],
+        [formatRss(a.peak_rss_kb || 0), 'rss'],
+        [io > 0 ? formatBytes(io) : '-', 'io']
+      ];
+      if (showFilename) vals.push([a.filename, null]);
+
+      var tr = el('tr');
+      for (var c = 0; c < vals.length; c++) {
+        var td = el('td', null, vals[c][0]);
+        if (vals[c][1]) {
+          td.setAttribute('data-col', vals[c][1]);
+        }
+      tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    tbl.appendChild(tbody);
+    return tbl;
   }
 
   // ---- Bottlenecks ----
@@ -748,17 +906,19 @@ var App = (function() {
     });
 
     function renderGroups(data, sortKey) {
-      // Remove old
       var old = document.querySelector('.bottleneck-list');
       if (old) old.remove();
 
-      data.sort(function(a, b) { return b[sortKey] - a[sortKey]; });
+      data.sort(function(a, b) { return (b[sortKey] || 0) - (a[sortKey] || 0); });
 
       var container = el('div', {className: 'bottleneck-list'});
 
-      // Sort controls
       var sortRow = el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, 'Sort by: ');
-      var sorts = [['total_us', 'Total Time'], ['count', 'Count'], ['max_us', 'Max Time'], ['avg_us', 'Avg Time']];
+      var sorts = [
+        ['total_us', 'Total Time'], ['count', 'Count'], ['max_us', 'Max Time'], ['avg_us', 'Avg Time'],
+        ['total_cpu_us', 'Total CPU'], ['max_cpu_us', 'Max CPU'], ['avg_cpu_us', 'Avg CPU'],
+        ['max_rss_kb', 'Max RSS']
+      ];
       for (var s = 0; s < sorts.length; s++) {
         (function(key, label) {
           var btn = el('span', {
@@ -766,7 +926,6 @@ var App = (function() {
               (sortKey === key ? 'background:var(--border);color:var(--accent)' : ''),
             onclick: function() {
               sortKey = key;
-              var app = document.getElementById('app');
               renderGroups(data, sortKey);
             }
           }, label);
@@ -775,10 +934,17 @@ var App = (function() {
       }
       container.appendChild(sortRow);
 
-      // Headers
-      var hdr = makeTable(['Command', 'Count', 'Total', 'Avg', 'Max'], data.map(function(g) {
-        return [g.cmd_name, g.count, formatDuration(g.total_us), formatDuration(g.avg_us), formatDuration(g.max_us)];
-      }));
+      var hdr = makeTable(
+        ['Command', 'Count', 'Total', 'Avg', 'Max', 'CPU Total', 'CPU Avg', 'CPU Max', 'Max RSS'],
+        data.map(function(g) {
+          return [g.cmd_name, g.count,
+                  formatDuration(g.total_us), formatDuration(g.avg_us), formatDuration(g.max_us),
+                  (g.total_cpu_us || 0) > 0 ? formatDuration(g.total_cpu_us) : '-',
+                  (g.avg_cpu_us || 0) > 0 ? formatDuration(g.avg_cpu_us) : '-',
+                  (g.max_cpu_us || 0) > 0 ? formatDuration(g.max_cpu_us) : '-',
+                  formatRss(g.max_rss_kb || 0)];
+        })
+      );
       container.appendChild(hdr);
 
       var app = document.getElementById('app');
@@ -811,12 +977,11 @@ var App = (function() {
   // ---- Analysis ----
   function renderAnalysis() {
     var app = document.getElementById('app');
-    app.innerHTML = '<div class="loading">Loading...</div>';
+    app.innerHTML = '';
 
     var tabs = ['Critical Path', 'Hotspots', 'Failures', 'Diagnostics'];
     var activeTab = 0;
 
-    app.innerHTML = '';
     var tabRow = el('div', {className: 'analysis-tabs'});
     var content = el('div', {className: 'analysis-content'});
 
@@ -855,9 +1020,10 @@ var App = (function() {
         for (var i = 0; i < data.path.length; i++) {
           var p = data.path[i];
           var indent = i * 20;
+          var cmdText = shortenCmd(p.cmdline, 60);
           var row = el('div', {style: 'padding:4px 8px;padding-left:' + (indent + 8) + 'px;border-left:2px solid var(--accent);margin-bottom:2px;background:var(--bg3);border-radius:0 4px 4px 0'}, [
             el('span', {style: 'color:var(--fg2)'}, '[' + p.pid + '] '),
-            el('span', null, shortenCmd(p.cmdline, 60)),
+            spanWithTitle(cmdText, p.cmdline),
             el('span', {style: 'color:var(--accent);margin-left:12px'}, formatDuration(p.duration_us))
           ]);
           content.appendChild(row);
@@ -888,18 +1054,16 @@ var App = (function() {
 
         if (data.by_errno && data.by_errno.length > 0) {
           content.appendChild(el('div', {style: 'margin:12px 0 8px;font-weight:bold'}, 'By Error Code'));
-          var tbl1 = makeTable(['Errno', 'Name', 'Count'], data.by_errno.map(function(e) {
+          content.appendChild(makeTable(['Errno', 'Name', 'Count'], data.by_errno.map(function(e) {
             return [e.errno_val, e.name, e.count];
-          }));
-          content.appendChild(tbl1);
+          })));
         }
 
         if (data.by_file && data.by_file.length > 0) {
           content.appendChild(el('div', {style: 'margin:12px 0 8px;font-weight:bold'}, 'Top Files'));
-          var tbl2 = makeTable(['Count', 'File'], data.by_file.map(function(f) {
+          content.appendChild(makeTable(['Count', 'File'], data.by_file.map(function(f) {
             return [f.count, f.filename];
-          }));
-          content.appendChild(tbl2);
+          })));
         }
       });
     } else if (idx === 3) {
@@ -930,11 +1094,9 @@ var App = (function() {
       tabs[i].className = 'tab' + (tabs[i].getAttribute('data-view') === view ? ' active' : '');
     }
 
-    // Detach current cached view (don't destroy it)
     var app = document.getElementById('app');
     while (app.firstChild) app.removeChild(app.firstChild);
 
-    // Cached views: processes and files preserve tree state
     if ((view === 'processes' || view === 'files') && viewDom[view]) {
       app.appendChild(viewDom[view]);
       return;
@@ -950,7 +1112,6 @@ var App = (function() {
     }
   }
 
-  // Init
   document.addEventListener('DOMContentLoaded', function() {
     var tabs = document.querySelectorAll('#navbar .tab');
     for (var i = 0; i < tabs.length; i++) {
@@ -959,6 +1120,7 @@ var App = (function() {
         switchView(this.getAttribute('data-view'));
       });
     }
+    syncColumnClasses();
     switchView('summary');
   });
 

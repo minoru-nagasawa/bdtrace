@@ -53,7 +53,11 @@ struct GroupStats {
     int count;
     int64_t total_us;
     int64_t max_us;
-    GroupStats() : count(0), total_us(0), max_us(0) {}
+    int64_t total_cpu_us;
+    int64_t max_cpu_us;
+    int64_t total_rss_kb;
+    int64_t max_rss_kb;
+    GroupStats() : count(0), total_us(0), max_us(0), total_cpu_us(0), max_cpu_us(0), total_rss_kb(0), max_rss_kb(0) {}
 };
 
 struct DfsEntry {
@@ -208,6 +212,14 @@ static void handle_processes(struct mg_connection *c) {
         file_counts[all_fa[i].pid]++;
     }
 
+    // Count failed accesses per PID
+    std::vector<FailedAccessRecord> all_fails;
+    g_db->get_all_failed_accesses(all_fails);
+    std::map<int, int> fail_counts;
+    for (size_t i = 0; i < all_fails.size(); ++i) {
+        fail_counts[all_fails[i].pid]++;
+    }
+
     std::set<int> pids;
     std::map<int, std::vector<int> > children_map;
     for (size_t i = 0; i < procs.size(); ++i) {
@@ -236,7 +248,10 @@ static void handle_processes(struct mg_connection *c) {
         jw.key("start_time_us").val(procs[i].start_time_us);
         jw.key("end_time_us").val(procs[i].end_time_us);
         jw.key("exit_code").val(procs[i].exit_code);
+        std::map<int, int>::const_iterator fl_it = fail_counts.find(procs[i].pid);
+        int fl = (fl_it != fail_counts.end()) ? fl_it->second : 0;
         jw.key("file_count").val(fc);
+        jw.key("fail_count").val(fl);
         jw.key("user_time_us").val(procs[i].user_time_us);
         jw.key("sys_time_us").val(procs[i].sys_time_us);
         jw.key("peak_rss_kb").val(procs[i].peak_rss_kb);
@@ -336,6 +351,8 @@ static void handle_files(struct mg_connection *c) {
 }
 
 static void write_proc_info(JsonWriter& jw, const ProcessRecord& proc) {
+    jw.key("start_time_us").val(proc.start_time_us);
+    jw.key("end_time_us").val(proc.end_time_us);
     int64_t dur = proc.end_time_us - proc.start_time_us;
     jw.key("duration_us").val(dur);
     jw.key("exit_code").val(proc.exit_code);
@@ -407,10 +424,15 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
             if (procs[i].end_time_us <= 0) continue;
             std::string name = cmd_name(procs[i].cmdline);
             int64_t dur = procs[i].end_time_us - procs[i].start_time_us;
+            int64_t cpu = procs[i].user_time_us + procs[i].sys_time_us;
             GroupStats& gs = groups[name];
             gs.count++;
             gs.total_us += dur;
             if (dur > gs.max_us) gs.max_us = dur;
+            gs.total_cpu_us += cpu;
+            if (cpu > gs.max_cpu_us) gs.max_cpu_us = cpu;
+            gs.total_rss_kb += procs[i].peak_rss_kb;
+            if (procs[i].peak_rss_kb > gs.max_rss_kb) gs.max_rss_kb = procs[i].peak_rss_kb;
         }
 
         JsonWriter jw;
@@ -423,6 +445,10 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
             jw.key("total_us").val(it->second.total_us);
             jw.key("max_us").val(it->second.max_us);
             jw.key("avg_us").val(it->second.count > 0 ? it->second.total_us / it->second.count : (int64_t)0);
+            jw.key("total_cpu_us").val(it->second.total_cpu_us);
+            jw.key("max_cpu_us").val(it->second.max_cpu_us);
+            jw.key("avg_cpu_us").val(it->second.count > 0 ? it->second.total_cpu_us / it->second.count : (int64_t)0);
+            jw.key("max_rss_kb").val(it->second.max_rss_kb);
             jw.endObject();
         }
         jw.endArray();
