@@ -833,6 +833,7 @@ var App = (function() {
     // Order matches Processes tree: Duration, Start, End, Exit, CPU, RSS, I/O
     var colDefs = [
       ['PID', null],
+      ['Process', null],
       ['Command', null],
       ['Mode', null],
       ['Duration', 'duration'],
@@ -866,7 +867,8 @@ var App = (function() {
       var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
       var vals = [
         [String(a.pid), null],
-        [shortenCmd(a.cmdline || '', showFilename ? 30 : 50), null],
+        [cmdName(a.cmdline || ''), null],
+        [a.cmdline || '', null],
         [a.mode_str, null],
         [a.duration_us != null ? formatDuration(a.duration_us) : '-', 'duration'],
         [a.start_time_us != null ? formatRelSec(a.start_time_us - minStart) : '-', 'start'],
@@ -881,6 +883,10 @@ var App = (function() {
       var tr = el('tr');
       for (var c = 0; c < vals.length; c++) {
         var td = el('td', null, vals[c][0]);
+        if (c === 2) {
+          td.title = vals[c][0];
+          td.className = 'cmd-cell';
+        }
         if (vals[c][1]) {
           td.setAttribute('data-col', vals[c][1]);
         }
