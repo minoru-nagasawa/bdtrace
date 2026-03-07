@@ -180,9 +180,18 @@ void PtraceBackend::stop() {
     running_ = false;
 }
 
+std::string PtraceBackend::resolve_path(int pid, const std::string& path) {
+    if (path.empty() || path[0] == '/') return path;
+    std::string cwd = read_proc_link(pid, "cwd");
+    if (cwd.empty()) return path;
+    return cwd + "/" + path;
+}
+
 void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mode, int fd) {
     std::string path = read_string(pid, addr);
     if (!path.empty() && !should_filter_path(path)) {
+        path = resolve_path(pid, path);
+        if (should_filter_path(path)) return;
         FileAccessRecord fa;
         fa.pid = pid;
         fa.filename = path;
@@ -198,6 +207,8 @@ void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mo
 void PtraceBackend::record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val) {
     std::string path = read_string(pid, addr);
     if (!path.empty() && !should_filter_path(path)) {
+        path = resolve_path(pid, path);
+        if (should_filter_path(path)) return;
         FailedAccessRecord fa;
         fa.pid = pid;
         fa.filename = path;
