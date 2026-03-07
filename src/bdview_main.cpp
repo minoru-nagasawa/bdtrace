@@ -142,10 +142,28 @@ static int cmd_slowest(Database& db, int n) {
 // --- files ---
 static const char* mode_str(int mode) {
     switch (mode) {
-        case FA_READ:  return "R";
-        case FA_WRITE: return "W";
-        case FA_RDWR:  return "RW";
-        default:       return "?";
+        case FA_READ:           return "R";
+        case FA_WRITE:          return "W";
+        case FA_RDWR:           return "RW";
+        case FA_STAT:           return "ST";
+        case FA_ACCESS:         return "AC";
+        case FA_EXEC:           return "EX";
+        case FA_UNLINK:         return "UL";
+        case FA_RENAME_SRC:     return "RS";
+        case FA_RENAME_DST:     return "RD";
+        case FA_READLINK:       return "RL";
+        case FA_MKDIR:          return "MD";
+        case FA_LINK_SRC:       return "LS";
+        case FA_LINK_DST:       return "LD";
+        case FA_SYMLINK_TARGET: return "SY";
+        case FA_SYMLINK_LINK:   return "SL";
+        case FA_CHMOD:          return "CM";
+        case FA_CHOWN:          return "CO";
+        case FA_TRUNCATE:       return "TR";
+        case FA_MKNOD:          return "MN";
+        case FA_UTIMENS:        return "UT";
+        case FA_CHDIR:          return "CD";
+        default:                return "?";
     }
 }
 

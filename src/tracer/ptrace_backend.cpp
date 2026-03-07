@@ -180,6 +180,20 @@ void PtraceBackend::stop() {
     running_ = false;
 }
 
+void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mode, int fd) {
+    std::string path = read_string(pid, addr);
+    if (!path.empty() && !should_filter_path(path)) {
+        FileAccessRecord fa;
+        fa.pid = pid;
+        fa.filename = path;
+        fa.mode = mode;
+        fa.fd = fd;
+        LOG_DEBUG("File access: pid=%d %s mode=%d fd=%d",
+                  pid, path.c_str(), mode, fd);
+        session_.on_file_access(fa);
+    }
+}
+
 void PtraceBackend::handle_syscall_stop(int pid) {
     std::map<int, ProcessState>::iterator it = procs_.find(pid);
     if (it == procs_.end()) return;
@@ -192,52 +206,217 @@ void PtraceBackend::handle_syscall_stop(int pid) {
     long syscall_nr = REG_SYSCALL(regs);
     long rax = REG_RETVAL(regs);
 
-    // Determine entry vs exit:
     // On syscall entry, rax == -ENOSYS (kernel sets this before dispatch).
     // On syscall exit, rax == actual return value.
     bool is_entry = (rax == -ENOSYS);
 
     if (is_entry) {
-        if (syscall_nr == SYS_OPEN_NR || syscall_nr == SYS_OPENAT_NR) {
-            // Save args for when we see the exit
-            if (syscall_nr == SYS_OPEN_NR) {
-                ps.pending_path_addr = REG_ARG0(regs);
-                ps.pending_flags = (int)REG_ARG1(regs);
-            } else {
-                ps.pending_path_addr = REG_ARG1(regs);
-                ps.pending_flags = (int)REG_ARG2(regs);
-            }
-            ps.pending_syscall = syscall_nr;
+        ps.pending_syscall = syscall_nr;
+        ps.pending_path_addr = 0;
+        ps.pending_path_addr2 = 0;
+        ps.pending_flags = 0;
+
+        // --- open family: save path + flags ---
+        if (syscall_nr == SYS_OPEN_NR) {
+            ps.pending_path_addr = REG_ARG0(regs);
+            ps.pending_flags = (int)REG_ARG1(regs);
+        } else if (syscall_nr == SYS_OPENAT_NR || syscall_nr == SYS_OPENAT2_NR) {
+            ps.pending_path_addr = REG_ARG1(regs);
+            ps.pending_flags = (int)REG_ARG2(regs);
+        } else if (syscall_nr == SYS_CREAT_NR) {
+            ps.pending_path_addr = REG_ARG0(regs);
+            ps.pending_flags = O_WRONLY | O_CREAT | O_TRUNC;
+        }
+        // --- single-path at arg0 ---
+        else if (syscall_nr == SYS_STAT_NR || syscall_nr == SYS_LSTAT_NR
+              || syscall_nr == SYS_ACCESS_NR
+              || syscall_nr == SYS_CHDIR_NR
+              || syscall_nr == SYS_UNLINK_NR
+              || syscall_nr == SYS_MKDIR_NR
+              || syscall_nr == SYS_CHMOD_NR
+              || syscall_nr == SYS_CHOWN_NR
+              || syscall_nr == SYS_READLINK_NR
+              || syscall_nr == SYS_TRUNCATE_NR
+              || syscall_nr == SYS_MKNOD_NR
+              || syscall_nr == SYS_EXECVE_NR) {
+            ps.pending_path_addr = REG_ARG0(regs);
+        }
+        // --- single-path "at" variants: path at arg1 ---
+        else if (syscall_nr == SYS_NEWFSTATAT_NR
+              || syscall_nr == SYS_FACCESSAT_NR || syscall_nr == SYS_FACCESSAT2_NR
+              || syscall_nr == SYS_UNLINKAT_NR
+              || syscall_nr == SYS_MKDIRAT_NR
+              || syscall_nr == SYS_FCHMODAT_NR
+              || syscall_nr == SYS_FCHOWNAT_NR
+              || syscall_nr == SYS_READLINKAT_NR
+              || syscall_nr == SYS_UTIMENSAT_NR
+              || syscall_nr == SYS_MKNODAT_NR
+              || syscall_nr == SYS_EXECVEAT_NR
+              || syscall_nr == SYS_STATX_NR) {
+            ps.pending_path_addr = REG_ARG1(regs);
+        }
+        // --- two-path: rename(old, new), link(old, new), symlink(target, linkpath) ---
+        else if (syscall_nr == SYS_RENAME_NR || syscall_nr == SYS_LINK_NR
+              || syscall_nr == SYS_SYMLINK_NR) {
+            ps.pending_path_addr = REG_ARG0(regs);
+            ps.pending_path_addr2 = REG_ARG1(regs);
+        }
+        // --- two-path "at": renameat(dfd1, old, dfd2, new) ---
+        else if (syscall_nr == SYS_RENAMEAT_NR || syscall_nr == SYS_RENAMEAT2_NR) {
+            ps.pending_path_addr = REG_ARG1(regs);
+            ps.pending_path_addr2 = REG_ARG3(regs);
+        }
+        // --- linkat(olddfd, old, newdfd, new, flags) ---
+        else if (syscall_nr == SYS_LINKAT_NR) {
+            ps.pending_path_addr = REG_ARG1(regs);
+            ps.pending_path_addr2 = REG_ARG3(regs);
+        }
+        // --- symlinkat(target, newdfd, linkpath) ---
+        else if (syscall_nr == SYS_SYMLINKAT_NR) {
+            ps.pending_path_addr = REG_ARG0(regs);
+            ps.pending_path_addr2 = REG_ARG2(regs);
+        }
+        // --- fchdir(fd) ---
+        else if (syscall_nr == SYS_FCHDIR_NR) {
+            // No path to save; handled at exit via /proc/pid/cwd
         }
     } else {
-        // Syscall exit
-        if (ps.pending_syscall == SYS_OPEN_NR || ps.pending_syscall == SYS_OPENAT_NR) {
-            // rax is the fd (or negative error)
+        // Syscall exit - record based on pending_syscall
+        long sc = ps.pending_syscall;
+
+        // --- open/openat/openat2/creat ---
+        if (sc == SYS_OPEN_NR || sc == SYS_OPENAT_NR || sc == SYS_OPENAT2_NR
+            || sc == SYS_CREAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                int accmode = ps.pending_flags & O_ACCMODE;
+                FileAccessMode mode = FA_RDWR;
+                if (accmode == O_RDONLY) mode = FA_READ;
+                else if (accmode == O_WRONLY) mode = FA_WRITE;
+                record_access(pid, ps.pending_path_addr, mode, (int)rax);
+            }
+        }
+        // --- stat/lstat/newfstatat/statx ---
+        else if (sc == SYS_STAT_NR || sc == SYS_LSTAT_NR
+              || sc == SYS_NEWFSTATAT_NR || sc == SYS_STATX_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_STAT);
+            }
+        }
+        // --- access/faccessat/faccessat2 ---
+        else if (sc == SYS_ACCESS_NR || sc == SYS_FACCESSAT_NR
+              || sc == SYS_FACCESSAT2_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_ACCESS);
+            }
+        }
+        // --- execve/execveat ---
+        else if (sc == SYS_EXECVE_NR || sc == SYS_EXECVEAT_NR) {
+            // execve only returns on failure; successful exec is handled
+            // by handle_exec_event. Record at entry for failed exec.
+            if (rax < 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_EXEC);
+            }
+        }
+        // --- unlink/unlinkat ---
+        else if (sc == SYS_UNLINK_NR || sc == SYS_UNLINKAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_UNLINK);
+            }
+        }
+        // --- rename/renameat/renameat2 ---
+        else if (sc == SYS_RENAME_NR || sc == SYS_RENAMEAT_NR
+              || sc == SYS_RENAMEAT2_NR) {
             if (rax >= 0) {
-                std::string path = read_string(pid, ps.pending_path_addr);
-                if (!path.empty() && !should_filter_path(path)) {
+                if (ps.pending_path_addr)
+                    record_access(pid, ps.pending_path_addr, FA_RENAME_SRC);
+                if (ps.pending_path_addr2)
+                    record_access(pid, ps.pending_path_addr2, FA_RENAME_DST);
+            }
+        }
+        // --- link/linkat ---
+        else if (sc == SYS_LINK_NR || sc == SYS_LINKAT_NR) {
+            if (rax >= 0) {
+                if (ps.pending_path_addr)
+                    record_access(pid, ps.pending_path_addr, FA_LINK_SRC);
+                if (ps.pending_path_addr2)
+                    record_access(pid, ps.pending_path_addr2, FA_LINK_DST);
+            }
+        }
+        // --- symlink/symlinkat ---
+        else if (sc == SYS_SYMLINK_NR || sc == SYS_SYMLINKAT_NR) {
+            if (rax >= 0) {
+                if (ps.pending_path_addr)
+                    record_access(pid, ps.pending_path_addr, FA_SYMLINK_TARGET);
+                if (ps.pending_path_addr2)
+                    record_access(pid, ps.pending_path_addr2, FA_SYMLINK_LINK);
+            }
+        }
+        // --- readlink/readlinkat ---
+        else if (sc == SYS_READLINK_NR || sc == SYS_READLINKAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_READLINK);
+            }
+        }
+        // --- mkdir/mkdirat ---
+        else if (sc == SYS_MKDIR_NR || sc == SYS_MKDIRAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_MKDIR);
+            }
+        }
+        // --- chmod/fchmodat ---
+        else if (sc == SYS_CHMOD_NR || sc == SYS_FCHMODAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_CHMOD);
+            }
+        }
+        // --- chown/fchownat ---
+        else if (sc == SYS_CHOWN_NR || sc == SYS_FCHOWNAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_CHOWN);
+            }
+        }
+        // --- truncate ---
+        else if (sc == SYS_TRUNCATE_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_TRUNCATE);
+            }
+        }
+        // --- mknod/mknodat ---
+        else if (sc == SYS_MKNOD_NR || sc == SYS_MKNODAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_MKNOD);
+            }
+        }
+        // --- utimensat ---
+        else if (sc == SYS_UTIMENSAT_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_UTIMENS);
+            }
+        }
+        // --- chdir ---
+        else if (sc == SYS_CHDIR_NR) {
+            if (rax >= 0 && ps.pending_path_addr) {
+                record_access(pid, ps.pending_path_addr, FA_CHDIR);
+            }
+        }
+        // --- fchdir(fd) - read cwd from /proc ---
+        else if (sc == SYS_FCHDIR_NR) {
+            if (rax >= 0) {
+                std::string cwd = read_proc_link(pid, "cwd");
+                if (!cwd.empty() && !should_filter_path(cwd)) {
                     FileAccessRecord fa;
                     fa.pid = pid;
-                    fa.filename = path;
-                    fa.fd = (int)rax;
-
-                    int accmode = ps.pending_flags & O_ACCMODE;
-                    if (accmode == O_RDONLY) {
-                        fa.mode = FA_READ;
-                    } else if (accmode == O_WRONLY) {
-                        fa.mode = FA_WRITE;
-                    } else {
-                        fa.mode = FA_RDWR;
-                    }
-
-                    LOG_DEBUG("File access: pid=%d %s mode=%d fd=%d",
-                              pid, path.c_str(), fa.mode, fa.fd);
+                    fa.filename = cwd;
+                    fa.mode = FA_CHDIR;
+                    fa.fd = -1;
                     session_.on_file_access(fa);
                 }
             }
-            ps.pending_syscall = -1;
-            ps.pending_path_addr = 0;
         }
+
+        ps.pending_syscall = -1;
+        ps.pending_path_addr = 0;
+        ps.pending_path_addr2 = 0;
     }
 }
 
@@ -264,10 +443,22 @@ void PtraceBackend::handle_exec_event(int pid) {
     std::string cmdline = read_cmdline(pid);
     LOG_DEBUG("Exec: %d -> %s", pid, cmdline.c_str());
 
+    // Record the exec'd binary
+    std::string exe = read_proc_link(pid, "exe");
+    if (!exe.empty() && !should_filter_path(exe)) {
+        FileAccessRecord fa;
+        fa.pid = pid;
+        fa.filename = exe;
+        fa.mode = FA_EXEC;
+        fa.fd = -1;
+        session_.on_file_access(fa);
+    }
+
     std::map<int, ProcessState>::iterator it = procs_.find(pid);
     if (it != procs_.end()) {
         it->second.pending_syscall = -1;
         it->second.pending_path_addr = 0;
+        it->second.pending_path_addr2 = 0;
     }
 
     ProcessRecord rec;
@@ -330,6 +521,17 @@ std::string PtraceBackend::read_cmdline(int pid) {
         }
     }
     return result;
+}
+
+std::string PtraceBackend::read_proc_link(int pid, const char* entry) {
+    char path[128];
+    std::snprintf(path, sizeof(path), "/proc/%d/%s", pid, entry);
+
+    char buf[4096];
+    ssize_t len = readlink(path, buf, sizeof(buf) - 1);
+    if (len <= 0) return "";
+    buf[len] = '\0';
+    return std::string(buf, len);
 }
 
 bool PtraceBackend::should_filter_path(const std::string& path) {

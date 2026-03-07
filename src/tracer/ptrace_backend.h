@@ -33,7 +33,9 @@ private:
 
     std::string read_string(int pid, unsigned long addr, size_t max_len = 4096);
     std::string read_cmdline(int pid);
+    std::string read_proc_link(int pid, const char* entry);
     bool should_filter_path(const std::string& path);
+    void record_access(int pid, unsigned long addr, FileAccessMode mode, int fd = -1);
 };
 
 } // namespace bdtrace

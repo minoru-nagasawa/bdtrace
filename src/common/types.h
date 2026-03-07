@@ -9,9 +9,27 @@
 namespace bdtrace {
 
 enum FileAccessMode {
-    FA_READ  = 0,
-    FA_WRITE = 1,
-    FA_RDWR  = 2
+    FA_READ        = 0,
+    FA_WRITE       = 1,
+    FA_RDWR        = 2,
+    FA_STAT        = 3,
+    FA_ACCESS      = 4,
+    FA_EXEC        = 5,
+    FA_UNLINK      = 6,
+    FA_RENAME_SRC  = 7,
+    FA_RENAME_DST  = 8,
+    FA_READLINK    = 9,
+    FA_MKDIR       = 10,
+    FA_LINK_SRC    = 11,
+    FA_LINK_DST    = 12,
+    FA_SYMLINK_TARGET = 13,
+    FA_SYMLINK_LINK   = 14,
+    FA_CHMOD       = 15,
+    FA_CHOWN       = 16,
+    FA_TRUNCATE    = 17,
+    FA_MKNOD       = 18,
+    FA_UTIMENS     = 19,
+    FA_CHDIR       = 20
 };
 
 struct ProcessRecord {
