@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     make \
     gdb \
     strace \
+    git \
     wget \
     unzip \
     && rm -rf /var/lib/apt/lists/*

@@ -3,7 +3,8 @@
 bdtrace
 bdview
 test_*
-!tests/test_*
+!tests/test_*.cpp
+!tests/helpers/*
 bdtrace.db
 *.db
 vendor/sqlite3.c

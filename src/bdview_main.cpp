@@ -23,7 +23,7 @@ static void usage() {
         "  slowest <db> [-n N]            Top N slowest processes (default 10)\n"
         "  files <db> [-p PID | -f PATH]  File access info\n"
         "  trace <db> [-p PID | -f PATH] [-w N]  Files with process ancestry\n"
-        "  rebuild <db> --changed FILE    Minimal rebuild set\n"
+        "  rebuild <db> --changed F [--changed F2 ...] [--collapse CMD ...]  Minimal rebuild set\n"
     );
 }
 
@@ -165,6 +165,31 @@ static const char* mode_str(int mode) {
         case FA_CHDIR:          return "CD";
         default:                return "?";
     }
+}
+
+static bool is_input_mode(int mode) {
+    return mode == FA_READ || mode == FA_RDWR || mode == FA_EXEC
+        || mode == FA_STAT || mode == FA_ACCESS || mode == FA_READLINK;
+}
+
+static bool is_output_mode(int mode) {
+    return mode == FA_WRITE || mode == FA_RDWR || mode == FA_RENAME_DST
+        || mode == FA_LINK_DST || mode == FA_SYMLINK_LINK
+        || mode == FA_TRUNCATE || mode == FA_MKNOD || mode == FA_MKDIR;
+}
+
+static bool cmp_start_time(const ProcessRecord& a, const ProcessRecord& b) {
+    return a.start_time_us < b.start_time_us;
+}
+
+// Extract command name (basename of first word) from cmdline
+static std::string cmd_name(const std::string& cmdline) {
+    std::string first = cmdline;
+    size_t sp = first.find(' ');
+    if (sp != std::string::npos) first = first.substr(0, sp);
+    size_t sl = first.rfind('/');
+    if (sl != std::string::npos) first = first.substr(sl + 1);
+    return first;
 }
 
 static int cmd_files(Database& db, int filter_pid, const std::string& filter_path) {
@@ -336,59 +361,191 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
 }
 
 // --- rebuild ---
-static int cmd_rebuild(Database& db, const std::string& changed_file) {
-    std::printf("=== Minimal Rebuild Set for: %s ===\n", changed_file.c_str());
+static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_args,
+                       const std::set<std::string>& collapse_names) {
+    // Phase 1: Bulk load all data
+    std::vector<FileAccessRecord> all_accesses;
+    std::vector<ProcessRecord> all_procs;
+    db.get_all_file_accesses(all_accesses);
+    db.get_all_processes(all_procs);
 
-    // Step 1: Find processes that read the changed file
-    std::vector<FileAccessRecord> readers;
-    db.get_file_accesses_by_name(changed_file, readers);
+    // Phase 2: Build indexes
+    // file_to_readers: filename -> set of PIDs that read/exec/stat this file
+    // pid_to_outputs:  PID -> set of filenames written by this PID
+    // proc_map:        PID -> ProcessRecord
+    std::map<std::string, std::set<int> > file_to_readers;
+    std::map<int, std::set<std::string> > pid_to_outputs;
+    std::map<int, ProcessRecord> proc_map;
 
-    std::set<int> affected_pids;
+    for (size_t i = 0; i < all_accesses.size(); ++i) {
+        const FileAccessRecord& fa = all_accesses[i];
+        if (is_input_mode(fa.mode)) {
+            file_to_readers[fa.filename].insert(fa.pid);
+        }
+        if (is_output_mode(fa.mode)) {
+            pid_to_outputs[fa.pid].insert(fa.filename);
+        }
+    }
+    for (size_t i = 0; i < all_procs.size(); ++i) {
+        proc_map[all_procs[i].pid] = all_procs[i];
+    }
+
+    // Phase 3: Resolve changed_args to a set of filenames
+    std::set<std::string> changed_files;
+    for (size_t a = 0; a < changed_args.size(); ++a) {
+        const std::string& arg = changed_args[a];
+
+        // Exact match
+        if (file_to_readers.find(arg) != file_to_readers.end()) {
+            changed_files.insert(arg);
+        }
+
+        // Folder prefix match: try arg + "/" if arg doesn't end with /
+        std::string prefix = arg;
+        if (!prefix.empty() && prefix[prefix.size() - 1] != '/') {
+            prefix += '/';
+        }
+
+        std::map<std::string, std::set<int> >::const_iterator it =
+            file_to_readers.lower_bound(prefix);
+        while (it != file_to_readers.end()) {
+            if (it->first.compare(0, prefix.size(), prefix) != 0) break;
+            changed_files.insert(it->first);
+            ++it;
+        }
+    }
+
+    // Phase 4: BFS propagation
+    std::set<int> affected;
     std::queue<int> worklist;
 
-    for (size_t i = 0; i < readers.size(); ++i) {
-        if (readers[i].mode == FA_READ || readers[i].mode == FA_RDWR) {
-            if (affected_pids.find(readers[i].pid) == affected_pids.end()) {
-                affected_pids.insert(readers[i].pid);
-                worklist.push(readers[i].pid);
+    // Seed: PIDs that read any changed file
+    for (std::set<std::string>::const_iterator fi = changed_files.begin();
+         fi != changed_files.end(); ++fi) {
+        const std::set<int>& readers = file_to_readers[*fi];
+        for (std::set<int>::const_iterator ri = readers.begin();
+             ri != readers.end(); ++ri) {
+            if (affected.find(*ri) == affected.end()) {
+                affected.insert(*ri);
+                worklist.push(*ri);
             }
         }
     }
 
-    // Step 2: BFS - find files written by affected processes,
-    // then find processes that read those files
+    // BFS: affected PID's outputs -> downstream readers
     while (!worklist.empty()) {
         int pid = worklist.front();
         worklist.pop();
 
-        std::vector<FileAccessRecord> writes;
-        db.get_file_accesses_by_pid(pid, writes);
+        std::map<int, std::set<std::string> >::const_iterator oit =
+            pid_to_outputs.find(pid);
+        if (oit == pid_to_outputs.end()) continue;
 
-        for (size_t i = 0; i < writes.size(); ++i) {
-            if (writes[i].mode != FA_WRITE && writes[i].mode != FA_RDWR) continue;
+        const std::set<std::string>& outputs = oit->second;
+        for (std::set<std::string>::const_iterator fi = outputs.begin();
+             fi != outputs.end(); ++fi) {
+            std::map<std::string, std::set<int> >::const_iterator rit =
+                file_to_readers.find(*fi);
+            if (rit == file_to_readers.end()) continue;
 
-            // Find all readers of this output file
-            std::vector<FileAccessRecord> downstream;
-            db.get_file_accesses_by_name(writes[i].filename, downstream);
-
-            for (size_t j = 0; j < downstream.size(); ++j) {
-                if (downstream[j].mode == FA_READ || downstream[j].mode == FA_RDWR) {
-                    if (affected_pids.find(downstream[j].pid) == affected_pids.end()) {
-                        affected_pids.insert(downstream[j].pid);
-                        worklist.push(downstream[j].pid);
-                    }
+            const std::set<int>& readers = rit->second;
+            for (std::set<int>::const_iterator ri = readers.begin();
+                 ri != readers.end(); ++ri) {
+                if (affected.find(*ri) == affected.end()) {
+                    affected.insert(*ri);
+                    worklist.push(*ri);
                 }
             }
         }
     }
 
-    // Print results
-    std::printf("Affected processes: %d\n", (int)affected_pids.size());
-    for (std::set<int>::iterator it = affected_pids.begin(); it != affected_pids.end(); ++it) {
-        ProcessRecord rec;
-        if (db.get_process(*it, rec)) {
-            std::printf("  [%d] %s\n", rec.pid, rec.cmdline.c_str());
+    // Phase 5: Filter affected processes for display
+    //
+    // A collapsed PID matches a --collapse name. It is shown as-is and
+    // all its affected descendants are hidden (absorbed into it).
+    // Among the remaining affected PIDs, only those with output files
+    // (entries in pid_to_outputs) are shown.
+
+    // Build children map for descendant traversal
+    std::map<int, std::vector<int> > pid_children;
+    for (std::map<int, ProcessRecord>::const_iterator it = proc_map.begin();
+         it != proc_map.end(); ++it) {
+        pid_children[it->second.ppid].push_back(it->first);
+    }
+
+    // Identify collapsed PIDs and collect their affected descendants
+    std::set<int> collapsed_pids;
+    std::set<int> hidden_pids;
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        std::map<int, ProcessRecord>::const_iterator pit = proc_map.find(*it);
+        if (pit == proc_map.end()) continue;
+        if (collapse_names.find(cmd_name(pit->second.cmdline)) != collapse_names.end()) {
+            collapsed_pids.insert(*it);
         }
+    }
+    // BFS from each collapsed PID to hide affected descendants
+    for (std::set<int>::const_iterator ci = collapsed_pids.begin();
+         ci != collapsed_pids.end(); ++ci) {
+        std::queue<int> dq;
+        dq.push(*ci);
+        while (!dq.empty()) {
+            int p = dq.front();
+            dq.pop();
+            std::map<int, std::vector<int> >::const_iterator ch = pid_children.find(p);
+            if (ch == pid_children.end()) continue;
+            for (size_t i = 0; i < ch->second.size(); ++i) {
+                int child = ch->second[i];
+                if (affected.find(child) != affected.end()) {
+                    hidden_pids.insert(child);
+                }
+                dq.push(child);
+            }
+        }
+    }
+
+    // Among affected PIDs with outputs, find those whose child also
+    // has outputs (these are intermediate orchestrators like gcc/g++)
+    std::set<int> has_output_child;
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        if (pid_to_outputs.find(*it) == pid_to_outputs.end()) continue;
+        std::map<int, ProcessRecord>::const_iterator pit = proc_map.find(*it);
+        if (pit == proc_map.end()) continue;
+        int ppid = pit->second.ppid;
+        if (affected.find(ppid) != affected.end()
+            && pid_to_outputs.find(ppid) != pid_to_outputs.end()) {
+            has_output_child.insert(ppid);
+        }
+    }
+
+    // Build result: collapsed PIDs + leaf output producers (have outputs,
+    // no affected child with outputs)
+    std::vector<ProcessRecord> result;
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        if (hidden_pids.find(*it) != hidden_pids.end()) continue;
+        if (collapsed_pids.find(*it) != collapsed_pids.end()) {
+            result.push_back(proc_map.find(*it)->second);
+            continue;
+        }
+        if (pid_to_outputs.find(*it) != pid_to_outputs.end()
+            && has_output_child.find(*it) == has_output_child.end()) {
+            result.push_back(proc_map.find(*it)->second);
+        }
+    }
+    std::sort(result.begin(), result.end(), cmp_start_time);
+
+    // Print header
+    std::printf("=== Minimal Rebuild Set for:");
+    for (size_t i = 0; i < changed_args.size(); ++i) {
+        std::printf(" %s", changed_args[i].c_str());
+    }
+    std::printf(" ===\n");
+
+    std::printf("Affected processes: %d\n", (int)result.size());
+    for (size_t i = 0; i < result.size(); ++i) {
+        std::printf("  [%d] %s\n", result[i].pid, result[i].cmdline.c_str());
     }
 
     return 0;
@@ -450,17 +607,20 @@ int main(int argc, char* argv[]) {
         }
         return cmd_trace(db, filter_pid, filter_path, col_width);
     } else if (command == "rebuild") {
-        std::string changed;
+        std::vector<std::string> changed;
+        std::set<std::string> collapse;
         for (int i = 3; i < argc; ++i) {
             if (std::strcmp(argv[i], "--changed") == 0 && i + 1 < argc) {
-                changed = argv[++i];
+                changed.push_back(argv[++i]);
+            } else if (std::strcmp(argv[i], "--collapse") == 0 && i + 1 < argc) {
+                collapse.insert(argv[++i]);
             }
         }
         if (changed.empty()) {
             std::fprintf(stderr, "bdview rebuild: --changed FILE required\n");
             return 1;
         }
-        return cmd_rebuild(db, changed);
+        return cmd_rebuild(db, changed, collapse);
     } else {
         std::fprintf(stderr, "bdview: unknown command: %s\n", command.c_str());
         usage();
