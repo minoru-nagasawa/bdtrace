@@ -2,6 +2,7 @@
 *.d
 bdtrace
 bdview
+bdview-web
 test_*
 !tests/test_*.cpp
 !tests/helpers/*
@@ -9,6 +10,9 @@ bdtrace.db
 *.db
 vendor/sqlite3.c
 vendor/sqlite3.h
+vendor/mongoose.c
+vendor/mongoose.h
+src/web/static_assets.h
 .vscode/*
 !.vscode/launch.json
 !.vscode/tasks.json

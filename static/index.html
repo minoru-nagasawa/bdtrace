@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bdtrace - Build Trace Viewer</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<nav id="navbar">
+  <span class="logo">bdtrace</span>
+  <a href="#" class="tab active" data-view="summary">Summary</a>
+  <a href="#" class="tab" data-view="processes">Processes</a>
+  <a href="#" class="tab" data-view="files">Files</a>
+  <a href="#" class="tab" data-view="bottlenecks">Bottlenecks</a>
+  <a href="#" class="tab" data-view="timeline">Timeline</a>
+  <a href="#" class="tab" data-view="analysis">Analysis</a>
+</nav>
+<main id="app"></main>
+<script src="/timeline.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
