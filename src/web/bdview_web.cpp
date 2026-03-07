@@ -418,7 +418,31 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
 
-    if (group_by == "cmd_name") {
+    std::string cmd_filter = get_query_param(query, "cmd");
+
+    if (!cmd_filter.empty()) {
+        // Return individual processes matching cmd_name
+        std::vector<ProcessRecord> matched;
+        for (size_t i = 0; i < procs.size(); ++i) {
+            if (procs[i].end_time_us <= 0) continue;
+            if (cmd_name(procs[i].cmdline) == cmd_filter)
+                matched.push_back(procs[i]);
+        }
+        std::sort(matched.begin(), matched.end(), cmp_duration_desc);
+
+        JsonWriter jw;
+        jw.beginArray();
+        for (size_t i = 0; i < matched.size(); ++i) {
+            jw.beginObject();
+            jw.key("pid").val(matched[i].pid);
+            jw.key("ppid").val(matched[i].ppid);
+            jw.key("cmdline").val(matched[i].cmdline);
+            write_proc_info(jw, matched[i]);
+            jw.endObject();
+        }
+        jw.endArray();
+        send_json(c, jw.str());
+    } else if (group_by == "cmd_name") {
         std::map<std::string, GroupStats> groups;
         for (size_t i = 0; i < procs.size(); ++i) {
             if (procs[i].end_time_us <= 0) continue;

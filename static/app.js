@@ -85,6 +85,54 @@ var App = (function() {
     return el('span', attrs, text);
   }
 
+  // ---- Column resize ----
+  function enableColumnResize(table) {
+    table.style.tableLayout = 'fixed';
+    var ths = table.querySelectorAll('thead th');
+    if (!ths.length) return;
+
+    // Set initial widths from computed sizes, then fix them
+    for (var i = 0; i < ths.length; i++) {
+      ths[i].style.width = ths[i].offsetWidth + 'px';
+    }
+
+    for (var i = 0; i < ths.length - 1; i++) {
+      (function(th, idx) {
+        var handle = document.createElement('span');
+        handle.className = 'col-resize-handle';
+        th.style.position = 'relative';
+        th.appendChild(handle);
+
+        handle.addEventListener('mousedown', function(e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var startX = e.clientX;
+          var startW = th.offsetWidth;
+          var nextTh = ths[idx + 1];
+          var nextW = nextTh.offsetWidth;
+
+          function onMove(e2) {
+            var dx = e2.clientX - startX;
+            var newW = Math.max(30, startW + dx);
+            var newNext = Math.max(30, nextW - dx);
+            th.style.width = newW + 'px';
+            nextTh.style.width = newNext + 'px';
+          }
+          function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+          }
+          document.body.style.cursor = 'col-resize';
+          document.body.style.userSelect = 'none';
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+      })(ths[i], i);
+    }
+  }
+
   function cmdName(cmdline) {
     var first = cmdline.split(' ')[0];
     var sl = first.lastIndexOf('/');
@@ -345,6 +393,7 @@ var App = (function() {
     // Tree header - always create all, use data-col for toggling
     var hdr = el('div', {className: 'tree-header'});
     hdr.appendChild(el('span', {className: 'th-tree'}, 'Process'));
+    var hdrColsWrap = el('span', {className: 'node-cols'});
     var hdrCols = [
       ['files', 'th-col', 'Files'],
       ['fails', 'th-col', 'Fails'],
@@ -360,15 +409,16 @@ var App = (function() {
     ];
     for (var hi = 0; hi < hdrCols.length; hi++) {
       var hc = el('span', {className: hdrCols[hi][1], 'data-col': hdrCols[hi][0]}, hdrCols[hi][2]);
-      hdr.appendChild(hc);
+      hdrColsWrap.appendChild(hc);
     }
+    hdr.appendChild(hdrColsWrap);
     left.appendChild(hdr);
 
     var treeDiv = el('div', {className: 'tree'});
     var roots = data.roots || [];
     var rootUl = el('ul');
     for (var r = 0; r < roots.length; r++) {
-      rootUl.appendChild(buildTreeNode(roots[r], ctx, right, nodeRegistry));
+      rootUl.appendChild(buildTreeNode(roots[r], ctx, right, nodeRegistry, 0));
     }
     treeDiv.appendChild(rootUl);
     left.appendChild(treeDiv);
@@ -378,7 +428,7 @@ var App = (function() {
     wrapper.appendChild(split);
   }
 
-  function buildTreeNode(pid, ctx, rightPanel, registry) {
+  function buildTreeNode(pid, ctx, rightPanel, registry, depth) {
     var proc = ctx.procMap[pid];
     if (!proc) return el('li');
     var dur = proc.end_time_us - proc.start_time_us;
@@ -393,14 +443,18 @@ var App = (function() {
     var cmdText = cmdName(proc.cmdline);
     var cmdSpan = spanWithTitle(cmdText, proc.cmdline, 'cmd' + (proc.exit_code !== 0 ? ' exit-err' : ''));
 
-    node.appendChild(toggle);
-    node.appendChild(pidSpan);
-    node.appendChild(cmdSpan);
+    var treePart = el('span', {className: 'node-tree'});
+    if (depth > 0) treePart.style.paddingLeft = (depth * 16) + 'px';
+    treePart.appendChild(toggle);
+    treePart.appendChild(pidSpan);
+    treePart.appendChild(cmdSpan);
+    node.appendChild(treePart);
 
     var cpuTotal = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
     var ioTotal = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
     var fc = proc.fail_count || 0;
 
+    var colsPart = el('span', {className: 'node-cols'});
     var cols = [
       ['files', 'col-num', proc.file_count != null ? String(proc.file_count) : '-'],
       ['fails', 'col-num' + (fc > 0 ? ' exit-err' : ''), fc > 0 ? String(fc) : '-'],
@@ -416,8 +470,9 @@ var App = (function() {
     ];
     for (var ci = 0; ci < cols.length; ci++) {
       var sp = el('span', {className: cols[ci][1], 'data-col': cols[ci][0]}, cols[ci][2]);
-      node.appendChild(sp);
+      colsPart.appendChild(sp);
     }
+    node.appendChild(colsPart);
 
     var childUl = null;
 
@@ -425,7 +480,7 @@ var App = (function() {
       if (!childUl && hasChildren) {
         childUl = el('ul');
         for (var c = 0; c < children.length; c++) {
-          childUl.appendChild(buildTreeNode(children[c], ctx, rightPanel, registry));
+          childUl.appendChild(buildTreeNode(children[c], ctx, rightPanel, registry, depth + 1));
         }
         li.appendChild(childUl);
       }
@@ -534,7 +589,7 @@ var App = (function() {
       container.appendChild(fileHdr);
 
       var treeDiv = el('div', {className: 'tree'});
-      treeDiv.appendChild(buildProcFileTree(tree, pfRegistry));
+      treeDiv.appendChild(buildProcFileTree(tree, pfRegistry, 0));
       container.appendChild(treeDiv);
 
       container.appendChild(el('div', {style: 'margin-top:8px;color:var(--fg2);font-size:11px'}, filenames.length + ' unique files, ' + files.length + ' total accesses'));
@@ -587,7 +642,7 @@ var App = (function() {
     return frag;
   }
 
-  function buildProcFileTree(tree, registry) {
+  function buildProcFileTree(tree, registry, depth) {
     var ul = el('ul');
     var keys = Object.keys(tree).sort();
     for (var k = 0; k < keys.length; k++) {
@@ -598,6 +653,7 @@ var App = (function() {
 
         var li = el('li');
         var node = el('div', {className: 'node'});
+        if (depth > 0) node.style.paddingLeft = (depth * 16 + 6) + 'px';
         var toggle = el('span', {className: 'toggle'}, hasChildren ? '+' : ' ');
         var nameSpan = el('span', {className: 'cmd'}, name);
         node.appendChild(toggle);
@@ -614,7 +670,7 @@ var App = (function() {
 
         function ensureChildren() {
           if (!childUl && hasChildren) {
-            childUl = buildProcFileTree(entry._children, registry);
+            childUl = buildProcFileTree(entry._children, registry, depth + 1);
             li.appendChild(childUl);
           }
         }
@@ -704,7 +760,7 @@ var App = (function() {
       left.appendChild(makeTreeToolbar(nodeRegistry));
 
       var treeDiv = el('div', {className: 'tree'});
-      treeDiv.appendChild(buildFileTree(tree, '', right, nodeRegistry));
+      treeDiv.appendChild(buildFileTree(tree, '', right, nodeRegistry, 0));
       left.appendChild(treeDiv);
 
       split.appendChild(left);
@@ -715,7 +771,7 @@ var App = (function() {
     });
   }
 
-  function buildFileTree(tree, prefix, rightPanel, registry) {
+  function buildFileTree(tree, prefix, rightPanel, registry, depth) {
     var ul = el('ul');
     var keys = Object.keys(tree).sort();
     for (var k = 0; k < keys.length; k++) {
@@ -734,6 +790,7 @@ var App = (function() {
       (function(name, entry, fullPath, hasChildren) {
         var li = el('li');
         var node = el('div', {className: 'node'});
+        if (depth > 0) node.style.paddingLeft = (depth * 16 + 6) + 'px';
         var toggle = el('span', {className: 'toggle'}, hasChildren ? '+' : ' ');
         var nameSpan = el('span', {className: 'cmd'}, name);
         var countSpan = el('span', {className: 'dur'}, '(' + entry._count + ')');
@@ -748,7 +805,7 @@ var App = (function() {
         function ensureChildren() {
           if (!childUl && hasChildren) {
             var childPrefix = (name === '/') ? '/' : fullPath;
-            childUl = buildFileTree(entry._children, childPrefix, rightPanel, registry);
+            childUl = buildFileTree(entry._children, childPrefix, rightPanel, registry, depth + 1);
             li.appendChild(childUl);
           }
         }
@@ -895,6 +952,7 @@ var App = (function() {
       tbody.appendChild(tr);
     }
     tbl.appendChild(tbody);
+    setTimeout(function() { enableColumnResize(tbl); }, 0);
     return tbl;
   }
 
@@ -940,18 +998,164 @@ var App = (function() {
       }
       container.appendChild(sortRow);
 
-      var hdr = makeTable(
-        ['Command', 'Count', 'Total', 'Avg', 'Max', 'CPU Total', 'CPU Avg', 'CPU Max', 'Max RSS'],
-        data.map(function(g) {
-          return [g.cmd_name, g.count,
-                  formatDuration(g.total_us), formatDuration(g.avg_us), formatDuration(g.max_us),
-                  (g.total_cpu_us || 0) > 0 ? formatDuration(g.total_cpu_us) : '-',
-                  (g.avg_cpu_us || 0) > 0 ? formatDuration(g.avg_cpu_us) : '-',
-                  (g.max_cpu_us || 0) > 0 ? formatDuration(g.max_cpu_us) : '-',
-                  formatRss(g.max_rss_kb || 0)];
-        })
-      );
-      container.appendChild(hdr);
+      // Compute totals for percentage
+      var grandTotalUs = 0, grandTotalCpu = 0;
+      for (var ti = 0; ti < data.length; ti++) {
+        grandTotalUs += data[ti].total_us || 0;
+        grandTotalCpu += data[ti].total_cpu_us || 0;
+      }
+
+      var tbl = document.createElement('table');
+      var thead = document.createElement('thead');
+      var headTr = document.createElement('tr');
+      var cols = ['', 'Command', 'Count', 'Total', '%Time', 'Avg', 'Max', 'CPU Total', '%CPU', 'CPU Avg', 'CPU Max', 'Max RSS'];
+      for (var ci = 0; ci < cols.length; ci++) {
+        var th = document.createElement('th');
+        th.textContent = cols[ci];
+        if (ci === 0) th.className = 'bn-toggle';
+        headTr.appendChild(th);
+      }
+      thead.appendChild(headTr);
+      tbl.appendChild(thead);
+
+      var tbody = document.createElement('tbody');
+      for (var gi = 0; gi < data.length; gi++) {
+        (function(g) {
+          var tr = document.createElement('tr');
+          tr.className = 'bottleneck-group';
+          var toggleTd = document.createElement('td');
+          toggleTd.className = 'bn-toggle';
+          toggleTd.textContent = '+';
+          tr.appendChild(toggleTd);
+
+          var pctTime = grandTotalUs > 0 ? (g.total_us || 0) * 100 / grandTotalUs : 0;
+          var pctCpu = grandTotalCpu > 0 ? (g.total_cpu_us || 0) * 100 / grandTotalCpu : 0;
+
+          var vals = [
+            {text: g.cmd_name},
+            {text: g.count},
+            {text: formatDuration(g.total_us)},
+            {text: formatPct(g.total_us, grandTotalUs), pct: pctTime},
+            {text: formatDuration(g.avg_us)},
+            {text: formatDuration(g.max_us)},
+            {text: (g.total_cpu_us || 0) > 0 ? formatDuration(g.total_cpu_us) : '-'},
+            {text: formatPct(g.total_cpu_us, grandTotalCpu), pct: pctCpu},
+            {text: (g.avg_cpu_us || 0) > 0 ? formatDuration(g.avg_cpu_us) : '-'},
+            {text: (g.max_cpu_us || 0) > 0 ? formatDuration(g.max_cpu_us) : '-'},
+            {text: formatRss(g.max_rss_kb || 0)}
+          ];
+          for (var vi = 0; vi < vals.length; vi++) {
+            var td = document.createElement('td');
+            td.textContent = vals[vi].text;
+            if (vals[vi].pct != null && vals[vi].pct >= 25) {
+              td.style.color = 'var(--red)';
+              td.style.fontWeight = 'bold';
+            } else if (vals[vi].pct != null && vals[vi].pct >= 10) {
+              td.style.color = 'var(--orange)';
+              td.style.fontWeight = 'bold';
+            } else if (vals[vi].pct != null && vals[vi].pct >= 5) {
+              td.style.color = 'var(--yellow)';
+            }
+            tr.appendChild(td);
+          }
+          tr.onclick = function() { toggleGroup(g, tr, toggleTd, tbody); };
+          tbody.appendChild(tr);
+        })(data[gi]);
+      }
+      tbl.appendChild(tbody);
+      container.appendChild(tbl);
+      setTimeout(function() { enableColumnResize(tbl); }, 0);
+
+      function toggleGroup(group, groupRow, toggleTd, tbody) {
+        if (groupRow._expanded) {
+          // collapse: remove child rows
+          var children = groupRow._children || [];
+          for (var i = 0; i < children.length; i++) {
+            if (children[i].parentNode) children[i].parentNode.removeChild(children[i]);
+          }
+          groupRow._expanded = false;
+          toggleTd.textContent = '+';
+          return;
+        }
+        // expand
+        if (groupRow._children) {
+          insertChildren(groupRow, groupRow._children, tbody);
+          groupRow._expanded = true;
+          toggleTd.textContent = '\u2212';
+          return;
+        }
+        toggleTd.textContent = '...';
+        api('/api/slowest?cmd=' + encodeURIComponent(group.cmd_name), function(procs) {
+          var rows = [];
+          for (var i = 0; i < procs.length; i++) {
+            var p = procs[i];
+            var cr = document.createElement('tr');
+            cr.className = 'bottleneck-child';
+            // toggle placeholder
+            var ct0 = document.createElement('td');
+            ct0.className = 'bn-toggle';
+            cr.appendChild(ct0);
+            // cmdline with pid
+            var ct1 = document.createElement('td');
+            ct1.className = 'cmd-cell';
+            ct1.textContent = '[' + p.pid + '] ' + p.cmdline;
+            ct1.title = p.cmdline;
+            cr.appendChild(ct1);
+            // exit_code (Count col)
+            var ct2 = document.createElement('td');
+            ct2.textContent = p.exit_code != null ? p.exit_code : '-';
+            if (p.exit_code && p.exit_code !== 0) ct2.style.color = 'var(--red)';
+            cr.appendChild(ct2);
+            // duration (Total col)
+            var ct3 = document.createElement('td');
+            ct3.textContent = formatDuration(p.duration_us);
+            cr.appendChild(ct3);
+            // %Time
+            var childPctTime = grandTotalUs > 0 ? (p.duration_us || 0) * 100 / grandTotalUs : 0;
+            var ctPctTime = document.createElement('td');
+            ctPctTime.textContent = formatPct(p.duration_us, grandTotalUs);
+            if (childPctTime >= 25) { ctPctTime.style.color = 'var(--red)'; ctPctTime.style.fontWeight = 'bold'; }
+            else if (childPctTime >= 10) { ctPctTime.style.color = 'var(--orange)'; ctPctTime.style.fontWeight = 'bold'; }
+            else if (childPctTime >= 5) { ctPctTime.style.color = 'var(--yellow)'; }
+            cr.appendChild(ctPctTime);
+            // avg, max placeholders
+            cr.appendChild(document.createElement('td')).textContent = '-';
+            cr.appendChild(document.createElement('td')).textContent = '-';
+            // cpu (CPU Total col)
+            var cpuVal = (p.user_time_us || 0) + (p.sys_time_us || 0);
+            var ct6 = document.createElement('td');
+            ct6.textContent = cpuVal > 0 ? formatDuration(cpuVal) : '-';
+            cr.appendChild(ct6);
+            // %CPU
+            var childPctCpu = grandTotalCpu > 0 ? cpuVal * 100 / grandTotalCpu : 0;
+            var ctPctCpu = document.createElement('td');
+            ctPctCpu.textContent = formatPct(cpuVal, grandTotalCpu);
+            if (childPctCpu >= 25) { ctPctCpu.style.color = 'var(--red)'; ctPctCpu.style.fontWeight = 'bold'; }
+            else if (childPctCpu >= 10) { ctPctCpu.style.color = 'var(--orange)'; ctPctCpu.style.fontWeight = 'bold'; }
+            else if (childPctCpu >= 5) { ctPctCpu.style.color = 'var(--yellow)'; }
+            cr.appendChild(ctPctCpu);
+            // cpu avg, cpu max placeholders
+            cr.appendChild(document.createElement('td')).textContent = '-';
+            cr.appendChild(document.createElement('td')).textContent = '-';
+            // rss
+            var ct9 = document.createElement('td');
+            ct9.textContent = formatRss(p.peak_rss_kb || 0);
+            cr.appendChild(ct9);
+            rows.push(cr);
+          }
+          groupRow._children = rows;
+          insertChildren(groupRow, rows, tbody);
+          groupRow._expanded = true;
+          toggleTd.textContent = '\u2212';
+        });
+      }
+
+      function insertChildren(groupRow, children, tbody) {
+        var next = groupRow.nextSibling;
+        for (var i = 0; i < children.length; i++) {
+          tbody.insertBefore(children[i], next);
+        }
+      }
 
       var app = document.getElementById('app');
       app.appendChild(container);
