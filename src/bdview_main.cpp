@@ -22,6 +22,7 @@ static void usage() {
         "  tree <db>                      Process tree with durations\n"
         "  slowest <db> [-n N]            Top N slowest processes (default 10)\n"
         "  files <db> [-p PID | -f PATH]  File access info\n"
+        "  trace <db> [-p PID | -f PATH]  Files with process ancestry chain\n"
         "  rebuild <db> --changed FILE    Minimal rebuild set\n"
     );
 }
@@ -173,6 +174,149 @@ static int cmd_files(Database& db, int filter_pid, const std::string& filter_pat
     return 0;
 }
 
+// --- trace ---
+// Build parent chain: pid -> parent -> grandparent -> ... -> root
+static std::vector<ProcessRecord> get_ancestor_chain(Database& db, int pid) {
+    std::vector<ProcessRecord> chain;
+    std::set<int> visited;
+    int cur = pid;
+    while (true) {
+        if (visited.find(cur) != visited.end()) break;
+        visited.insert(cur);
+        ProcessRecord rec;
+        if (!db.get_process(cur, rec)) break;
+        chain.push_back(rec);
+        cur = rec.ppid;
+    }
+    return chain;
+}
+
+static int cmd_trace(Database& db, int filter_pid, const std::string& filter_path) {
+    // Collect all processes and file accesses
+    std::vector<ProcessRecord> all_procs;
+    db.get_all_processes(all_procs);
+
+    // Build pid -> process map
+    std::map<int, ProcessRecord> proc_map;
+    for (size_t i = 0; i < all_procs.size(); ++i) {
+        proc_map[all_procs[i].pid] = all_procs[i];
+    }
+
+    if (filter_pid > 0) {
+        // Show files for this PID with its ancestor chain
+        std::vector<ProcessRecord> chain = get_ancestor_chain(db, filter_pid);
+        if (chain.empty()) {
+            std::printf("Process %d not found.\n", filter_pid);
+            return 1;
+        }
+
+        std::printf("=== Trace for PID %d ===\n", filter_pid);
+        std::printf("Process chain:\n");
+        for (size_t i = 0; i < chain.size(); ++i) {
+            std::string indent(i * 2, ' ');
+            std::printf("  %s%s%s [%d]\n", indent.c_str(),
+                        i == 0 ? "" : "\\_ ",
+                        chain[i].cmdline.c_str(), chain[i].pid);
+        }
+
+        std::vector<FileAccessRecord> accesses;
+        db.get_file_accesses_by_pid(filter_pid, accesses);
+        std::printf("\nFiles (%d):\n", (int)accesses.size());
+        for (size_t i = 0; i < accesses.size(); ++i) {
+            std::printf("  %-3s %s\n", mode_str(accesses[i].mode),
+                        accesses[i].filename.c_str());
+        }
+        return 0;
+    }
+
+    if (!filter_path.empty()) {
+        // Show all processes that touched this file, with ancestor chains
+        std::vector<FileAccessRecord> accesses;
+        db.get_file_accesses_by_name(filter_path, accesses);
+
+        if (accesses.empty()) {
+            std::printf("No accesses found for: %s\n", filter_path.c_str());
+            return 0;
+        }
+
+        std::printf("=== Trace for: %s ===\n\n", filter_path.c_str());
+        // Deduplicate by pid (may have multiple accesses)
+        std::set<int> seen_pids;
+        for (size_t i = 0; i < accesses.size(); ++i) {
+            int pid = accesses[i].pid;
+            if (seen_pids.find(pid) != seen_pids.end()) continue;
+            seen_pids.insert(pid);
+
+            std::printf("  %-3s [%d]", mode_str(accesses[i].mode), pid);
+            // Print ancestor chain inline
+            std::vector<ProcessRecord> chain = get_ancestor_chain(db, pid);
+            for (size_t j = 0; j < chain.size(); ++j) {
+                if (j == 0) {
+                    std::printf(" %s", chain[j].cmdline.c_str());
+                } else {
+                    std::printf("\n      %s\\_ %s [%d]",
+                                std::string(j * 3, ' ').c_str(),
+                                chain[j].cmdline.c_str(), chain[j].pid);
+                }
+            }
+            std::printf("\n\n");
+        }
+        return 0;
+    }
+
+    // No filter: group by file, show each file with its accessing processes
+    std::vector<FileAccessRecord> all_accesses;
+    db.get_all_file_accesses(all_accesses);
+
+    if (all_accesses.empty()) {
+        std::printf("No file accesses recorded.\n");
+        return 0;
+    }
+
+    // Group accesses by filename
+    // Use a vector of pairs to preserve insertion order
+    std::map<std::string, std::vector<FileAccessRecord> > by_file;
+    std::vector<std::string> file_order;
+    for (size_t i = 0; i < all_accesses.size(); ++i) {
+        const std::string& fn = all_accesses[i].filename;
+        if (by_file.find(fn) == by_file.end()) {
+            file_order.push_back(fn);
+        }
+        by_file[fn].push_back(all_accesses[i]);
+    }
+
+    std::printf("=== File Access Trace (%d files) ===\n\n", (int)file_order.size());
+
+    for (size_t fi = 0; fi < file_order.size(); ++fi) {
+        const std::string& filename = file_order[fi];
+        const std::vector<FileAccessRecord>& accs = by_file[filename];
+
+        std::printf("%s\n", filename.c_str());
+
+        // Deduplicate by pid
+        std::set<int> seen_pids;
+        for (size_t i = 0; i < accs.size(); ++i) {
+            int pid = accs[i].pid;
+            if (seen_pids.find(pid) != seen_pids.end()) continue;
+            seen_pids.insert(pid);
+
+            std::vector<ProcessRecord> chain = get_ancestor_chain(db, pid);
+            if (chain.empty()) continue;
+
+            std::printf("  %-3s %s [%d]\n", mode_str(accs[i].mode),
+                        chain[0].cmdline.c_str(), chain[0].pid);
+            for (size_t j = 1; j < chain.size(); ++j) {
+                std::printf("      %s\\_ %s [%d]\n",
+                            std::string((j - 1) * 3, ' ').c_str(),
+                            chain[j].cmdline.c_str(), chain[j].pid);
+            }
+        }
+        std::printf("\n");
+    }
+
+    return 0;
+}
+
 // --- rebuild ---
 static int cmd_rebuild(Database& db, const std::string& changed_file) {
     std::printf("=== Minimal Rebuild Set for: %s ===\n", changed_file.c_str());
@@ -273,6 +417,17 @@ int main(int argc, char* argv[]) {
             }
         }
         return cmd_files(db, filter_pid, filter_path);
+    } else if (command == "trace") {
+        int filter_pid = 0;
+        std::string filter_path;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+                filter_pid = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+                filter_path = argv[++i];
+            }
+        }
+        return cmd_trace(db, filter_pid, filter_path);
     } else if (command == "rebuild") {
         std::string changed;
         for (int i = 3; i < argc; ++i) {
