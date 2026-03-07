@@ -282,10 +282,20 @@ void PtraceBackend::handle_exec_event(int pid) {
     std::string cmdline = read_cmdline(pid);
     LOG_DEBUG("Exec: %d -> %s", pid, cmdline.c_str());
 
+    // Reset syscall tracking state after exec.
+    // execve entry set in_syscall=true, but successful exec has no
+    // corresponding syscall exit. Without this reset, all subsequent
+    // syscall entry/exit tracking is permanently inverted.
+    std::map<int, ProcessState>::iterator it = procs_.find(pid);
+    if (it != procs_.end()) {
+        it->second.in_syscall = false;
+        it->second.pending_syscall = -1;
+    }
+
     ProcessRecord rec;
     rec.pid = pid;
-    if (procs_.find(pid) != procs_.end()) {
-        rec.ppid = procs_[pid].ppid;
+    if (it != procs_.end()) {
+        rec.ppid = it->second.ppid;
     }
     rec.cmdline = cmdline;
     rec.start_time_us = now_us();
