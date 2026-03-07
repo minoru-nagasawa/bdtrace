@@ -887,9 +887,10 @@ static void handle_diagnostics(struct mg_connection *c) {
             if (serial_count >= 3 && serial_time > total_us / 10) {
                 ProcessRecord parent;
                 if (g_db->get_process(it->first, parent)) {
-                    char msg[256];
-                    std::snprintf(msg, sizeof(msg), "%d sequential children under [%d] %s",
-                                  serial_count, it->first, shorten_cmd(parent.cmdline, 40).c_str());
+                    char prefix[64];
+                    std::snprintf(prefix, sizeof(prefix), "%d sequential children under [%d] ",
+                                  serial_count, it->first);
+                    std::string msg = std::string(prefix) + parent.cmdline;
                     char detail[128];
                     std::snprintf(detail, sizeof(detail), "Potential parallelization savings: %s",
                                   format_duration_us(serial_time).c_str());
@@ -911,12 +912,12 @@ static void handle_diagnostics(struct mg_connection *c) {
         for (size_t i = 0; i < sorted.size() && i < 5; ++i) {
             int64_t dur = sorted[i].end_time_us - sorted[i].start_time_us;
             if (dur >= threshold) {
-                char msg[256];
-                std::snprintf(msg, sizeof(msg), "%s (%d%% of total) [%d] %s",
+                char prefix[128];
+                std::snprintf(prefix, sizeof(prefix), "%s (%d%% of total) [%d] ",
                               format_duration_us(dur).c_str(),
                               (int)(dur * 100 / total_us),
-                              sorted[i].pid,
-                              shorten_cmd(sorted[i].cmdline, 50).c_str());
+                              sorted[i].pid);
+                std::string msg = std::string(prefix) + sorted[i].cmdline;
                 jw.beginObject();
                 jw.key("type").val("SLOW");
                 jw.key("message").val(msg);

@@ -14,8 +14,11 @@ var TimelineRenderer = (function() {
 
   // Interaction
   var dragStartX = -1;
+  var dragStartY = -1;
   var dragStartViewLeft = 0;
   var dragStartViewRight = 0;
+  var dragStartScrollY = 0;
+  var dragMode = ''; // 'h' or 'v'
   var hoveredRow = -1;
   var hoveredProc = null;
 
@@ -246,12 +249,14 @@ var TimelineRenderer = (function() {
     canvas.addEventListener('mousedown', function(e) {
       var rect = canvas.getBoundingClientRect();
       var mx = e.clientX - rect.left;
-      if (mx > LABEL_W) {
-        dragStartX = mx;
-        dragStartViewLeft = viewLeft;
-        dragStartViewRight = viewRight;
-        canvas.style.cursor = 'grabbing';
-      }
+      var my = e.clientY - rect.top;
+      dragStartX = mx;
+      dragStartY = my;
+      dragStartViewLeft = viewLeft;
+      dragStartViewRight = viewRight;
+      dragStartScrollY = scrollY;
+      dragMode = '';
+      canvas.style.cursor = 'grabbing';
     });
 
     canvas.addEventListener('mousemove', function(e) {
@@ -261,14 +266,25 @@ var TimelineRenderer = (function() {
 
       if (dragStartX >= 0) {
         var dx = mx - dragStartX;
-        var barW = canvas.clientWidth - LABEL_W;
-        var range = dragStartViewRight - dragStartViewLeft;
-        var shift = -dx / barW * range;
-        viewLeft = dragStartViewLeft + shift;
-        viewRight = dragStartViewRight + shift;
-        var maxRange = data.max_time_us - data.min_time_us;
-        if (viewLeft < data.min_time_us) { viewLeft = data.min_time_us; viewRight = viewLeft + range; }
-        if (viewRight > data.max_time_us) { viewRight = data.max_time_us; viewLeft = viewRight - range; }
+        var dy = my - dragStartY;
+
+        // Determine drag direction on first significant movement
+        if (!dragMode && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+          dragMode = Math.abs(dy) > Math.abs(dx) ? 'v' : 'h';
+        }
+
+        if (dragMode === 'v') {
+          var maxScroll = Math.max(0, rows.length * ROW_H - (canvas.clientHeight - ROW_H));
+          scrollY = Math.max(0, Math.min(maxScroll, dragStartScrollY - dy));
+        } else if (dragMode === 'h') {
+          var barW = canvas.clientWidth - LABEL_W;
+          var range = dragStartViewRight - dragStartViewLeft;
+          var shift = -dx / barW * range;
+          viewLeft = dragStartViewLeft + shift;
+          viewRight = dragStartViewRight + shift;
+          if (viewLeft < data.min_time_us) { viewLeft = data.min_time_us; viewRight = viewLeft + range; }
+          if (viewRight > data.max_time_us) { viewRight = data.max_time_us; viewLeft = viewRight - range; }
+        }
         render();
         return;
       }
@@ -301,11 +317,13 @@ var TimelineRenderer = (function() {
 
     canvas.addEventListener('mouseup', function() {
       dragStartX = -1;
+      dragMode = '';
       canvas.style.cursor = '';
     });
 
     canvas.addEventListener('mouseleave', function() {
       dragStartX = -1;
+      dragMode = '';
       hoveredRow = -1;
       tooltip.style.display = 'none';
       canvas.style.cursor = '';

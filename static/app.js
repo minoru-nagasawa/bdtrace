@@ -190,7 +190,7 @@ var App = (function() {
       if (s.slowest && s.slowest.length > 0) {
         app.appendChild(el('div', {className: 'section-title'}, 'Slowest Processes'));
         var tbl = makeTable(['PID', 'Duration', 'Command'], s.slowest.map(function(p) {
-          return [p.pid, formatDuration(p.duration_us), shortenCmd(p.cmdline, 80)];
+          return [p.pid, formatDuration(p.duration_us), p.cmdline];
         }));
         app.appendChild(tbl);
       }
