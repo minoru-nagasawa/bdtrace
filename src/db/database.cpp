@@ -30,7 +30,6 @@ bool Database::open(const std::string& path) {
     // Enable WAL mode
     exec("PRAGMA journal_mode=WAL");
     exec("PRAGMA synchronous=NORMAL");
-    exec("PRAGMA foreign_keys=ON");
 
     return true;
 }
