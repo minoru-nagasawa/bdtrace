@@ -168,7 +168,7 @@ int PtraceBackend::run_event_loop() {
             procs_[pid].traced = true;
             PT(PTRACE_SYSCALL, pid, 0, 0);
         } else {
-            PT(PTRACE_SYSCALL, pid, 0, sig);
+            PT(PTRACE_SYSCALL, pid, 0, (long)sig);
         }
     }
 
