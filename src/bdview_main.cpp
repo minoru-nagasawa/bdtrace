@@ -22,7 +22,7 @@ static void usage() {
         "  tree <db>                      Process tree with durations\n"
         "  slowest <db> [-n N]            Top N slowest processes (default 10)\n"
         "  files <db> [-p PID | -f PATH]  File access info\n"
-        "  trace <db> [-p PID | -f PATH]  Files with process ancestry chain\n"
+        "  trace <db> [-p PID | -f PATH] [-w N]  Files with process ancestry\n"
         "  rebuild <db> --changed FILE    Minimal rebuild set\n"
     );
 }
@@ -175,6 +175,15 @@ static int cmd_files(Database& db, int filter_pid, const std::string& filter_pat
 }
 
 // --- trace ---
+
+// Truncate cmdline to fit within max_len characters.
+// Keeps the command name (first word) and truncates args.
+static std::string shorten_cmd(const std::string& cmdline, size_t max_len) {
+    if (cmdline.size() <= max_len) return cmdline;
+    if (max_len <= 3) return cmdline.substr(0, max_len);
+    return cmdline.substr(0, max_len - 3) + "...";
+}
+
 // Build parent chain: pid -> parent -> grandparent -> ... -> root
 static std::vector<ProcessRecord> get_ancestor_chain(Database& db, int pid) {
     std::vector<ProcessRecord> chain;
@@ -191,19 +200,12 @@ static std::vector<ProcessRecord> get_ancestor_chain(Database& db, int pid) {
     return chain;
 }
 
-static int cmd_trace(Database& db, int filter_pid, const std::string& filter_path) {
-    // Collect all processes and file accesses
-    std::vector<ProcessRecord> all_procs;
-    db.get_all_processes(all_procs);
-
-    // Build pid -> process map
-    std::map<int, ProcessRecord> proc_map;
-    for (size_t i = 0; i < all_procs.size(); ++i) {
-        proc_map[all_procs[i].pid] = all_procs[i];
-    }
+static int cmd_trace(Database& db, int filter_pid, const std::string& filter_path, int col_width) {
+    // col_width=0 means unlimited
+    // cmd_max: max chars for cmdline display. 0 = unlimited.
+    size_t cmd_max = (col_width > 0) ? (size_t)col_width : 0;
 
     if (filter_pid > 0) {
-        // Show files for this PID with its ancestor chain
         std::vector<ProcessRecord> chain = get_ancestor_chain(db, filter_pid);
         if (chain.empty()) {
             std::printf("Process %d not found.\n", filter_pid);
@@ -214,9 +216,10 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
         std::printf("Process chain:\n");
         for (size_t i = 0; i < chain.size(); ++i) {
             std::string indent(i * 2, ' ');
+            std::string cmd = cmd_max ? shorten_cmd(chain[i].cmdline, cmd_max) : chain[i].cmdline;
             std::printf("  %s%s%s [%d]\n", indent.c_str(),
                         i == 0 ? "" : "\\_ ",
-                        chain[i].cmdline.c_str(), chain[i].pid);
+                        cmd.c_str(), chain[i].pid);
         }
 
         std::vector<FileAccessRecord> accesses;
@@ -230,7 +233,6 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
     }
 
     if (!filter_path.empty()) {
-        // Show all processes that touched this file, with ancestor chains
         std::vector<FileAccessRecord> accesses;
         db.get_file_accesses_by_name(filter_path, accesses);
 
@@ -240,23 +242,22 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
         }
 
         std::printf("=== Trace for: %s ===\n\n", filter_path.c_str());
-        // Deduplicate by pid (may have multiple accesses)
         std::set<int> seen_pids;
         for (size_t i = 0; i < accesses.size(); ++i) {
             int pid = accesses[i].pid;
             if (seen_pids.find(pid) != seen_pids.end()) continue;
             seen_pids.insert(pid);
 
-            std::printf("  %-3s [%d]", mode_str(accesses[i].mode), pid);
-            // Print ancestor chain inline
             std::vector<ProcessRecord> chain = get_ancestor_chain(db, pid);
+            std::printf("  %-3s [%d]", mode_str(accesses[i].mode), pid);
             for (size_t j = 0; j < chain.size(); ++j) {
+                std::string cmd = cmd_max ? shorten_cmd(chain[j].cmdline, cmd_max) : chain[j].cmdline;
                 if (j == 0) {
-                    std::printf(" %s", chain[j].cmdline.c_str());
+                    std::printf(" %s", cmd.c_str());
                 } else {
                     std::printf("\n      %s\\_ %s [%d]",
                                 std::string(j * 3, ' ').c_str(),
-                                chain[j].cmdline.c_str(), chain[j].pid);
+                                cmd.c_str(), chain[j].pid);
                 }
             }
             std::printf("\n\n");
@@ -264,7 +265,7 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
         return 0;
     }
 
-    // No filter: group by file, show each file with its accessing processes
+    // No filter: group by file
     std::vector<FileAccessRecord> all_accesses;
     db.get_all_file_accesses(all_accesses);
 
@@ -273,8 +274,6 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
         return 0;
     }
 
-    // Group accesses by filename
-    // Use a vector of pairs to preserve insertion order
     std::map<std::string, std::vector<FileAccessRecord> > by_file;
     std::vector<std::string> file_order;
     for (size_t i = 0; i < all_accesses.size(); ++i) {
@@ -293,7 +292,6 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
 
         std::printf("%s\n", filename.c_str());
 
-        // Deduplicate by pid
         std::set<int> seen_pids;
         for (size_t i = 0; i < accs.size(); ++i) {
             int pid = accs[i].pid;
@@ -303,12 +301,14 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
             std::vector<ProcessRecord> chain = get_ancestor_chain(db, pid);
             if (chain.empty()) continue;
 
+            std::string cmd0 = cmd_max ? shorten_cmd(chain[0].cmdline, cmd_max) : chain[0].cmdline;
             std::printf("  %-3s %s [%d]\n", mode_str(accs[i].mode),
-                        chain[0].cmdline.c_str(), chain[0].pid);
+                        cmd0.c_str(), chain[0].pid);
             for (size_t j = 1; j < chain.size(); ++j) {
+                std::string cmd = cmd_max ? shorten_cmd(chain[j].cmdline, cmd_max) : chain[j].cmdline;
                 std::printf("      %s\\_ %s [%d]\n",
                             std::string((j - 1) * 3, ' ').c_str(),
-                            chain[j].cmdline.c_str(), chain[j].pid);
+                            cmd.c_str(), chain[j].pid);
             }
         }
         std::printf("\n");
@@ -420,14 +420,17 @@ int main(int argc, char* argv[]) {
     } else if (command == "trace") {
         int filter_pid = 0;
         std::string filter_path;
+        int col_width = 0;  // 0 = unlimited
         for (int i = 3; i < argc; ++i) {
             if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
                 filter_pid = std::atoi(argv[++i]);
             } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
                 filter_path = argv[++i];
+            } else if (std::strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+                col_width = std::atoi(argv[++i]);
             }
         }
-        return cmd_trace(db, filter_pid, filter_path);
+        return cmd_trace(db, filter_pid, filter_path, col_width);
     } else if (command == "rebuild") {
         std::string changed;
         for (int i = 3; i < argc; ++i) {
