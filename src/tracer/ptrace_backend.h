@@ -27,8 +27,6 @@ private:
 
     void setup_child(int pid);
     void handle_syscall_stop(int pid);
-    void handle_syscall_entry(int pid, ProcessState& ps, long syscall_nr);
-    void handle_syscall_exit(int pid, ProcessState& ps);
     void handle_fork_event(int pid);
     void handle_exec_event(int pid);
     void handle_exit_event(int pid, int status);
