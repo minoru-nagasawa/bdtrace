@@ -79,12 +79,9 @@ void test_trace_false() {
     cleanup();
 }
 
-int main() {
-    log_init(LOG_ERROR);
+void run_trace_simple_tests() {
     std::printf("=== Simple Trace Tests ===\n");
 
     RUN_TEST(test_trace_true);
     RUN_TEST(test_trace_false);
-
-    TEST_REPORT();
 }

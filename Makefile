@@ -47,29 +47,20 @@ vendor/sqlite3.o: vendor/sqlite3.c
 
 # Tests
 TEST_LIBS = $(COMMON_OBJS) $(DB_OBJS) $(SQLITE_OBJ)
+TEST_SRCS = tests/test_main.cpp tests/test_database.cpp tests/test_trace_simple.cpp \
+            tests/test_trace_fork.cpp tests/test_trace_file_io.cpp tests/test_rebuild.cpp
+TEST_OBJS = $(TEST_SRCS:.cpp=.o)
 
-test_database: tests/test_database.o $(TEST_LIBS)
+test_all: $(TEST_OBJS) $(TEST_LIBS) $(TRACER_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-test_trace_simple: tests/test_trace_simple.o $(TEST_LIBS) $(TRACER_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-test_trace_fork: tests/test_trace_fork.o $(TEST_LIBS) $(TRACER_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-test_trace_file_io: tests/test_trace_file_io.o $(TEST_LIBS) $(TRACER_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-test: test_database test_trace_simple test_trace_fork test_trace_file_io
-	./test_database
-	./test_trace_simple
-	./test_trace_fork
-	./test_trace_file_io
+test: test_all
+	./test_all
 
 fetch_sqlite:
 	bash scripts/fetch_sqlite.sh
 
 clean:
-	rm -f bdtrace bdview test_database test_trace_simple test_trace_fork test_trace_file_io
+	rm -f bdtrace bdview test_all
 	find . -name '*.o' -delete
 	rm -f *.db

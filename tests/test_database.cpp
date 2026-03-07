@@ -181,8 +181,7 @@ void test_meta() {
     cleanup();
 }
 
-int main() {
-    log_init(LOG_ERROR);
+void run_database_tests() {
     std::printf("=== Database Tests ===\n");
 
     RUN_TEST(test_open_close);
@@ -192,6 +191,4 @@ int main() {
     RUN_TEST(test_children);
     RUN_TEST(test_transaction);
     RUN_TEST(test_meta);
-
-    TEST_REPORT();
 }

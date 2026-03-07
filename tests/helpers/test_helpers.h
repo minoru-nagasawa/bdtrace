@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
-static int g_test_failures = 0;
-static int g_test_count = 0;
+extern int g_test_failures;
+extern int g_test_count;
 
 #define RUN_TEST(fn) do { \
     ++g_test_count; \

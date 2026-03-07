@@ -104,13 +104,10 @@ void test_filtered_paths() {
     cleanup();
 }
 
-int main() {
-    log_init(LOG_ERROR);
+void run_trace_file_io_tests() {
     std::printf("=== File I/O Trace Tests ===\n");
 
     RUN_TEST(test_file_read);
     RUN_TEST(test_file_write);
     RUN_TEST(test_filtered_paths);
-
-    TEST_REPORT();
 }

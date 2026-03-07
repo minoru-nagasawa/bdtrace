@@ -79,12 +79,9 @@ void test_sequential_commands() {
     cleanup();
 }
 
-int main() {
-    log_init(LOG_ERROR);
+void run_trace_fork_tests() {
     std::printf("=== Fork Trace Tests ===\n");
 
     RUN_TEST(test_fork_children);
     RUN_TEST(test_sequential_commands);
-
-    TEST_REPORT();
 }
