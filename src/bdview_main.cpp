@@ -112,6 +112,18 @@ static int cmd_summary(Database& db) {
     }
     std::sort(valid.begin(), valid.end(), cmp_duration_desc);
 
+    // Aggregate resource usage
+    int64_t total_user_us = 0, total_sys_us = 0;
+    int64_t total_io_read = 0, total_io_write = 0;
+    int64_t max_rss = 0;
+    for (size_t i = 0; i < procs.size(); ++i) {
+        total_user_us += procs[i].user_time_us;
+        total_sys_us += procs[i].sys_time_us;
+        total_io_read += procs[i].io_read_bytes;
+        total_io_write += procs[i].io_write_bytes;
+        if (procs[i].peak_rss_kb > max_rss) max_rss = procs[i].peak_rss_kb;
+    }
+
     std::printf("=== Build Trace Summary ===\n");
     std::printf("Total time:        %s\n", format_duration_us(total_us).c_str());
     std::printf("Processes:         %d\n", proc_count);
@@ -119,6 +131,23 @@ static int cmd_summary(Database& db) {
     std::printf("File accesses:     %d (read: %d, write: %d)\n", file_count, read_count, write_count);
     if (failed_count > 0) {
         std::printf("Failed accesses:   %d\n", failed_count);
+    }
+    if (total_user_us > 0 || total_sys_us > 0) {
+        std::printf("Total CPU time:    %s user, %s sys\n",
+                    format_duration_us(total_user_us).c_str(),
+                    format_duration_us(total_sys_us).c_str());
+    }
+    if (max_rss > 0) {
+        if (max_rss >= 1024) {
+            std::printf("Peak RSS:          %lld MB\n", (long long)(max_rss / 1024));
+        } else {
+            std::printf("Peak RSS:          %lld KB\n", (long long)max_rss);
+        }
+    }
+    if (total_io_read > 0 || total_io_write > 0) {
+        std::printf("I/O:               read %lld MB, write %lld MB\n",
+                    (long long)(total_io_read / (1024 * 1024)),
+                    (long long)(total_io_write / (1024 * 1024)));
     }
 
     int top = 5;

@@ -38,6 +38,10 @@ private:
     bool should_filter_path(const std::string& path);
     void record_access(int pid, unsigned long addr, FileAccessMode mode, int fd = -1);
     void record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val);
+
+    void read_proc_cpu(int pid, int64_t& user_us, int64_t& sys_us);
+    int64_t read_proc_peak_rss(int pid);
+    void read_proc_io(int pid, int64_t& read_bytes, int64_t& write_bytes);
 };
 
 } // namespace bdtrace

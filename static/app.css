@@ -127,6 +127,19 @@ tr:hover td { background: var(--bg3); }
 .split .left { max-width: 45%; }
 .split .right { flex: 1; }
 
+/* Tree toolbar */
+.tree-btn {
+  cursor: pointer;
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--fg2);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  user-select: none;
+}
+.tree-btn:hover { color: var(--accent); border-color: var(--accent); }
+
 /* Tree */
 .tree ul { list-style: none; padding-left: 16px; }
 .tree > ul { padding-left: 0; }

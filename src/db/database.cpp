@@ -46,7 +46,7 @@ void Database::close() {
 bool Database::init_schema() {
     if (!exec(get_schema_sql())) return false;
     // Set schema version if not set
-    insert_meta("schema_version", "2");
+    insert_meta("schema_version", "3");
     return prepare_stmts();
 }
 
@@ -74,6 +74,23 @@ bool Database::upgrade_schema() {
              ")");
         exec("CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid)");
     }
+
+    // Check if resource columns exist; if not, upgrade to v3
+    {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(db_, "SELECT user_time_us FROM processes LIMIT 0", -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            LOG_INFO("Upgrading schema to v3 (resource tracking)...");
+            exec("ALTER TABLE processes ADD COLUMN user_time_us INTEGER DEFAULT 0");
+            exec("ALTER TABLE processes ADD COLUMN sys_time_us INTEGER DEFAULT 0");
+            exec("ALTER TABLE processes ADD COLUMN peak_rss_kb INTEGER DEFAULT 0");
+            exec("ALTER TABLE processes ADD COLUMN io_read_bytes INTEGER DEFAULT 0");
+            exec("ALTER TABLE processes ADD COLUMN io_write_bytes INTEGER DEFAULT 0");
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+
     return true;
 }
 
@@ -106,7 +123,7 @@ bool Database::prepare(const char* sql, sqlite3_stmt** stmt) {
 bool Database::prepare_stmts() {
     if (!prepare("INSERT INTO processes (pid, ppid, cmdline, start_time_us, end_time_us, exit_code) VALUES (?, ?, ?, ?, ?, ?)", &stmt_insert_process_))
         return false;
-    if (!prepare("UPDATE processes SET end_time_us = ?, exit_code = ? WHERE pid = ?", &stmt_update_exit_))
+    if (!prepare("UPDATE processes SET end_time_us = ?, exit_code = ?, user_time_us = ?, sys_time_us = ?, peak_rss_kb = ?, io_read_bytes = ?, io_write_bytes = ? WHERE pid = ?", &stmt_update_exit_))
         return false;
     if (!prepare("INSERT INTO file_accesses (pid, filename, mode, fd, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_file_))
         return false;
@@ -153,11 +170,19 @@ bool Database::insert_process(const ProcessRecord& rec) {
     return true;
 }
 
-bool Database::update_process_exit(int pid, int64_t end_time_us, int exit_code) {
+bool Database::update_process_exit(int pid, int64_t end_time_us, int exit_code,
+                                    int64_t user_time_us, int64_t sys_time_us,
+                                    int64_t peak_rss_kb,
+                                    int64_t io_read_bytes, int64_t io_write_bytes) {
     sqlite3_reset(stmt_update_exit_);
     sqlite3_bind_int64(stmt_update_exit_, 1, end_time_us);
     sqlite3_bind_int(stmt_update_exit_, 2, exit_code);
-    sqlite3_bind_int(stmt_update_exit_, 3, pid);
+    sqlite3_bind_int64(stmt_update_exit_, 3, user_time_us);
+    sqlite3_bind_int64(stmt_update_exit_, 4, sys_time_us);
+    sqlite3_bind_int64(stmt_update_exit_, 5, peak_rss_kb);
+    sqlite3_bind_int64(stmt_update_exit_, 6, io_read_bytes);
+    sqlite3_bind_int64(stmt_update_exit_, 7, io_write_bytes);
+    sqlite3_bind_int(stmt_update_exit_, 8, pid);
     int rc = sqlite3_step(stmt_update_exit_);
     if (rc != SQLITE_DONE) {
         last_error_ = sqlite3_errmsg(db_);
@@ -215,12 +240,20 @@ static ProcessRecord row_to_process(sqlite3_stmt* stmt) {
     r.start_time_us = sqlite3_column_int64(stmt, 3);
     r.end_time_us = sqlite3_column_int64(stmt, 4);
     r.exit_code = sqlite3_column_int(stmt, 5);
+    int col_count = sqlite3_column_count(stmt);
+    if (col_count > 6) {
+        r.user_time_us = sqlite3_column_int64(stmt, 6);
+        r.sys_time_us = sqlite3_column_int64(stmt, 7);
+        r.peak_rss_kb = sqlite3_column_int64(stmt, 8);
+        r.io_read_bytes = sqlite3_column_int64(stmt, 9);
+        r.io_write_bytes = sqlite3_column_int64(stmt, 10);
+    }
     return r;
 }
 
 bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code FROM processes ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes ORDER BY start_time_us", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         out.push_back(row_to_process(stmt));
@@ -231,7 +264,7 @@ bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
 
 bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, ppid);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -243,7 +276,7 @@ bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
 
 bool Database::get_process(int pid, ProcessRecord& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code FROM processes WHERE pid = ?", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes WHERE pid = ?", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, pid);
     bool found = false;

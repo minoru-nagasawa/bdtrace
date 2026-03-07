@@ -39,9 +39,16 @@ struct ProcessRecord {
     int64_t start_time_us;
     int64_t end_time_us;
     int exit_code;
+    int64_t user_time_us;
+    int64_t sys_time_us;
+    int64_t peak_rss_kb;
+    int64_t io_read_bytes;
+    int64_t io_write_bytes;
 
     ProcessRecord()
-        : pid(0), ppid(0), start_time_us(0), end_time_us(0), exit_code(-1) {}
+        : pid(0), ppid(0), start_time_us(0), end_time_us(0), exit_code(-1)
+        , user_time_us(0), sys_time_us(0), peak_rss_kb(0)
+        , io_read_bytes(0), io_write_bytes(0) {}
 };
 
 struct FileAccessRecord {

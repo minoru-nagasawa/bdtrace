@@ -3,6 +3,7 @@
 var App = (function() {
   var currentView = 'summary';
   var cache = {};
+  var viewDom = {};  // cached rendered DOM per view
 
   function api(path, cb) {
     if (cache[path]) { cb(cache[path]); return; }
@@ -43,6 +44,20 @@ var App = (function() {
     return (us / 1000000).toFixed(2) + 's';
   }
 
+  function formatBytes(b) {
+    if (b <= 0) return '-';
+    if (b < 1024) return b + 'B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+    if (b < 1073741824) return (b / 1048576).toFixed(1) + 'MB';
+    return (b / 1073741824).toFixed(2) + 'GB';
+  }
+
+  function formatRss(kb) {
+    if (kb <= 0) return '-';
+    if (kb < 1024) return kb + 'KB';
+    return (kb / 1024).toFixed(1) + 'MB';
+  }
+
   function shortenCmd(cmd, max) {
     if (!max || cmd.length <= max) return cmd;
     return cmd.substr(0, max - 3) + '...';
@@ -52,6 +67,38 @@ var App = (function() {
     var first = cmdline.split(' ')[0];
     var sl = first.lastIndexOf('/');
     return sl >= 0 ? first.substr(sl + 1) : first;
+  }
+
+  // ---- Tree control helpers ----
+  // registry: array of { expand:fn, collapse:fn, hasChildren:bool }
+  function expandAll(registry) {
+    // Repeatedly expand until no new nodes appear (lazy-built children register themselves)
+    var prev = 0;
+    while (registry.length > prev) {
+      prev = registry.length;
+      for (var i = 0; i < registry.length; i++) {
+        if (registry[i].hasChildren) registry[i].expand();
+      }
+    }
+  }
+
+  function collapseAll(registry) {
+    for (var i = registry.length - 1; i >= 0; i--) {
+      if (registry[i].hasChildren) registry[i].collapse();
+    }
+  }
+
+  function makeTreeToolbar(registry) {
+    var bar = el('div', {style: 'display:flex;gap:8px;margin-bottom:8px'});
+    bar.appendChild(el('span', {
+      className: 'tree-btn',
+      onclick: function() { expandAll(registry); }
+    }, 'Expand All'));
+    bar.appendChild(el('span', {
+      className: 'tree-btn',
+      onclick: function() { collapseAll(registry); }
+    }, 'Collapse All'));
+    return bar;
   }
 
   // ---- Summary View ----
@@ -94,6 +141,8 @@ var App = (function() {
           drawParallelism(canvas, p);
         }
       });
+
+      viewDom['summary'] = app.innerHTML ? null : null; // summary doesn't need caching
     });
   }
 
@@ -187,11 +236,20 @@ var App = (function() {
 
   // ---- Process Explorer ----
   function renderProcesses() {
+    // Check for cached DOM
+    if (viewDom['processes']) {
+      var app = document.getElementById('app');
+      app.innerHTML = '';
+      app.appendChild(viewDom['processes']);
+      return;
+    }
+
     var app = document.getElementById('app');
     app.innerHTML = '<div class="loading">Loading...</div>';
 
     api('/api/processes', function(data) {
       app.innerHTML = '';
+      var wrapper = el('div');
       var split = el('div', {className: 'split'});
       var left = el('div', {className: 'left'});
       var right = el('div', {className: 'right'});
@@ -210,6 +268,11 @@ var App = (function() {
         if (i === 0 || procs[i].start_time_us < minStart) minStart = procs[i].start_time_us;
       }
 
+      var nodeRegistry = [];
+
+      // Toolbar
+      left.appendChild(makeTreeToolbar(nodeRegistry));
+
       // Tree header
       var hdr = el('div', {className: 'tree-header'});
       hdr.appendChild(el('span', {className: 'th-tree'}, 'Process'));
@@ -217,6 +280,9 @@ var App = (function() {
       hdr.appendChild(el('span', {className: 'th-col th-dur'}, 'Duration'));
       hdr.appendChild(el('span', {className: 'th-col'}, 'Start'));
       hdr.appendChild(el('span', {className: 'th-col'}, 'End'));
+      hdr.appendChild(el('span', {className: 'th-col'}, 'CPU'));
+      hdr.appendChild(el('span', {className: 'th-col'}, 'RSS'));
+      hdr.appendChild(el('span', {className: 'th-col'}, 'I/O'));
       hdr.appendChild(el('span', {className: 'th-col th-exit'}, 'Exit'));
       left.appendChild(hdr);
 
@@ -224,18 +290,20 @@ var App = (function() {
       var roots = data.roots || [];
       var rootUl = el('ul');
       for (var r = 0; r < roots.length; r++) {
-        rootUl.appendChild(buildTreeNode(roots[r], procMap, data.children_map, totalDur, minStart, right));
+        rootUl.appendChild(buildTreeNode(roots[r], procMap, data.children_map, totalDur, minStart, right, nodeRegistry));
       }
       treeDiv.appendChild(rootUl);
       left.appendChild(treeDiv);
 
       split.appendChild(left);
       split.appendChild(right);
-      app.appendChild(split);
+      wrapper.appendChild(split);
+      app.appendChild(wrapper);
+      viewDom['processes'] = wrapper;
     });
   }
 
-  function buildTreeNode(pid, procMap, childMap, totalDur, minStart, rightPanel) {
+  function buildTreeNode(pid, procMap, childMap, totalDur, minStart, rightPanel, registry) {
     var proc = procMap[pid];
     if (!proc) return el('li');
     var dur = proc.end_time_us - proc.start_time_us;
@@ -254,6 +322,11 @@ var App = (function() {
     var durSpan = el('span', {className: 'col-num col-dur' + (dur > totalDur * 0.25 ? ' slow' : '')}, formatDuration(dur));
     var startSpan = el('span', {className: 'col-num'}, formatRelSec(proc.start_time_us - minStart));
     var endSpan = el('span', {className: 'col-num'}, formatRelSec(proc.end_time_us - minStart));
+    var cpuTotal = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
+    var cpuSpan = el('span', {className: 'col-num'}, cpuTotal > 0 ? formatDuration(cpuTotal) : '-');
+    var rssSpan = el('span', {className: 'col-num'}, formatRss(proc.peak_rss_kb || 0));
+    var ioTotal = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
+    var ioSpan = el('span', {className: 'col-num'}, ioTotal > 0 ? formatBytes(ioTotal) : '-');
     var exitSpan = el('span', {className: 'col-num col-exit' + (proc.exit_code !== 0 ? ' exit-err' : '')}, String(proc.exit_code));
 
     node.appendChild(toggle);
@@ -263,9 +336,41 @@ var App = (function() {
     node.appendChild(durSpan);
     node.appendChild(startSpan);
     node.appendChild(endSpan);
+    node.appendChild(cpuSpan);
+    node.appendChild(rssSpan);
+    node.appendChild(ioSpan);
     node.appendChild(exitSpan);
 
     var childUl = null;
+
+    function ensureChildren() {
+      if (!childUl && hasChildren) {
+        childUl = el('ul');
+        for (var c = 0; c < children.length; c++) {
+          childUl.appendChild(buildTreeNode(children[c], procMap, childMap, totalDur, minStart, rightPanel, registry));
+        }
+        li.appendChild(childUl);
+      }
+    }
+
+    function doExpand() {
+      if (!hasChildren || expanded) return;
+      expanded = true;
+      toggle.textContent = '-';
+      ensureChildren();
+      childUl.style.display = '';
+    }
+
+    function doCollapse() {
+      if (!hasChildren || !expanded) return;
+      expanded = false;
+      toggle.textContent = '+';
+      if (childUl) childUl.style.display = 'none';
+    }
+
+    if (registry) {
+      registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+    }
 
     node.onclick = function(e) {
       e.stopPropagation();
@@ -277,16 +382,7 @@ var App = (function() {
 
       // Toggle expand
       if (hasChildren) {
-        expanded = !expanded;
-        toggle.textContent = expanded ? '-' : '+';
-        if (expanded && !childUl) {
-          childUl = el('ul');
-          for (var c = 0; c < children.length; c++) {
-            childUl.appendChild(buildTreeNode(children[c], procMap, childMap, totalDur, minStart, rightPanel));
-          }
-          li.appendChild(childUl);
-        }
-        if (childUl) childUl.style.display = expanded ? '' : 'none';
+        if (expanded) doCollapse(); else doExpand();
       }
     };
 
@@ -308,6 +404,14 @@ var App = (function() {
       el('span', {className: proc.exit_code === 0 ? '' : 'exit-err'}, String(proc.exit_code)),
       el('span', null, '  Duration: ' + formatDuration(proc.end_time_us - proc.start_time_us))
     ]));
+    var cpuUser = proc.user_time_us || 0, cpuSys = proc.sys_time_us || 0;
+    if (cpuUser > 0 || cpuSys > 0 || (proc.peak_rss_kb || 0) > 0) {
+      container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2)'}, [
+        el('span', null, 'CPU: ' + formatDuration(cpuUser) + ' user, ' + formatDuration(cpuSys) + ' sys'),
+        el('span', null, '  RSS: ' + formatRss(proc.peak_rss_kb || 0)),
+        el('span', null, '  I/O: R:' + formatBytes(proc.io_read_bytes || 0) + ' W:' + formatBytes(proc.io_write_bytes || 0))
+      ]));
+    }
     container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2);word-break:break-all'}, proc.cmdline));
     container.appendChild(el('div', {className: 'loading'}, 'Loading files...'));
     panel.appendChild(container);
@@ -319,6 +423,14 @@ var App = (function() {
         el('span', {className: proc.exit_code === 0 ? '' : 'exit-err'}, String(proc.exit_code)),
         el('span', null, '  Duration: ' + formatDuration(proc.end_time_us - proc.start_time_us))
       ]));
+      var cpuUser2 = proc.user_time_us || 0, cpuSys2 = proc.sys_time_us || 0;
+      if (cpuUser2 > 0 || cpuSys2 > 0 || (proc.peak_rss_kb || 0) > 0) {
+        container.appendChild(el('div', {style: 'margin-bottom:4px;color:var(--fg2)'}, [
+          el('span', null, 'CPU: ' + formatDuration(cpuUser2) + ' user, ' + formatDuration(cpuSys2) + ' sys'),
+          el('span', null, '  RSS: ' + formatRss(proc.peak_rss_kb || 0)),
+          el('span', null, '  I/O: R:' + formatBytes(proc.io_read_bytes || 0) + ' W:' + formatBytes(proc.io_write_bytes || 0))
+        ]));
+      }
       container.appendChild(el('div', {style: 'margin-bottom:8px;color:var(--fg2);word-break:break-all'}, proc.cmdline));
 
       if (files.length === 0) {
@@ -428,11 +540,20 @@ var App = (function() {
 
   // ---- File Explorer ----
   function renderFiles() {
+    // Check for cached DOM
+    if (viewDom['files']) {
+      var app = document.getElementById('app');
+      app.innerHTML = '';
+      app.appendChild(viewDom['files']);
+      return;
+    }
+
     var app = document.getElementById('app');
     app.innerHTML = '<div class="loading">Loading...</div>';
 
     api('/api/files', function(data) {
       app.innerHTML = '';
+      var wrapper = el('div');
       var split = el('div', {className: 'split'});
       var left = el('div', {className: 'left'});
       var right = el('div', {className: 'right'});
@@ -468,17 +589,24 @@ var App = (function() {
         tree[relKeys[i]] = relTree[relKeys[i]];
       }
 
+      var nodeRegistry = [];
+
+      // Toolbar
+      left.appendChild(makeTreeToolbar(nodeRegistry));
+
       var treeDiv = el('div', {className: 'tree'});
-      treeDiv.appendChild(buildFileTree(tree, '', right));
+      treeDiv.appendChild(buildFileTree(tree, '', right, nodeRegistry));
       left.appendChild(treeDiv);
 
       split.appendChild(left);
       split.appendChild(right);
-      app.appendChild(split);
+      wrapper.appendChild(split);
+      app.appendChild(wrapper);
+      viewDom['files'] = wrapper;
     });
   }
 
-  function buildFileTree(tree, prefix, rightPanel) {
+  function buildFileTree(tree, prefix, rightPanel, registry) {
     var ul = el('ul');
     var keys = Object.keys(tree).sort();
     for (var k = 0; k < keys.length; k++) {
@@ -509,6 +637,33 @@ var App = (function() {
         var childUl = null;
         var expanded = false;
 
+        function ensureChildren() {
+          if (!childUl && hasChildren) {
+            var childPrefix = (name === '/') ? '/' : fullPath;
+            childUl = buildFileTree(entry._children, childPrefix, rightPanel, registry);
+            li.appendChild(childUl);
+          }
+        }
+
+        function doExpand() {
+          if (!hasChildren || expanded) return;
+          expanded = true;
+          toggle.textContent = '-';
+          ensureChildren();
+          childUl.style.display = '';
+        }
+
+        function doCollapse() {
+          if (!hasChildren || !expanded) return;
+          expanded = false;
+          toggle.textContent = '+';
+          if (childUl) childUl.style.display = 'none';
+        }
+
+        if (registry) {
+          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+        }
+
         node.onclick = function(e) {
           e.stopPropagation();
           var prev = document.querySelector('.tree .node.selected');
@@ -518,16 +673,7 @@ var App = (function() {
           showFileDetail(fullPath, rightPanel);
 
           if (hasChildren) {
-            expanded = !expanded;
-            toggle.textContent = expanded ? '-' : '+';
-            if (expanded && !childUl) {
-              // For '/' node, children use prefix '/'
-              // For others, children use fullPath as prefix
-              var childPrefix = (name === '/') ? '/' : fullPath;
-              childUl = buildFileTree(entry._children, childPrefix, rightPanel);
-              li.appendChild(childUl);
-            }
-            if (childUl) childUl.style.display = expanded ? '' : 'none';
+            if (expanded) doCollapse(); else doExpand();
           }
         };
 
@@ -561,15 +707,28 @@ var App = (function() {
             container.appendChild(el('div', {style: 'color:var(--fg2)'}, 'No accesses found'));
             return;
           }
-          var tbl = makeTable(['PID', 'Command', 'Mode', 'Filename'], d2.map(function(a) {
-            return [a.pid, shortenCmd(a.cmdline || '', 40), a.mode_str, a.filename];
+          var tbl = makeTable(['PID', 'Command', 'Mode', 'Duration', 'CPU', 'RSS', 'I/O', 'Filename'], d2.map(function(a) {
+            var cpu = (a.user_time_us || 0) + (a.sys_time_us || 0);
+            var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
+            return [a.pid, shortenCmd(a.cmdline || '', 40), a.mode_str,
+                    a.duration_us != null ? formatDuration(a.duration_us) : '-',
+                    cpu > 0 ? formatDuration(cpu) : '-',
+                    formatRss(a.peak_rss_kb || 0),
+                    io > 0 ? formatBytes(io) : '-',
+                    a.filename];
           }));
           container.appendChild(tbl);
         });
         return;
       }
-      var tbl = makeTable(['PID', 'Command', 'Mode'], data.map(function(a) {
-        return [a.pid, shortenCmd(a.cmdline || '', 50), a.mode_str];
+      var tbl = makeTable(['PID', 'Command', 'Mode', 'Duration', 'CPU', 'RSS', 'I/O'], data.map(function(a) {
+        var cpu = (a.user_time_us || 0) + (a.sys_time_us || 0);
+        var io = (a.io_read_bytes || 0) + (a.io_write_bytes || 0);
+        return [a.pid, shortenCmd(a.cmdline || '', 50), a.mode_str,
+                a.duration_us != null ? formatDuration(a.duration_us) : '-',
+                cpu > 0 ? formatDuration(cpu) : '-',
+                formatRss(a.peak_rss_kb || 0),
+                io > 0 ? formatBytes(io) : '-'];
       }));
       container.appendChild(tbl);
     });
@@ -769,6 +928,16 @@ var App = (function() {
     var tabs = document.querySelectorAll('#navbar .tab');
     for (var i = 0; i < tabs.length; i++) {
       tabs[i].className = 'tab' + (tabs[i].getAttribute('data-view') === view ? ' active' : '');
+    }
+
+    // Detach current cached view (don't destroy it)
+    var app = document.getElementById('app');
+    while (app.firstChild) app.removeChild(app.firstChild);
+
+    // Cached views: processes and files preserve tree state
+    if ((view === 'processes' || view === 'files') && viewDom[view]) {
+      app.appendChild(viewDom[view]);
+      return;
     }
 
     switch (view) {

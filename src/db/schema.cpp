@@ -14,7 +14,12 @@ const char* get_schema_sql() {
         "  cmdline TEXT,"
         "  start_time_us INTEGER,"
         "  end_time_us INTEGER,"
-        "  exit_code INTEGER"
+        "  exit_code INTEGER,"
+        "  user_time_us INTEGER DEFAULT 0,"
+        "  sys_time_us INTEGER DEFAULT 0,"
+        "  peak_rss_kb INTEGER DEFAULT 0,"
+        "  io_read_bytes INTEGER DEFAULT 0,"
+        "  io_write_bytes INTEGER DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
         "CREATE TABLE IF NOT EXISTS file_accesses ("
@@ -51,6 +56,16 @@ const char* get_schema_v2_upgrade_sql() {
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
+        ;
+}
+
+const char* get_schema_v3_upgrade_sql() {
+    return
+        "ALTER TABLE processes ADD COLUMN user_time_us INTEGER DEFAULT 0;"
+        "ALTER TABLE processes ADD COLUMN sys_time_us INTEGER DEFAULT 0;"
+        "ALTER TABLE processes ADD COLUMN peak_rss_kb INTEGER DEFAULT 0;"
+        "ALTER TABLE processes ADD COLUMN io_read_bytes INTEGER DEFAULT 0;"
+        "ALTER TABLE processes ADD COLUMN io_write_bytes INTEGER DEFAULT 0;"
         ;
 }
 

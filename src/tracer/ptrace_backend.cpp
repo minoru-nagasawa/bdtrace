@@ -138,7 +138,17 @@ int PtraceBackend::run_event_loop() {
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
-            session_.on_process_exit(pid, now_us(), exit_code);
+            std::map<int, ProcessState>::iterator exit_it = procs_.find(pid);
+            if (exit_it != procs_.end()) {
+                session_.on_process_exit(pid, now_us(), exit_code,
+                                         exit_it->second.user_time_us,
+                                         exit_it->second.sys_time_us,
+                                         exit_it->second.peak_rss_kb,
+                                         exit_it->second.io_read_bytes,
+                                         exit_it->second.io_write_bytes);
+            } else {
+                session_.on_process_exit(pid, now_us(), exit_code);
+            }
             LOG_DEBUG("Process %d exited with %d", pid, exit_code);
             procs_.erase(pid);
             continue;
@@ -180,11 +190,55 @@ void PtraceBackend::stop() {
     running_ = false;
 }
 
+static std::string normalize_path(const std::string& path) {
+    if (path.empty()) return path;
+
+    // Split into components
+    std::vector<std::string> parts;
+    bool absolute = (path[0] == '/');
+    size_t i = 0;
+    while (i < path.size()) {
+        while (i < path.size() && path[i] == '/') ++i;
+        size_t start = i;
+        while (i < path.size() && path[i] != '/') ++i;
+        if (i > start) {
+            std::string comp = path.substr(start, i - start);
+            if (comp == ".") {
+                // skip
+            } else if (comp == "..") {
+                if (!parts.empty() && parts.back() != "..") {
+                    parts.pop_back();
+                } else if (!absolute) {
+                    parts.push_back(comp);
+                }
+                // if absolute and parts is empty, just ignore (can't go above /)
+            } else {
+                parts.push_back(comp);
+            }
+        }
+    }
+
+    std::string result;
+    if (absolute) result = "/";
+    for (size_t j = 0; j < parts.size(); ++j) {
+        if (j > 0) result += '/';
+        result += parts[j];
+    }
+    if (result.empty()) result = ".";
+    return result;
+}
+
 std::string PtraceBackend::resolve_path(int pid, const std::string& path) {
-    if (path.empty() || path[0] == '/') return path;
-    std::string cwd = read_proc_link(pid, "cwd");
-    if (cwd.empty()) return path;
-    return cwd + "/" + path;
+    if (path.empty()) return path;
+    std::string full;
+    if (path[0] == '/') {
+        full = path;
+    } else {
+        std::string cwd = read_proc_link(pid, "cwd");
+        if (cwd.empty()) return path;
+        full = cwd + "/" + path;
+    }
+    return normalize_path(full);
 }
 
 void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mode, int fd) {
@@ -520,6 +574,22 @@ void PtraceBackend::handle_exit_event(int pid, int status) {
     unsigned long exit_status = 0;
     PT(PTRACE_GETEVENTMSG, pid, 0, &exit_status);
     LOG_DEBUG("Exit event: %d status=%lu", pid, exit_status);
+
+    // Read resource usage while process still exists in /proc
+    int64_t user_us = 0, sys_us = 0;
+    read_proc_cpu(pid, user_us, sys_us);
+    int64_t peak_rss = read_proc_peak_rss(pid);
+    int64_t io_r = 0, io_w = 0;
+    read_proc_io(pid, io_r, io_w);
+
+    std::map<int, ProcessState>::iterator it = procs_.find(pid);
+    if (it != procs_.end()) {
+        it->second.user_time_us = user_us;
+        it->second.sys_time_us = sys_us;
+        it->second.peak_rss_kb = peak_rss;
+        it->second.io_read_bytes = io_r;
+        it->second.io_write_bytes = io_w;
+    }
 }
 
 std::string PtraceBackend::read_string(int pid, unsigned long addr, size_t max_len) {
@@ -581,6 +651,85 @@ bool PtraceBackend::should_filter_path(const std::string& path) {
     if (path.compare(0, 6, "/proc/") == 0) return true;
     if (path.compare(0, 4, "/sys/") == 0) return true;
     return false;
+}
+
+void PtraceBackend::read_proc_cpu(int pid, int64_t& user_us, int64_t& sys_us) {
+    user_us = 0;
+    sys_us = 0;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return;
+
+    char buf[1024];
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    if (n == 0) return;
+    buf[n] = '\0';
+
+    // Fields are space-separated; comm (field 2) may contain spaces/parens.
+    // Find closing ')' to skip past comm field.
+    char* p = std::strrchr(buf, ')');
+    if (!p) return;
+    p++; // skip ')'
+
+    // After ')': " S ppid pgrp sid ... utime stime ..."
+    // state=field 3, utime=field 14, stime=field 15
+    // Skip fields 3-13 (11 space-separated tokens) to reach field 14
+    long utime = 0, stime = 0;
+    int skip = 11; // fields 3 through 13
+    while (*p && skip > 0) {
+        while (*p == ' ') ++p;
+        while (*p && *p != ' ') ++p;
+        --skip;
+    }
+    while (*p == ' ') ++p;
+    utime = std::strtol(p, &p, 10);
+    while (*p == ' ') ++p;
+    stime = std::strtol(p, &p, 10);
+
+    // Convert clock ticks to microseconds
+    long ticks_per_sec = sysconf(_SC_CLK_TCK);
+    if (ticks_per_sec <= 0) ticks_per_sec = 100;
+    user_us = (int64_t)utime * 1000000 / ticks_per_sec;
+    sys_us = (int64_t)stime * 1000000 / ticks_per_sec;
+}
+
+int64_t PtraceBackend::read_proc_peak_rss(int pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return 0;
+
+    char line[256];
+    int64_t peak_kb = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "VmHWM:", 6) == 0) {
+            peak_kb = std::strtol(line + 6, NULL, 10);
+            break;
+        }
+    }
+    std::fclose(f);
+    return peak_kb;
+}
+
+void PtraceBackend::read_proc_io(int pid, int64_t& read_bytes, int64_t& write_bytes) {
+    read_bytes = 0;
+    write_bytes = 0;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/io", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return; // /proc/pid/io may not exist on older kernels
+
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "read_bytes:", 11) == 0) {
+            read_bytes = std::strtol(line + 11, NULL, 10);
+        } else if (std::strncmp(line, "write_bytes:", 12) == 0) {
+            write_bytes = std::strtol(line + 12, NULL, 10);
+        }
+    }
+    std::fclose(f);
 }
 
 } // namespace bdtrace

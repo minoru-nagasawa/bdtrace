@@ -14,7 +14,10 @@ public:
 
     bool open(const std::string& db_path);
     void on_process_start(const ProcessRecord& rec);
-    void on_process_exit(int pid, int64_t end_time_us, int exit_code);
+    void on_process_exit(int pid, int64_t end_time_us, int exit_code,
+                         int64_t user_time_us = 0, int64_t sys_time_us = 0,
+                         int64_t peak_rss_kb = 0,
+                         int64_t io_read_bytes = 0, int64_t io_write_bytes = 0);
     void on_file_access(const FileAccessRecord& rec);
     void on_failed_access(const FailedAccessRecord& rec);
     void finalize();

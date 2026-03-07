@@ -237,6 +237,11 @@ static void handle_processes(struct mg_connection *c) {
         jw.key("end_time_us").val(procs[i].end_time_us);
         jw.key("exit_code").val(procs[i].exit_code);
         jw.key("file_count").val(fc);
+        jw.key("user_time_us").val(procs[i].user_time_us);
+        jw.key("sys_time_us").val(procs[i].sys_time_us);
+        jw.key("peak_rss_kb").val(procs[i].peak_rss_kb);
+        jw.key("io_read_bytes").val(procs[i].io_read_bytes);
+        jw.key("io_write_bytes").val(procs[i].io_write_bytes);
         jw.endObject();
     }
     jw.endArray();
@@ -330,6 +335,17 @@ static void handle_files(struct mg_connection *c) {
     send_json(c, jw.str());
 }
 
+static void write_proc_info(JsonWriter& jw, const ProcessRecord& proc) {
+    int64_t dur = proc.end_time_us - proc.start_time_us;
+    jw.key("duration_us").val(dur);
+    jw.key("exit_code").val(proc.exit_code);
+    jw.key("user_time_us").val(proc.user_time_us);
+    jw.key("sys_time_us").val(proc.sys_time_us);
+    jw.key("peak_rss_kb").val(proc.peak_rss_kb);
+    jw.key("io_read_bytes").val(proc.io_read_bytes);
+    jw.key("io_write_bytes").val(proc.io_write_bytes);
+}
+
 static void handle_files_by_path(struct mg_connection *c, const std::string& path) {
     std::vector<FileAccessRecord> accesses;
     g_db->get_file_accesses_by_name(path, accesses);
@@ -338,16 +354,14 @@ static void handle_files_by_path(struct mg_connection *c, const std::string& pat
     jw.beginArray();
     for (size_t i = 0; i < accesses.size(); ++i) {
         ProcessRecord proc;
-        std::string cmdline;
-        if (g_db->get_process(accesses[i].pid, proc)) {
-            cmdline = proc.cmdline;
-        }
+        bool found = g_db->get_process(accesses[i].pid, proc);
         jw.beginObject();
         jw.key("pid").val(accesses[i].pid);
-        jw.key("cmdline").val(cmdline);
+        jw.key("cmdline").val(found ? proc.cmdline : std::string());
         jw.key("mode").val((int)accesses[i].mode);
         jw.key("mode_str").val(mode_str(accesses[i].mode));
         jw.key("timestamp_us").val(accesses[i].timestamp_us);
+        if (found) write_proc_info(jw, proc);
         jw.endObject();
     }
     jw.endArray();
@@ -366,14 +380,14 @@ static void handle_files_by_prefix(struct mg_connection *c, const std::string& p
     for (size_t i = 0; i < all_fa.size(); ++i) {
         if (all_fa[i].filename.compare(0, pfx.size(), pfx) == 0) {
             ProcessRecord proc;
-            std::string cmdline;
-            if (g_db->get_process(all_fa[i].pid, proc)) cmdline = proc.cmdline;
+            bool found = g_db->get_process(all_fa[i].pid, proc);
             jw.beginObject();
             jw.key("pid").val(all_fa[i].pid);
-            jw.key("cmdline").val(cmdline);
+            jw.key("cmdline").val(found ? proc.cmdline : std::string());
             jw.key("filename").val(all_fa[i].filename);
             jw.key("mode_str").val(mode_str(all_fa[i].mode));
             jw.key("timestamp_us").val(all_fa[i].timestamp_us);
+            if (found) write_proc_info(jw, proc);
             jw.endObject();
         }
     }

@@ -29,12 +29,17 @@ void TraceSession::on_process_start(const ProcessRecord& rec) {
     maybe_commit();
 }
 
-void TraceSession::on_process_exit(int pid, int64_t end_time_us, int exit_code) {
+void TraceSession::on_process_exit(int pid, int64_t end_time_us, int exit_code,
+                                    int64_t user_time_us, int64_t sys_time_us,
+                                    int64_t peak_rss_kb,
+                                    int64_t io_read_bytes, int64_t io_write_bytes) {
     if (!in_transaction_) {
         db_.begin_transaction();
         in_transaction_ = true;
     }
-    db_.update_process_exit(pid, end_time_us, exit_code);
+    db_.update_process_exit(pid, end_time_us, exit_code,
+                            user_time_us, sys_time_us, peak_rss_kb,
+                            io_read_bytes, io_write_bytes);
     ++event_count_;
     maybe_commit();
 }

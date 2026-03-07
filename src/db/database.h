@@ -26,7 +26,10 @@ public:
     // Write operations
     bool insert_meta(const std::string& key, const std::string& value);
     bool insert_process(const ProcessRecord& rec);
-    bool update_process_exit(int pid, int64_t end_time_us, int exit_code);
+    bool update_process_exit(int pid, int64_t end_time_us, int exit_code,
+                             int64_t user_time_us = 0, int64_t sys_time_us = 0,
+                             int64_t peak_rss_kb = 0,
+                             int64_t io_read_bytes = 0, int64_t io_write_bytes = 0);
     bool insert_file_access(const FileAccessRecord& rec);
     bool insert_failed_access(const FailedAccessRecord& rec);
 
