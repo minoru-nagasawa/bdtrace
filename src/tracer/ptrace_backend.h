@@ -36,6 +36,7 @@ private:
     std::string read_proc_link(int pid, const char* entry);
     bool should_filter_path(const std::string& path);
     void record_access(int pid, unsigned long addr, FileAccessMode mode, int fd = -1);
+    void record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val);
 };
 
 } // namespace bdtrace

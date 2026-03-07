@@ -49,8 +49,19 @@ struct FileAccessRecord {
     std::string filename;
     FileAccessMode mode;
     int fd;
+    int64_t timestamp_us;
 
-    FileAccessRecord() : pid(0), mode(FA_READ), fd(-1) {}
+    FileAccessRecord() : pid(0), mode(FA_READ), fd(-1), timestamp_us(0) {}
+};
+
+struct FailedAccessRecord {
+    int pid;
+    std::string filename;
+    FileAccessMode mode;
+    int errno_val;
+    int64_t timestamp_us;
+
+    FailedAccessRecord() : pid(0), mode(FA_READ), errno_val(0), timestamp_us(0) {}
 };
 
 inline int64_t now_us() {

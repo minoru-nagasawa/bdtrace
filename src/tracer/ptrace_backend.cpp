@@ -188,9 +188,25 @@ void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mo
         fa.filename = path;
         fa.mode = mode;
         fa.fd = fd;
+        fa.timestamp_us = now_us();
         LOG_DEBUG("File access: pid=%d %s mode=%d fd=%d",
                   pid, path.c_str(), mode, fd);
         session_.on_file_access(fa);
+    }
+}
+
+void PtraceBackend::record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val) {
+    std::string path = read_string(pid, addr);
+    if (!path.empty() && !should_filter_path(path)) {
+        FailedAccessRecord fa;
+        fa.pid = pid;
+        fa.filename = path;
+        fa.mode = mode;
+        fa.errno_val = errno_val;
+        fa.timestamp_us = now_us();
+        LOG_DEBUG("Failed access: pid=%d %s mode=%d errno=%d",
+                  pid, path.c_str(), mode, errno_val);
+        session_.on_failed_access(fa);
     }
 }
 
@@ -287,26 +303,38 @@ void PtraceBackend::handle_syscall_stop(int pid) {
         // --- open/openat/openat2/creat ---
         if (sc == SYS_OPEN_NR || sc == SYS_OPENAT_NR || sc == SYS_OPENAT2_NR
             || sc == SYS_CREAT_NR) {
-            if (rax >= 0 && ps.pending_path_addr) {
+            if (ps.pending_path_addr) {
                 int accmode = ps.pending_flags & O_ACCMODE;
                 FileAccessMode mode = FA_RDWR;
                 if (accmode == O_RDONLY) mode = FA_READ;
                 else if (accmode == O_WRONLY) mode = FA_WRITE;
-                record_access(pid, ps.pending_path_addr, mode, (int)rax);
+                if (rax >= 0) {
+                    record_access(pid, ps.pending_path_addr, mode, (int)rax);
+                } else {
+                    record_failed_access(pid, ps.pending_path_addr, mode, (int)(-rax));
+                }
             }
         }
         // --- stat/lstat/newfstatat/statx ---
         else if (sc == SYS_STAT_NR || sc == SYS_LSTAT_NR
               || sc == SYS_NEWFSTATAT_NR || sc == SYS_STATX_NR) {
-            if (rax >= 0 && ps.pending_path_addr) {
-                record_access(pid, ps.pending_path_addr, FA_STAT);
+            if (ps.pending_path_addr) {
+                if (rax >= 0) {
+                    record_access(pid, ps.pending_path_addr, FA_STAT);
+                } else {
+                    record_failed_access(pid, ps.pending_path_addr, FA_STAT, (int)(-rax));
+                }
             }
         }
         // --- access/faccessat/faccessat2 ---
         else if (sc == SYS_ACCESS_NR || sc == SYS_FACCESSAT_NR
               || sc == SYS_FACCESSAT2_NR) {
-            if (rax >= 0 && ps.pending_path_addr) {
-                record_access(pid, ps.pending_path_addr, FA_ACCESS);
+            if (ps.pending_path_addr) {
+                if (rax >= 0) {
+                    record_access(pid, ps.pending_path_addr, FA_ACCESS);
+                } else {
+                    record_failed_access(pid, ps.pending_path_addr, FA_ACCESS, (int)(-rax));
+                }
             }
         }
         // --- execve/execveat ---
@@ -409,6 +437,7 @@ void PtraceBackend::handle_syscall_stop(int pid) {
                     fa.filename = cwd;
                     fa.mode = FA_CHDIR;
                     fa.fd = -1;
+                    fa.timestamp_us = now_us();
                     session_.on_file_access(fa);
                 }
             }
@@ -451,6 +480,7 @@ void PtraceBackend::handle_exec_event(int pid) {
         fa.filename = exe;
         fa.mode = FA_EXEC;
         fa.fd = -1;
+        fa.timestamp_us = now_us();
         session_.on_file_access(fa);
     }
 

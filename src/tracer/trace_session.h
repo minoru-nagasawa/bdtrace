@@ -16,6 +16,7 @@ public:
     void on_process_start(const ProcessRecord& rec);
     void on_process_exit(int pid, int64_t end_time_us, int exit_code);
     void on_file_access(const FileAccessRecord& rec);
+    void on_failed_access(const FailedAccessRecord& rec);
     void finalize();
 
     Database& db() { return db_; }

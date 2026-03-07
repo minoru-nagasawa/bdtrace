@@ -49,6 +49,16 @@ void TraceSession::on_file_access(const FileAccessRecord& rec) {
     maybe_commit();
 }
 
+void TraceSession::on_failed_access(const FailedAccessRecord& rec) {
+    if (!in_transaction_) {
+        db_.begin_transaction();
+        in_transaction_ = true;
+    }
+    db_.insert_failed_access(rec);
+    ++event_count_;
+    maybe_commit();
+}
+
 void TraceSession::finalize() {
     if (in_transaction_) {
         db_.commit_transaction();

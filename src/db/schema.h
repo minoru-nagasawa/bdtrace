@@ -4,6 +4,7 @@
 namespace bdtrace {
 
 const char* get_schema_sql();
+const char* get_schema_v2_upgrade_sql();
 
 } // namespace bdtrace
 

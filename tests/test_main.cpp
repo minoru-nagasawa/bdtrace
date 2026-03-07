@@ -9,6 +9,7 @@ void run_trace_simple_tests();
 void run_trace_fork_tests();
 void run_trace_file_io_tests();
 void run_rebuild_tests();
+void run_transparency_tests();
 
 int main() {
     bdtrace::log_init(bdtrace::LOG_ERROR);
@@ -18,6 +19,7 @@ int main() {
     run_trace_fork_tests();
     run_trace_file_io_tests();
     run_rebuild_tests();
+    run_transparency_tests();
 
     TEST_REPORT();
 }

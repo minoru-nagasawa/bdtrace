@@ -13,6 +13,7 @@ Database::Database()
     , stmt_update_exit_(0)
     , stmt_insert_file_(0)
     , stmt_insert_meta_(0)
+    , stmt_insert_failed_(0)
 {}
 
 Database::~Database() {
@@ -44,7 +45,36 @@ void Database::close() {
 
 bool Database::init_schema() {
     if (!exec(get_schema_sql())) return false;
+    // Set schema version if not set
+    insert_meta("schema_version", "2");
     return prepare_stmts();
+}
+
+bool Database::upgrade_schema() {
+    // Check if failed_accesses table exists; if not, upgrade from v1
+    if (!has_table("failed_accesses")) {
+        LOG_INFO("Upgrading schema to v2...");
+        // Check if timestamp_us column exists by trying a query
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(db_, "SELECT timestamp_us FROM file_accesses LIMIT 0", -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            // Column doesn't exist, add it
+            exec("ALTER TABLE file_accesses ADD COLUMN timestamp_us INTEGER NOT NULL DEFAULT 0");
+        } else {
+            sqlite3_finalize(stmt);
+        }
+        // Create failed_accesses table
+        exec("CREATE TABLE IF NOT EXISTS failed_accesses ("
+             "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+             "  pid INTEGER NOT NULL,"
+             "  filename TEXT NOT NULL,"
+             "  mode INTEGER NOT NULL,"
+             "  errno_val INTEGER NOT NULL,"
+             "  timestamp_us INTEGER NOT NULL DEFAULT 0"
+             ")");
+        exec("CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid)");
+    }
+    return true;
 }
 
 bool Database::exec(const char* sql) {
@@ -78,9 +108,11 @@ bool Database::prepare_stmts() {
         return false;
     if (!prepare("UPDATE processes SET end_time_us = ?, exit_code = ? WHERE pid = ?", &stmt_update_exit_))
         return false;
-    if (!prepare("INSERT INTO file_accesses (pid, filename, mode, fd) VALUES (?, ?, ?, ?)", &stmt_insert_file_))
+    if (!prepare("INSERT INTO file_accesses (pid, filename, mode, fd, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_file_))
         return false;
     if (!prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", &stmt_insert_meta_))
+        return false;
+    if (!prepare("INSERT INTO failed_accesses (pid, filename, mode, errno_val, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_failed_))
         return false;
     return true;
 }
@@ -90,6 +122,7 @@ void Database::finalize_stmts() {
     if (stmt_update_exit_)    { sqlite3_finalize(stmt_update_exit_);    stmt_update_exit_ = 0; }
     if (stmt_insert_file_)    { sqlite3_finalize(stmt_insert_file_);    stmt_insert_file_ = 0; }
     if (stmt_insert_meta_)    { sqlite3_finalize(stmt_insert_meta_);    stmt_insert_meta_ = 0; }
+    if (stmt_insert_failed_)  { sqlite3_finalize(stmt_insert_failed_);  stmt_insert_failed_ = 0; }
 }
 
 bool Database::insert_meta(const std::string& key, const std::string& value) {
@@ -139,7 +172,23 @@ bool Database::insert_file_access(const FileAccessRecord& rec) {
     sqlite3_bind_text(stmt_insert_file_, 2, rec.filename.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt_insert_file_, 3, rec.mode);
     sqlite3_bind_int(stmt_insert_file_, 4, rec.fd);
+    sqlite3_bind_int64(stmt_insert_file_, 5, rec.timestamp_us);
     int rc = sqlite3_step(stmt_insert_file_);
+    if (rc != SQLITE_DONE) {
+        last_error_ = sqlite3_errmsg(db_);
+        return false;
+    }
+    return true;
+}
+
+bool Database::insert_failed_access(const FailedAccessRecord& rec) {
+    sqlite3_reset(stmt_insert_failed_);
+    sqlite3_bind_int(stmt_insert_failed_, 1, rec.pid);
+    sqlite3_bind_text(stmt_insert_failed_, 2, rec.filename.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt_insert_failed_, 3, rec.mode);
+    sqlite3_bind_int(stmt_insert_failed_, 4, rec.errno_val);
+    sqlite3_bind_int64(stmt_insert_failed_, 5, rec.timestamp_us);
+    int rc = sqlite3_step(stmt_insert_failed_);
     if (rc != SQLITE_DONE) {
         last_error_ = sqlite3_errmsg(db_);
         return false;
@@ -206,19 +255,24 @@ bool Database::get_process(int pid, ProcessRecord& out) {
     return found;
 }
 
+static FileAccessRecord row_to_file_access(sqlite3_stmt* stmt) {
+    FileAccessRecord r;
+    r.pid = sqlite3_column_int(stmt, 0);
+    const char* fn = (const char*)sqlite3_column_text(stmt, 1);
+    if (fn) r.filename = fn;
+    r.mode = static_cast<FileAccessMode>(sqlite3_column_int(stmt, 2));
+    r.fd = sqlite3_column_int(stmt, 3);
+    r.timestamp_us = sqlite3_column_int64(stmt, 4);
+    return r;
+}
+
 bool Database::get_file_accesses_by_pid(int pid, std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd FROM file_accesses WHERE pid = ?", &stmt))
+    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE pid = ?", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, pid);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        FileAccessRecord r;
-        r.pid = sqlite3_column_int(stmt, 0);
-        const char* fn = (const char*)sqlite3_column_text(stmt, 1);
-        if (fn) r.filename = fn;
-        r.mode = static_cast<FileAccessMode>(sqlite3_column_int(stmt, 2));
-        r.fd = sqlite3_column_int(stmt, 3);
-        out.push_back(r);
+        out.push_back(row_to_file_access(stmt));
     }
     sqlite3_finalize(stmt);
     return true;
@@ -226,17 +280,11 @@ bool Database::get_file_accesses_by_pid(int pid, std::vector<FileAccessRecord>& 
 
 bool Database::get_file_accesses_by_name(const std::string& filename, std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd FROM file_accesses WHERE filename = ?", &stmt))
+    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE filename = ?", &stmt))
         return false;
     sqlite3_bind_text(stmt, 1, filename.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        FileAccessRecord r;
-        r.pid = sqlite3_column_int(stmt, 0);
-        const char* fn = (const char*)sqlite3_column_text(stmt, 1);
-        if (fn) r.filename = fn;
-        r.mode = static_cast<FileAccessMode>(sqlite3_column_int(stmt, 2));
-        r.fd = sqlite3_column_int(stmt, 3);
-        out.push_back(r);
+        out.push_back(row_to_file_access(stmt));
     }
     sqlite3_finalize(stmt);
     return true;
@@ -244,15 +292,28 @@ bool Database::get_file_accesses_by_name(const std::string& filename, std::vecto
 
 bool Database::get_all_file_accesses(std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd FROM file_accesses", &stmt))
+    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        FileAccessRecord r;
+        out.push_back(row_to_file_access(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_all_failed_accesses(std::vector<FailedAccessRecord>& out) {
+    if (!has_table("failed_accesses")) return true;
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, filename, mode, errno_val, timestamp_us FROM failed_accesses", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        FailedAccessRecord r;
         r.pid = sqlite3_column_int(stmt, 0);
         const char* fn = (const char*)sqlite3_column_text(stmt, 1);
         if (fn) r.filename = fn;
         r.mode = static_cast<FileAccessMode>(sqlite3_column_int(stmt, 2));
-        r.fd = sqlite3_column_int(stmt, 3);
+        r.errno_val = sqlite3_column_int(stmt, 3);
+        r.timestamp_us = sqlite3_column_int64(stmt, 4);
         out.push_back(r);
     }
     sqlite3_finalize(stmt);
@@ -279,6 +340,31 @@ int Database::get_file_access_count() {
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+int Database::get_failed_access_count() {
+    if (!has_table("failed_accesses")) return 0;
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT COUNT(*) FROM failed_accesses", &stmt)) return -1;
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+bool Database::has_table(const std::string& table_name) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", &stmt))
+        return false;
+    sqlite3_bind_text(stmt, 1, table_name.c_str(), -1, SQLITE_TRANSIENT);
+    bool exists = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        exists = sqlite3_column_int(stmt, 0) > 0;
+    }
+    sqlite3_finalize(stmt);
+    return exists;
 }
 
 } // namespace bdtrace

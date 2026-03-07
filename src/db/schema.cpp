@@ -22,10 +22,35 @@ const char* get_schema_sql() {
         "  pid INTEGER NOT NULL,"
         "  filename TEXT NOT NULL,"
         "  mode INTEGER NOT NULL,"
-        "  fd INTEGER"
+        "  fd INTEGER,"
+        "  timestamp_us INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_fa_pid ON file_accesses(pid);"
         "CREATE INDEX IF NOT EXISTS idx_fa_filename ON file_accesses(filename);"
+        "CREATE TABLE IF NOT EXISTS failed_accesses ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  pid INTEGER NOT NULL,"
+        "  filename TEXT NOT NULL,"
+        "  mode INTEGER NOT NULL,"
+        "  errno_val INTEGER NOT NULL,"
+        "  timestamp_us INTEGER NOT NULL DEFAULT 0"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
+        ;
+}
+
+const char* get_schema_v2_upgrade_sql() {
+    return
+        "ALTER TABLE file_accesses ADD COLUMN timestamp_us INTEGER NOT NULL DEFAULT 0;"
+        "CREATE TABLE IF NOT EXISTS failed_accesses ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  pid INTEGER NOT NULL,"
+        "  filename TEXT NOT NULL,"
+        "  mode INTEGER NOT NULL,"
+        "  errno_val INTEGER NOT NULL,"
+        "  timestamp_us INTEGER NOT NULL DEFAULT 0"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
         ;
 }
 
