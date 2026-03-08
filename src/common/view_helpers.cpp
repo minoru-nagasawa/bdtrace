@@ -365,6 +365,78 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result) {
     }
 }
 
+// --- Rebuild filtering ---
+
+static bool cmp_start_time(const ProcessRecord& a, const ProcessRecord& b) {
+    return a.start_time_us < b.start_time_us;
+}
+
+RebuildResult filter_rebuild_set(const DependencyGraph& g,
+                                 const std::set<int>& affected,
+                                 const std::set<std::string>& collapse_names) {
+    RebuildResult res;
+    res.total_affected = (int)affected.size();
+
+    // Collapse: find processes matching collapse_names, hide their descendants
+    std::set<int> collapsed_pids;
+    std::set<int> hidden_pids;
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
+        if (pit == g.proc_map.end()) continue;
+        if (collapse_names.find(cmd_name(pit->second.cmdline)) != collapse_names.end()) {
+            collapsed_pids.insert(*it);
+        }
+    }
+    for (std::set<int>::const_iterator ci = collapsed_pids.begin();
+         ci != collapsed_pids.end(); ++ci) {
+        std::queue<int> dq;
+        dq.push(*ci);
+        while (!dq.empty()) {
+            int p = dq.front();
+            dq.pop();
+            std::map<int, std::vector<int> >::const_iterator ch = g.pid_children.find(p);
+            if (ch == g.pid_children.end()) continue;
+            for (size_t i = 0; i < ch->second.size(); ++i) {
+                int child = ch->second[i];
+                if (affected.find(child) != affected.end()) {
+                    hidden_pids.insert(child);
+                }
+                dq.push(child);
+            }
+        }
+    }
+
+    // Leaf filter: only show processes with outputs that have no children with outputs
+    std::set<int> has_output_child;
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        if (g.pid_to_outputs.find(*it) == g.pid_to_outputs.end()) continue;
+        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
+        if (pit == g.proc_map.end()) continue;
+        int ppid = pit->second.ppid;
+        if (affected.find(ppid) != affected.end()
+            && g.pid_to_outputs.find(ppid) != g.pid_to_outputs.end()) {
+            has_output_child.insert(ppid);
+        }
+    }
+
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        if (hidden_pids.find(*it) != hidden_pids.end()) continue;
+        if (collapsed_pids.find(*it) != collapsed_pids.end()) {
+            res.processes.push_back(g.proc_map.find(*it)->second);
+            continue;
+        }
+        if (g.pid_to_outputs.find(*it) != g.pid_to_outputs.end()
+            && has_output_child.find(*it) == has_output_child.end()) {
+            res.processes.push_back(g.proc_map.find(*it)->second);
+        }
+    }
+    std::sort(res.processes.begin(), res.processes.end(), cmp_start_time);
+    return res;
+}
+
 // --- Rebuild estimate ---
 
 void compute_rebuild_estimate(const DependencyGraph& g,

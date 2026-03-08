@@ -92,6 +92,7 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     rec.pid = pid;
     rec.ppid = getpid();
     rec.cmdline = read_cmdline(pid);
+    rec.cwd = read_proc_link(pid, "cwd");
     rec.start_time_us = now_us();
     session_.on_process_start(rec);
 
@@ -530,6 +531,7 @@ void PtraceBackend::handle_fork_event(int pid) {
     rec.ppid = pid;
     rec.start_time_us = now_us();
     rec.cmdline = read_cmdline((int)child_pid);
+    rec.cwd = read_proc_link((int)child_pid, "cwd");
     session_.on_process_start(rec);
 }
 
@@ -562,6 +564,7 @@ void PtraceBackend::handle_exec_event(int pid) {
         rec.ppid = it->second.ppid;
     }
     rec.cmdline = cmdline;
+    rec.cwd = read_proc_link(pid, "cwd");
     rec.start_time_us = now_us();
 
     char sql_buf[128];

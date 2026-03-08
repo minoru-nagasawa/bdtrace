@@ -68,6 +68,17 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result);
 
 // --- Rebuild estimate ---
 
+struct RebuildResult {
+    std::vector<ProcessRecord> processes;  // filtered leaf processes
+    int total_affected;                    // total before filtering
+};
+
+// Filter affected PIDs to minimal rebuild set (leaf processes with outputs).
+// collapse_names: command names whose subtrees should be collapsed.
+RebuildResult filter_rebuild_set(const DependencyGraph& g,
+                                 const std::set<int>& affected,
+                                 const std::set<std::string>& collapse_names);
+
 struct RebuildEstimate {
     int affected_count;
     int64_t serial_estimate_us;

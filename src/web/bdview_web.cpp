@@ -1137,23 +1137,53 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
     }
 
     std::set<int> affected = rebuild_bfs(g, changed_files);
+
+    // Parse optional collapse parameter (comma-separated command names)
+    std::set<std::string> collapse_names;
+    std::string collapse_str = get_query_param(query, "collapse");
+    if (!collapse_str.empty()) {
+        size_t cs = 0;
+        while (cs < collapse_str.size()) {
+            size_t cc = collapse_str.find(',', cs);
+            if (cc == std::string::npos) cc = collapse_str.size();
+            std::string name = collapse_str.substr(cs, cc - cs);
+            if (!name.empty()) collapse_names.insert(name);
+            cs = cc + 1;
+        }
+    }
+
+    // Apply same filtering as CLI (leaf processes with outputs)
+    RebuildResult rr = filter_rebuild_set(g, affected, collapse_names);
+
     RebuildEstimate est;
     compute_rebuild_estimate(g, affected, est);
 
+    // Find trace-wide min start time (same baseline as Processes tab)
+    int64_t trace_min_start = 0;
+    for (std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.begin();
+         pit != g.proc_map.end(); ++pit) {
+        if (trace_min_start == 0 || pit->second.start_time_us < trace_min_start) {
+            trace_min_start = pit->second.start_time_us;
+        }
+    }
+
     JsonWriter w;
     w.beginObject();
-    w.key("affected_count").val(est.affected_count);
+    w.key("affected_count").val((int)rr.processes.size());
+    w.key("total_affected").val(rr.total_affected);
+    w.key("trace_min_start_us").val(trace_min_start);
     w.key("serial_estimate_us").val(est.serial_estimate_us);
     w.key("longest_single_us").val(est.longest_single_us);
     w.key("affected").beginArray();
-    for (std::set<int>::const_iterator it = affected.begin();
-         it != affected.end(); ++it) {
-        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
-        if (pit == g.proc_map.end()) continue;
+    for (size_t i = 0; i < rr.processes.size(); ++i) {
         w.beginObject();
-        w.key("pid").val(pit->second.pid);
-        w.key("cmdline").val(pit->second.cmdline);
-        w.key("duration_us").val(pit->second.end_time_us - pit->second.start_time_us);
+        int64_t dur = rr.processes[i].end_time_us - rr.processes[i].start_time_us;
+        if (dur < 0) dur = 0;
+        w.key("pid").val(rr.processes[i].pid);
+        w.key("cmdline").val(rr.processes[i].cmdline);
+        w.key("cwd").val(rr.processes[i].cwd);
+        w.key("start_time_us").val(rr.processes[i].start_time_us);
+        w.key("duration_us").val(dur);
         w.endObject();
     }
     w.endArray();

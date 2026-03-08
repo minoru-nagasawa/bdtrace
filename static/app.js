@@ -41,6 +41,7 @@ var App = (function() {
   }
 
   function formatDuration(us) {
+    if (us < 0) us = 0;
     if (us < 1000) return us + 'us';
     if (us < 1000000) return (us / 1000).toFixed(1) + 'ms';
     return (us / 1000000).toFixed(2) + 's';
@@ -412,9 +413,9 @@ var App = (function() {
       hdrColsWrap.appendChild(hc);
     }
     hdr.appendChild(hdrColsWrap);
-    left.appendChild(hdr);
 
     var treeDiv = el('div', {className: 'tree'});
+    treeDiv.appendChild(hdr);
     var roots = data.roots || [];
     var rootUl = el('ul');
     for (var r = 0; r < roots.length; r++) {
@@ -1324,16 +1325,133 @@ var App = (function() {
     } else if (idx === 6) {
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Rebuild Estimator'));
-      var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
-      var input = el('input', {type: 'text', placeholder: 'Enter changed file path(s), comma-separated', style: 'flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+
+      // File search input with autocomplete suggestions
+      var searchRow = el('div', {style: 'display:flex;gap:8px;margin-bottom:4px;align-items:center'});
+      var searchWrap = el('div', {style: 'flex:1;position:relative'});
+      var input = el('input', {type: 'text', placeholder: 'Type to search files...', style: 'width:100%;box-sizing:border-box;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var suggestBox = el('div', {style: 'display:none;position:absolute;left:0;right:0;top:100%;max-height:200px;overflow-y:auto;background:var(--bg2);border:1px solid var(--border);border-radius:0 0 4px 4px;z-index:100'});
+      searchWrap.appendChild(input);
+      searchWrap.appendChild(suggestBox);
       var btn = el('button', {style: 'padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer'}, 'Calculate');
-      row.appendChild(input);
-      row.appendChild(btn);
-      content.appendChild(row);
+      searchRow.appendChild(searchWrap);
+      searchRow.appendChild(btn);
+      content.appendChild(searchRow);
+
+      // Selected files list
+      var selectedDiv = el('div', {style: 'margin-bottom:12px;display:flex;flex-wrap:wrap;gap:4px'});
+      content.appendChild(selectedDiv);
+      var selectedFiles = [];
+
+      function renderSelected() {
+        selectedDiv.innerHTML = '';
+        for (var si = 0; si < selectedFiles.length; si++) {
+          (function(idx) {
+            var tag = el('span', {style: 'display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:3px;font-size:12px;max-width:100%;word-break:break-all'});
+            tag.appendChild(document.createTextNode(selectedFiles[idx]));
+            var rm = el('span', {style: 'cursor:pointer;color:var(--fg2);font-weight:bold'}, '\u00d7');
+            rm.onclick = function() { selectedFiles.splice(idx, 1); renderSelected(); };
+            tag.appendChild(rm);
+            selectedDiv.appendChild(tag);
+          })(si);
+        }
+      }
+
+      // Fetch file list for autocomplete
+      var allFilePaths = [];
+      api('/api/files', function(data) {
+        if (data) {
+          for (var fi = 0; fi < data.length; fi++) {
+            allFilePaths.push(data[fi].path);
+          }
+        }
+      });
+
+      var suggestIndex = -1;
+      var suggestMatches = [];
+
+      function selectSuggestion(path) {
+        if (selectedFiles.indexOf(path) < 0) {
+          selectedFiles.push(path);
+          renderSelected();
+        }
+        input.value = '';
+        suggestBox.style.display = 'none';
+        suggestIndex = -1;
+      }
+
+      function updateSuggestHighlight() {
+        var items = suggestBox.children;
+        for (var i = 0; i < items.length; i++) {
+          items[i].style.background = i === suggestIndex ? 'var(--bg3)' : '';
+        }
+        if (suggestIndex >= 0 && suggestIndex < items.length) {
+          items[suggestIndex].scrollIntoView({block: 'nearest'});
+        }
+      }
+
+      function showSuggestions(query) {
+        suggestBox.innerHTML = '';
+        suggestIndex = -1;
+        if (!query) { suggestBox.style.display = 'none'; return; }
+        var q = query.toLowerCase();
+        suggestMatches = [];
+        for (var fi = 0; fi < allFilePaths.length; fi++) {
+          if (allFilePaths[fi].toLowerCase().indexOf(q) >= 0) {
+            suggestMatches.push(allFilePaths[fi]);
+            if (suggestMatches.length >= 20) break;
+          }
+        }
+        if (suggestMatches.length === 0) { suggestBox.style.display = 'none'; return; }
+        for (var mi = 0; mi < suggestMatches.length; mi++) {
+          (function(path, idx) {
+            var item = el('div', {style: 'padding:4px 8px;cursor:pointer;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'}, path);
+            item.title = path;
+            item.onmouseenter = function() { suggestIndex = idx; updateSuggestHighlight(); };
+            item.onclick = function() { selectSuggestion(path); };
+            suggestBox.appendChild(item);
+          })(suggestMatches[mi], mi);
+        }
+        suggestBox.style.display = 'block';
+      }
+
+      input.oninput = function() { showSuggestions(input.value.trim()); };
+      input.onkeydown = function(e) {
+        if (suggestBox.style.display !== 'none' && suggestMatches.length > 0) {
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            suggestIndex = suggestIndex < suggestMatches.length - 1 ? suggestIndex + 1 : 0;
+            updateSuggestHighlight();
+            return;
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            suggestIndex = suggestIndex > 0 ? suggestIndex - 1 : suggestMatches.length - 1;
+            updateSuggestHighlight();
+            return;
+          } else if (e.key === 'Enter' && suggestIndex >= 0) {
+            e.preventDefault();
+            selectSuggestion(suggestMatches[suggestIndex]);
+            return;
+          }
+        }
+        if (e.key === 'Enter') {
+          var val = input.value.trim();
+          if (val && selectedFiles.indexOf(val) < 0) {
+            selectedFiles.push(val);
+            renderSelected();
+          }
+          input.value = '';
+          suggestBox.style.display = 'none';
+        }
+      };
+      document.addEventListener('click', function(e) {
+        if (!searchWrap.contains(e.target)) { suggestBox.style.display = 'none'; suggestIndex = -1; }
+      });
+
       var resultDiv = el('div');
       content.appendChild(resultDiv);
       btn.onclick = function() {
-        var val = input.value.trim();
+        var val = selectedFiles.length > 0 ? selectedFiles.join(',') : input.value.trim();
         if (!val) return;
         resultDiv.innerHTML = '<div class="loading">Calculating...</div>';
         api('/api/rebuild?changed=' + encodeURIComponent(val) + '&estimate=1', function(data) {
@@ -1346,10 +1464,40 @@ var App = (function() {
           resultDiv.appendChild(el('div', {style: 'margin-bottom:8px'}, 'Serial estimate: ' + formatDuration(data.serial_estimate_us)));
           resultDiv.appendChild(el('div', {style: 'margin-bottom:12px'}, 'Longest single: ' + formatDuration(data.longest_single_us)));
           if (data.affected && data.affected.length > 0) {
-            var tbl = makeTable(['PID', 'Duration', 'Command'], data.affected.map(function(p) {
-              return [p.pid, formatDuration(p.duration_us), shortenCmd(p.cmdline, 60)];
+            var minStart = data.trace_min_start_us || 0;
+            var tbl = makeTable(['PID', 'Start', 'Duration', 'Directory', 'Command'], data.affected.map(function(p) {
+              return [p.pid, formatRelSec(p.start_time_us - minStart), formatDuration(p.duration_us), p.cwd || '', p.cmdline];
             }));
             resultDiv.appendChild(tbl);
+
+            // Copyable rebuild script
+            var lines = [];
+            var lastCwd = null;
+            for (var pi = 0; pi < data.affected.length; pi++) {
+              var p = data.affected[pi];
+              if (pi > 0) lines.push('');
+              if (p.cwd && p.cwd !== lastCwd) {
+                lines.push('cd ' + p.cwd);
+                lines.push('');
+                lastCwd = p.cwd;
+              }
+              lines.push(p.cmdline);
+            }
+            var script = lines.join('\n');
+            var scriptDiv = el('div', {style: 'margin-top:12px'});
+            var copyBtn = el('button', {style: 'padding:4px 12px;margin-bottom:8px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px;cursor:pointer'}, 'Copy rebuild script');
+            copyBtn.onclick = function() {
+              if (navigator.clipboard) {
+                navigator.clipboard.writeText(script);
+                copyBtn.textContent = 'Copied!';
+                setTimeout(function() { copyBtn.textContent = 'Copy rebuild script'; }, 2000);
+              }
+            };
+            scriptDiv.appendChild(copyBtn);
+            var pre = el('pre', {style: 'padding:8px 12px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow-x:auto;font-size:12px;white-space:pre-wrap;word-break:break-all'});
+            pre.textContent = script;
+            scriptDiv.appendChild(pre);
+            resultDiv.appendChild(scriptDiv);
           }
         });
       };

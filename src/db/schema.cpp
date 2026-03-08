@@ -19,7 +19,8 @@ const char* get_schema_sql() {
         "  sys_time_us INTEGER DEFAULT 0,"
         "  peak_rss_kb INTEGER DEFAULT 0,"
         "  io_read_bytes INTEGER DEFAULT 0,"
-        "  io_write_bytes INTEGER DEFAULT 0"
+        "  io_write_bytes INTEGER DEFAULT 0,"
+        "  cwd TEXT DEFAULT ''"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
         "CREATE TABLE IF NOT EXISTS file_accesses ("
@@ -66,6 +67,12 @@ const char* get_schema_v3_upgrade_sql() {
         "ALTER TABLE processes ADD COLUMN peak_rss_kb INTEGER DEFAULT 0;"
         "ALTER TABLE processes ADD COLUMN io_read_bytes INTEGER DEFAULT 0;"
         "ALTER TABLE processes ADD COLUMN io_write_bytes INTEGER DEFAULT 0;"
+        ;
+}
+
+const char* get_schema_v4_upgrade_sql() {
+    return
+        "ALTER TABLE processes ADD COLUMN cwd TEXT DEFAULT '';"
         ;
 }
 

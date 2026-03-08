@@ -36,6 +36,7 @@ struct ProcessRecord {
     int pid;
     int ppid;
     std::string cmdline;
+    std::string cwd;
     int64_t start_time_us;
     int64_t end_time_us;
     int exit_code;

@@ -423,63 +423,7 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
     }
 
     std::set<int> affected = rebuild_bfs(g, changed_files);
-
-    std::set<int> collapsed_pids;
-    std::set<int> hidden_pids;
-    for (std::set<int>::const_iterator it = affected.begin();
-         it != affected.end(); ++it) {
-        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
-        if (pit == g.proc_map.end()) continue;
-        if (collapse_names.find(cmd_name(pit->second.cmdline)) != collapse_names.end()) {
-            collapsed_pids.insert(*it);
-        }
-    }
-    for (std::set<int>::const_iterator ci = collapsed_pids.begin();
-         ci != collapsed_pids.end(); ++ci) {
-        std::queue<int> dq;
-        dq.push(*ci);
-        while (!dq.empty()) {
-            int p = dq.front();
-            dq.pop();
-            std::map<int, std::vector<int> >::const_iterator ch = g.pid_children.find(p);
-            if (ch == g.pid_children.end()) continue;
-            for (size_t i = 0; i < ch->second.size(); ++i) {
-                int child = ch->second[i];
-                if (affected.find(child) != affected.end()) {
-                    hidden_pids.insert(child);
-                }
-                dq.push(child);
-            }
-        }
-    }
-
-    std::set<int> has_output_child;
-    for (std::set<int>::const_iterator it = affected.begin();
-         it != affected.end(); ++it) {
-        if (g.pid_to_outputs.find(*it) == g.pid_to_outputs.end()) continue;
-        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
-        if (pit == g.proc_map.end()) continue;
-        int ppid = pit->second.ppid;
-        if (affected.find(ppid) != affected.end()
-            && g.pid_to_outputs.find(ppid) != g.pid_to_outputs.end()) {
-            has_output_child.insert(ppid);
-        }
-    }
-
-    std::vector<ProcessRecord> result;
-    for (std::set<int>::const_iterator it = affected.begin();
-         it != affected.end(); ++it) {
-        if (hidden_pids.find(*it) != hidden_pids.end()) continue;
-        if (collapsed_pids.find(*it) != collapsed_pids.end()) {
-            result.push_back(g.proc_map.find(*it)->second);
-            continue;
-        }
-        if (g.pid_to_outputs.find(*it) != g.pid_to_outputs.end()
-            && has_output_child.find(*it) == has_output_child.end()) {
-            result.push_back(g.proc_map.find(*it)->second);
-        }
-    }
-    std::sort(result.begin(), result.end(), cmp_start_time);
+    RebuildResult rr = filter_rebuild_set(g, affected, collapse_names);
 
     std::printf("=== Minimal Rebuild Set for:");
     for (size_t i = 0; i < changed_args.size(); ++i) {
@@ -487,9 +431,14 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
     }
     std::printf(" ===\n");
 
-    std::printf("Affected processes: %d\n", (int)result.size());
-    for (size_t i = 0; i < result.size(); ++i) {
-        std::printf("  [%d] %s\n", result[i].pid, result[i].cmdline.c_str());
+    std::printf("Affected processes: %d\n", (int)rr.processes.size());
+    std::string last_cwd;
+    for (size_t i = 0; i < rr.processes.size(); ++i) {
+        if (!rr.processes[i].cwd.empty() && rr.processes[i].cwd != last_cwd) {
+            std::printf("  cd %s\n", rr.processes[i].cwd.c_str());
+            last_cwd = rr.processes[i].cwd;
+        }
+        std::printf("  [%d] %s\n", rr.processes[i].pid, rr.processes[i].cmdline.c_str());
     }
 
     if (estimate) {

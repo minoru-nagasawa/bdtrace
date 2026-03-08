@@ -91,6 +91,18 @@ bool Database::upgrade_schema() {
         }
     }
 
+    // Check if cwd column exists; if not, upgrade to v4
+    {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(db_, "SELECT cwd FROM processes LIMIT 0", -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            LOG_INFO("Upgrading schema to v4 (cwd tracking)...");
+            exec("ALTER TABLE processes ADD COLUMN cwd TEXT DEFAULT ''");
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+
     return true;
 }
 
@@ -121,7 +133,7 @@ bool Database::prepare(const char* sql, sqlite3_stmt** stmt) {
 }
 
 bool Database::prepare_stmts() {
-    if (!prepare("INSERT INTO processes (pid, ppid, cmdline, start_time_us, end_time_us, exit_code) VALUES (?, ?, ?, ?, ?, ?)", &stmt_insert_process_))
+    if (!prepare("INSERT INTO processes (pid, ppid, cmdline, start_time_us, end_time_us, exit_code, cwd) VALUES (?, ?, ?, ?, ?, ?, ?)", &stmt_insert_process_))
         return false;
     if (!prepare("UPDATE processes SET end_time_us = ?, exit_code = ?, user_time_us = ?, sys_time_us = ?, peak_rss_kb = ?, io_read_bytes = ?, io_write_bytes = ? WHERE pid = ?", &stmt_update_exit_))
         return false;
@@ -162,6 +174,7 @@ bool Database::insert_process(const ProcessRecord& rec) {
     sqlite3_bind_int64(stmt_insert_process_, 4, rec.start_time_us);
     sqlite3_bind_int64(stmt_insert_process_, 5, rec.end_time_us);
     sqlite3_bind_int(stmt_insert_process_, 6, rec.exit_code);
+    sqlite3_bind_text(stmt_insert_process_, 7, rec.cwd.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt_insert_process_);
     if (rc != SQLITE_DONE) {
         last_error_ = sqlite3_errmsg(db_);
@@ -248,12 +261,16 @@ static ProcessRecord row_to_process(sqlite3_stmt* stmt) {
         r.io_read_bytes = sqlite3_column_int64(stmt, 9);
         r.io_write_bytes = sqlite3_column_int64(stmt, 10);
     }
+    if (col_count > 11) {
+        const char* cwd = (const char*)sqlite3_column_text(stmt, 11);
+        if (cwd) r.cwd = cwd;
+    }
     return r;
 }
 
 bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes ORDER BY start_time_us", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         out.push_back(row_to_process(stmt));
@@ -264,7 +281,7 @@ bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
 
 bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, ppid);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -276,7 +293,7 @@ bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
 
 bool Database::get_process(int pid, ProcessRecord& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes FROM processes WHERE pid = ?", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes WHERE pid = ?", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, pid);
     bool found = false;
