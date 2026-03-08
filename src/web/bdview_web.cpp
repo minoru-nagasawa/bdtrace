@@ -363,21 +363,53 @@ static void write_proc_info(JsonWriter& jw, const ProcessRecord& proc) {
     jw.key("io_write_bytes").val(proc.io_write_bytes);
 }
 
+struct PidAccess {
+    int pid;
+    std::set<int> modes;
+    int64_t first_timestamp;
+};
+
 static void handle_files_by_path(struct mg_connection *c, const std::string& path) {
     std::vector<FileAccessRecord> accesses;
     g_db->get_file_accesses_by_name(path, accesses);
 
+    // Group by PID: merge modes, keep earliest timestamp
+    std::map<int, PidAccess> pid_map;
+    for (size_t i = 0; i < accesses.size(); ++i) {
+        int pid = accesses[i].pid;
+        std::map<int, PidAccess>::iterator it = pid_map.find(pid);
+        if (it == pid_map.end()) {
+            PidAccess pa;
+            pa.pid = pid;
+            pa.modes.insert((int)accesses[i].mode);
+            pa.first_timestamp = accesses[i].timestamp_us;
+            pid_map[pid] = pa;
+        } else {
+            it->second.modes.insert((int)accesses[i].mode);
+            if (accesses[i].timestamp_us < it->second.first_timestamp)
+                it->second.first_timestamp = accesses[i].timestamp_us;
+        }
+    }
+
     JsonWriter jw;
     jw.beginArray();
-    for (size_t i = 0; i < accesses.size(); ++i) {
+    for (std::map<int, PidAccess>::const_iterator it = pid_map.begin();
+         it != pid_map.end(); ++it) {
         ProcessRecord proc;
-        bool found = g_db->get_process(accesses[i].pid, proc);
+        bool found = g_db->get_process(it->first, proc);
+        // Build combined mode string
+        std::string modes;
+        for (std::set<int>::const_iterator mi = it->second.modes.begin();
+             mi != it->second.modes.end(); ++mi) {
+            if (!modes.empty()) modes += ",";
+            modes += mode_str(*mi);
+        }
         jw.beginObject();
-        jw.key("pid").val(accesses[i].pid);
+        jw.key("pid").val(it->first);
         jw.key("cmdline").val(found ? proc.cmdline : std::string());
-        jw.key("mode").val((int)accesses[i].mode);
-        jw.key("mode_str").val(mode_str(accesses[i].mode));
-        jw.key("timestamp_us").val(accesses[i].timestamp_us);
+        jw.key("mode").val(-1);
+        jw.key("mode_str").val(modes);
+        jw.key("timestamp_us").val(it->second.first_timestamp);
         if (found) write_proc_info(jw, proc);
         jw.endObject();
     }
@@ -392,21 +424,45 @@ static void handle_files_by_prefix(struct mg_connection *c, const std::string& p
     std::string pfx = prefix;
     if (!pfx.empty() && pfx[pfx.size() - 1] != '/') pfx += '/';
 
+    // Group by (pid, filename): merge modes, keep earliest timestamp
+    typedef std::pair<int, std::string> PidFile;
+    std::map<PidFile, PidAccess> grouped;
+    for (size_t i = 0; i < all_fa.size(); ++i) {
+        if (all_fa[i].filename.compare(0, pfx.size(), pfx) != 0) continue;
+        PidFile key(all_fa[i].pid, all_fa[i].filename);
+        std::map<PidFile, PidAccess>::iterator it = grouped.find(key);
+        if (it == grouped.end()) {
+            PidAccess pa;
+            pa.modes.insert((int)all_fa[i].mode);
+            pa.first_timestamp = all_fa[i].timestamp_us;
+            grouped[key] = pa;
+        } else {
+            it->second.modes.insert((int)all_fa[i].mode);
+            if (all_fa[i].timestamp_us < it->second.first_timestamp)
+                it->second.first_timestamp = all_fa[i].timestamp_us;
+        }
+    }
+
     JsonWriter jw;
     jw.beginArray();
-    for (size_t i = 0; i < all_fa.size(); ++i) {
-        if (all_fa[i].filename.compare(0, pfx.size(), pfx) == 0) {
-            ProcessRecord proc;
-            bool found = g_db->get_process(all_fa[i].pid, proc);
-            jw.beginObject();
-            jw.key("pid").val(all_fa[i].pid);
-            jw.key("cmdline").val(found ? proc.cmdline : std::string());
-            jw.key("filename").val(all_fa[i].filename);
-            jw.key("mode_str").val(mode_str(all_fa[i].mode));
-            jw.key("timestamp_us").val(all_fa[i].timestamp_us);
-            if (found) write_proc_info(jw, proc);
-            jw.endObject();
+    for (std::map<PidFile, PidAccess>::const_iterator it = grouped.begin();
+         it != grouped.end(); ++it) {
+        ProcessRecord proc;
+        bool found = g_db->get_process(it->first.first, proc);
+        std::string modes;
+        for (std::set<int>::const_iterator mi = it->second.modes.begin();
+             mi != it->second.modes.end(); ++mi) {
+            if (!modes.empty()) modes += ",";
+            modes += mode_str(*mi);
         }
+        jw.beginObject();
+        jw.key("pid").val(it->first.first);
+        jw.key("cmdline").val(found ? proc.cmdline : std::string());
+        jw.key("filename").val(it->first.second);
+        jw.key("mode_str").val(modes);
+        jw.key("timestamp_us").val(it->second.first_timestamp);
+        if (found) write_proc_info(jw, proc);
+        jw.endObject();
     }
     jw.endArray();
     send_json(c, jw.str());
