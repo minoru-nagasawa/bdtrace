@@ -6,6 +6,7 @@ bdview-web
 test_*
 !tests/test_*.cpp
 !tests/helpers/*
+!scripts/test_*.sh
 bdtrace.db
 *.db
 vendor/sqlite3.c
