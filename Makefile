@@ -66,7 +66,7 @@ TEST_LIBS = $(COMMON_OBJS) $(HELPER_OBJS) $(DB_OBJS) $(SQLITE_OBJ)
 TEST_SRCS = tests/test_main.cpp tests/test_database.cpp tests/test_trace_simple.cpp \
             tests/test_trace_fork.cpp tests/test_trace_file_io.cpp tests/test_rebuild.cpp \
             tests/test_transparency.cpp tests/test_shell_patterns.cpp \
-            tests/test_analysis.cpp
+            tests/test_analysis.cpp tests/test_cmd_name.cpp
 TEST_OBJS = $(TEST_SRCS:.cpp=.o)
 
 test_all: $(TEST_OBJS) $(TEST_LIBS) $(TRACER_OBJS)

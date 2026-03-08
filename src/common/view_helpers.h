@@ -15,6 +15,9 @@ const char* mode_str(int mode);
 bool is_input_mode(int mode);
 bool is_output_mode(int mode);
 std::string cmd_name(const std::string& cmdline);
+// Returns the script's absolute path for interpreter commands, using cwd
+// to resolve relative paths. For non-interpreter commands, returns basename.
+std::string cmd_name_full(const std::string& cmdline, const std::string& cwd);
 std::string shorten_cmd(const std::string& cmdline, size_t max_len);
 const char* errno_name(int e);
 

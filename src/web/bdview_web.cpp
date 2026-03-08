@@ -477,11 +477,11 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
     std::string cmd_filter = get_query_param(query, "cmd");
 
     if (!cmd_filter.empty()) {
-        // Return individual processes matching cmd_name
+        // Return individual processes matching cmd_name_full
         std::vector<ProcessRecord> matched;
         for (size_t i = 0; i < procs.size(); ++i) {
             if (procs[i].end_time_us <= 0) continue;
-            if (cmd_name(procs[i].cmdline) == cmd_filter)
+            if (cmd_name_full(procs[i].cmdline, procs[i].cwd) == cmd_filter)
                 matched.push_back(procs[i]);
         }
         std::sort(matched.begin(), matched.end(), cmp_duration_desc);
@@ -502,7 +502,7 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
         std::map<std::string, GroupStats> groups;
         for (size_t i = 0; i < procs.size(); ++i) {
             if (procs[i].end_time_us <= 0) continue;
-            std::string name = cmd_name(procs[i].cmdline);
+            std::string name = cmd_name_full(procs[i].cmdline, procs[i].cwd);
             int64_t dur = procs[i].end_time_us - procs[i].start_time_us;
             int64_t cpu = procs[i].user_time_us + procs[i].sys_time_us;
             GroupStats& gs = groups[name];

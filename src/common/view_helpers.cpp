@@ -43,13 +43,239 @@ bool is_output_mode(int mode) {
         || mode == FA_TRUNCATE || mode == FA_MKNOD || mode == FA_MKDIR;
 }
 
+static std::string basename_of(const std::string& path) {
+    size_t sl = path.rfind('/');
+    if (sl != std::string::npos) return path.substr(sl + 1);
+    return path;
+}
+
+static bool is_interpreter(const std::string& name) {
+    return name == "perl" || name == "python" || name == "python2"
+        || name == "python3" || name == "ruby" || name == "wish"
+        || name == "tclsh" || name == "lua" || name == "node"
+        || name == "sh" || name == "bash" || name == "dash"
+        || name == "zsh" || name == "ksh" || name == "csh"
+        || name == "tcsh" || name == "env"
+        || name == "awk" || name == "gawk" || name == "mawk" || name == "nawk"
+        || name == "sed" || name == "gsed"
+        || name == "m4" || name == "gm4"
+        || name == "java" || name == "groovy" || name == "gradle"
+        || name == "cmake" || name == "ctest"
+        || name == "php";
+}
+
+// Interpreters where the first non-flag argument is code, not a script file.
+// Script file is specified via -f flag only.
+static bool is_code_first_interpreter(const std::string& name) {
+    return name == "awk" || name == "gawk" || name == "mawk" || name == "nawk"
+        || name == "sed" || name == "gsed";
+}
+
 std::string cmd_name(const std::string& cmdline) {
     std::string first = cmdline;
     size_t sp = first.find(' ');
     if (sp != std::string::npos) first = first.substr(0, sp);
-    size_t sl = first.rfind('/');
-    if (sl != std::string::npos) first = first.substr(sl + 1);
-    return first;
+    std::string exe = basename_of(first);
+
+    if (!is_interpreter(exe) || sp == std::string::npos)
+        return exe;
+
+    // For interpreters, find the script argument (skip flags starting with -)
+    std::string rest = cmdline.substr(sp + 1);
+
+    // Handle "env [-flags] [VAR=val...] cmd [args...]" by recursing
+    if (exe == "env") {
+        // Skip env options and VAR=val assignments
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            // skip leading spaces
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            if (pos >= rest.size()) break;
+            if (rest[pos] == '-') {
+                // skip flag token
+                while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            } else if (rest.find('=', pos) != std::string::npos
+                       && (rest.find(' ', pos) == std::string::npos
+                           || rest.find('=', pos) < rest.find(' ', pos))) {
+                // skip VAR=val token
+                while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            } else {
+                break;
+            }
+        }
+        if (pos < rest.size()) {
+            return cmd_name(rest.substr(pos));
+        }
+        return exe;
+    }
+
+    // For awk/sed: first non-flag arg is code, not a script.
+    // Only -f <file> specifies a script file.
+    if (is_code_first_interpreter(exe)) {
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            if (pos >= rest.size() || rest[pos] != '-') break;
+            size_t fstart = pos;
+            while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            std::string flag = rest.substr(fstart, pos - fstart);
+            if (flag == "-f") {
+                // Next token is the script file
+                while (pos < rest.size() && rest[pos] == ' ') ++pos;
+                if (pos >= rest.size()) return exe;
+                size_t end = rest.find(' ', pos);
+                std::string script = (end != std::string::npos)
+                    ? rest.substr(pos, end - pos) : rest.substr(pos);
+                std::string script_base = basename_of(script);
+                return script_base.empty() ? exe : script_base;
+            }
+        }
+        // No -f found: first non-flag arg is code expression, return exe
+        return exe;
+    }
+
+    // Determine which flags mean "inline code" (no script file follows)
+    // and which flags consume the next token as their argument.
+    bool shell = (exe == "sh" || exe == "bash" || exe == "dash"
+               || exe == "zsh" || exe == "ksh" || exe == "csh" || exe == "tcsh");
+
+    size_t pos = 0;
+    while (pos < rest.size()) {
+        while (pos < rest.size() && rest[pos] == ' ') ++pos;
+        if (pos >= rest.size() || rest[pos] != '-') break;
+        size_t fstart = pos;
+        while (pos < rest.size() && rest[pos] != ' ') ++pos;
+        std::string flag = rest.substr(fstart, pos - fstart);
+        // For shells: -c means inline code, return exe
+        if (shell && flag == "-c") return exe;
+        // For non-shells (perl/ruby/python/node): -e/-c means inline code
+        if (!shell && (flag == "-e" || flag == "-c")) return exe;
+        // Flags that consume the next token as their argument (skip it)
+        // These are interpreter-specific; shells have very few.
+        bool has_arg = false;
+        if (!shell) {
+            // perl/python/ruby/node flags that take an argument
+            has_arg = (flag == "-I" || flag == "-m" || flag == "-M"
+                    || flag == "-x" || flag == "-W" || flag == "-X"
+                    || flag == "-o" || flag == "-O");
+        }
+        if (has_arg) {
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            while (pos < rest.size() && rest[pos] != ' ') ++pos;
+        }
+    }
+    if (pos >= rest.size()) return exe;
+
+    // Extract the script name token
+    size_t end = rest.find(' ', pos);
+    std::string script = (end != std::string::npos)
+        ? rest.substr(pos, end - pos)
+        : rest.substr(pos);
+    std::string script_base = basename_of(script);
+
+    if (script_base.empty()) return exe;
+    return script_base;
+}
+
+static std::string resolve_path(const std::string& path, const std::string& cwd) {
+    if (path.empty()) return path;
+    if (path[0] == '/') return path;  // already absolute
+    if (cwd.empty()) return path;
+    std::string base = cwd;
+    if (!base.empty() && base[base.size() - 1] != '/') base += '/';
+    return base + path;
+}
+
+// Extract the script argument token from cmdline (same logic as cmd_name
+// but returns the raw token before basename extraction).
+static std::string script_token(const std::string& cmdline) {
+    std::string first = cmdline;
+    size_t sp = first.find(' ');
+    if (sp == std::string::npos) return "";
+    first = first.substr(0, sp);
+    std::string exe = basename_of(first);
+
+    if (!is_interpreter(exe)) return "";
+
+    std::string rest = cmdline.substr(sp + 1);
+
+    // Handle env
+    if (exe == "env") {
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            if (pos >= rest.size()) break;
+            if (rest[pos] == '-') {
+                while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            } else if (rest.find('=', pos) != std::string::npos
+                       && (rest.find(' ', pos) == std::string::npos
+                           || rest.find('=', pos) < rest.find(' ', pos))) {
+                while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            } else {
+                break;
+            }
+        }
+        if (pos < rest.size()) {
+            return script_token(rest.substr(pos));
+        }
+        return "";
+    }
+
+    // For awk/sed: only -f <file> specifies a script
+    if (is_code_first_interpreter(exe)) {
+        size_t pos = 0;
+        while (pos < rest.size()) {
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            if (pos >= rest.size() || rest[pos] != '-') break;
+            size_t fstart = pos;
+            while (pos < rest.size() && rest[pos] != ' ') ++pos;
+            std::string flag = rest.substr(fstart, pos - fstart);
+            if (flag == "-f") {
+                while (pos < rest.size() && rest[pos] == ' ') ++pos;
+                if (pos >= rest.size()) return "";
+                size_t end = rest.find(' ', pos);
+                return (end != std::string::npos) ? rest.substr(pos, end - pos) : rest.substr(pos);
+            }
+        }
+        return "";
+    }
+
+    // Skip interpreter flags (same logic as cmd_name)
+    bool shell = (exe == "sh" || exe == "bash" || exe == "dash"
+               || exe == "zsh" || exe == "ksh" || exe == "csh" || exe == "tcsh");
+    size_t pos = 0;
+    while (pos < rest.size()) {
+        while (pos < rest.size() && rest[pos] == ' ') ++pos;
+        if (pos >= rest.size() || rest[pos] != '-') break;
+        size_t fstart = pos;
+        while (pos < rest.size() && rest[pos] != ' ') ++pos;
+        std::string flag = rest.substr(fstart, pos - fstart);
+        if (shell && flag == "-c") return "";
+        if (!shell && (flag == "-e" || flag == "-c")) return "";
+        bool has_arg = false;
+        if (!shell) {
+            has_arg = (flag == "-I" || flag == "-m" || flag == "-M"
+                    || flag == "-x" || flag == "-W" || flag == "-X"
+                    || flag == "-o" || flag == "-O");
+        }
+        if (has_arg) {
+            while (pos < rest.size() && rest[pos] == ' ') ++pos;
+            while (pos < rest.size() && rest[pos] != ' ') ++pos;
+        }
+    }
+    if (pos >= rest.size()) return "";
+
+    size_t end = rest.find(' ', pos);
+    return (end != std::string::npos) ? rest.substr(pos, end - pos) : rest.substr(pos);
+}
+
+std::string cmd_name_full(const std::string& cmdline, const std::string& cwd) {
+    std::string token = script_token(cmdline);
+    if (token.empty()) {
+        // Non-interpreter: return basename of executable
+        return cmd_name(cmdline);
+    }
+    return resolve_path(token, cwd);
 }
 
 std::string shorten_cmd(const std::string& cmdline, size_t max_len) {
