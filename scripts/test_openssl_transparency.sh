@@ -87,7 +87,9 @@ echo "--- Build 1: baseline (no tracing) ---"
 cp -a "${OPENSSL_DIR}" "${BUILDDIR}"
 cd "${BUILDDIR}"
 ./config no-async no-shared >/dev/null 2>&1
+T1_START=$(date +%s%N)
 make -j1 2>&1 | tail -3
+T1_END=$(date +%s%N)
 cd "${WORKDIR}"
 mv "${BUILDDIR}" build-baseline
 
@@ -102,7 +104,9 @@ cd "${BUILDDIR}"
 # (mkbuildinf.pl does not respect SOURCE_DATE_EPOCH in OpenSSL 1.1.1w)
 cp "${WORKDIR}/build-baseline/crypto/buildinf.h" crypto/buildinf.h
 touch crypto/buildinf.h
+T2_START=$(date +%s%N)
 "${BDTRACE}" -o "${WORKDIR}/trace.db" make -j1 2>&1 | tail -3
+T2_END=$(date +%s%N)
 cd "${WORKDIR}"
 mv "${BUILDDIR}" build-traced
 
@@ -175,11 +179,25 @@ else
     fi
 fi
 
+# Timing summary
+T1_MS=$(( (T1_END - T1_START) / 1000000 ))
+T2_MS=$(( (T2_END - T2_START) / 1000000 ))
+if [ "${T1_MS}" -gt 0 ]; then
+    OVERHEAD=$(( (T2_MS - T1_MS) * 100 / T1_MS ))
+else
+    OVERHEAD="N/A"
+fi
+
 # Summary
 echo ""
 echo "=== Results ==="
 echo "PASS: ${PASS}"
 echo "FAIL: ${FAIL}"
+echo ""
+echo "=== Timing ==="
+echo "Baseline:  ${T1_MS} ms"
+echo "Traced:    ${T2_MS} ms"
+echo "Overhead:  ${OVERHEAD}%"
 
 if [ "${FAIL}" -gt 0 ]; then
     echo ""

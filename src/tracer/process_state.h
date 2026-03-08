@@ -15,6 +15,7 @@ struct ProcessState {
     unsigned long pending_path_addr2; // address of 2nd filename arg (rename/link/symlink)
     int pending_flags;     // flags arg for open/openat
     bool traced;           // has been set up with PTRACE_SETOPTIONS
+    std::string cached_cwd; // cached cwd, updated on chdir/fchdir
     int64_t user_time_us;
     int64_t sys_time_us;
     int64_t peak_rss_kb;

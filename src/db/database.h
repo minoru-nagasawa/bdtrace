@@ -32,6 +32,7 @@ public:
                              int64_t io_read_bytes = 0, int64_t io_write_bytes = 0);
     bool insert_file_access(const FileAccessRecord& rec);
     bool insert_failed_access(const FailedAccessRecord& rec);
+    bool delete_process(int pid);
 
     // Transaction control
     bool begin_transaction();
@@ -68,6 +69,7 @@ private:
     sqlite3_stmt* stmt_insert_file_;
     sqlite3_stmt* stmt_insert_meta_;
     sqlite3_stmt* stmt_insert_failed_;
+    sqlite3_stmt* stmt_delete_process_;
 
     void finalize_stmts();
     bool prepare_stmts();

@@ -3,7 +3,7 @@
 
 namespace bdtrace {
 
-static const int BATCH_SIZE = 1000;
+static const int BATCH_SIZE = 5000;
 
 TraceSession::TraceSession()
     : event_count_(0), in_transaction_(false)
@@ -60,6 +60,16 @@ void TraceSession::on_failed_access(const FailedAccessRecord& rec) {
         in_transaction_ = true;
     }
     db_.insert_failed_access(rec);
+    ++event_count_;
+    maybe_commit();
+}
+
+void TraceSession::delete_process(int pid) {
+    if (!in_transaction_) {
+        db_.begin_transaction();
+        in_transaction_ = true;
+    }
+    db_.delete_process(pid);
     ++event_count_;
     maybe_commit();
 }

@@ -20,6 +20,7 @@ public:
                          int64_t io_read_bytes = 0, int64_t io_write_bytes = 0);
     void on_file_access(const FileAccessRecord& rec);
     void on_failed_access(const FailedAccessRecord& rec);
+    void delete_process(int pid);
     void finalize();
 
     Database& db() { return db_; }

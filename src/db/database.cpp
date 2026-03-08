@@ -14,6 +14,7 @@ Database::Database()
     , stmt_insert_file_(0)
     , stmt_insert_meta_(0)
     , stmt_insert_failed_(0)
+    , stmt_delete_process_(0)
 {}
 
 Database::~Database() {
@@ -143,6 +144,8 @@ bool Database::prepare_stmts() {
         return false;
     if (!prepare("INSERT INTO failed_accesses (pid, filename, mode, errno_val, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_failed_))
         return false;
+    if (!prepare("DELETE FROM processes WHERE pid = ?", &stmt_delete_process_))
+        return false;
     return true;
 }
 
@@ -152,6 +155,7 @@ void Database::finalize_stmts() {
     if (stmt_insert_file_)    { sqlite3_finalize(stmt_insert_file_);    stmt_insert_file_ = 0; }
     if (stmt_insert_meta_)    { sqlite3_finalize(stmt_insert_meta_);    stmt_insert_meta_ = 0; }
     if (stmt_insert_failed_)  { sqlite3_finalize(stmt_insert_failed_);  stmt_insert_failed_ = 0; }
+    if (stmt_delete_process_) { sqlite3_finalize(stmt_delete_process_); stmt_delete_process_ = 0; }
 }
 
 bool Database::insert_meta(const std::string& key, const std::string& value) {
@@ -212,6 +216,17 @@ bool Database::insert_file_access(const FileAccessRecord& rec) {
     sqlite3_bind_int(stmt_insert_file_, 4, rec.fd);
     sqlite3_bind_int64(stmt_insert_file_, 5, rec.timestamp_us);
     int rc = sqlite3_step(stmt_insert_file_);
+    if (rc != SQLITE_DONE) {
+        last_error_ = sqlite3_errmsg(db_);
+        return false;
+    }
+    return true;
+}
+
+bool Database::delete_process(int pid) {
+    sqlite3_reset(stmt_delete_process_);
+    sqlite3_bind_int(stmt_delete_process_, 1, pid);
+    int rc = sqlite3_step(stmt_delete_process_);
     if (rc != SQLITE_DONE) {
         last_error_ = sqlite3_errmsg(db_);
         return false;

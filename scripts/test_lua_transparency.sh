@@ -64,7 +64,9 @@ echo ""
 echo "--- Build 1: baseline (no tracing) ---"
 cp -a "${LUA_DIR}" build-baseline
 cd build-baseline
+T1_START=$(date +%s%N)
 make -j1 linux 2>&1 | tail -3
+T1_END=$(date +%s%N)
 cd "${WORKDIR}"
 
 # Build 2: traced with bdtrace
@@ -72,7 +74,9 @@ echo ""
 echo "--- Build 2: traced (with bdtrace) ---"
 cp -a "${LUA_DIR}" build-traced
 cd build-traced
+T2_START=$(date +%s%N)
 "${BDTRACE}" -o "${WORKDIR}/trace.db" make -j1 linux 2>&1 | tail -3
+T2_END=$(date +%s%N)
 cd "${WORKDIR}"
 
 # Compare artifacts
@@ -132,11 +136,25 @@ else
     fi
 fi
 
+# Timing summary
+T1_MS=$(( (T1_END - T1_START) / 1000000 ))
+T2_MS=$(( (T2_END - T2_START) / 1000000 ))
+if [ "${T1_MS}" -gt 0 ]; then
+    OVERHEAD=$(( (T2_MS - T1_MS) * 100 / T1_MS ))
+else
+    OVERHEAD="N/A"
+fi
+
 # Summary
 echo ""
 echo "=== Results ==="
 echo "PASS: ${PASS}"
 echo "FAIL: ${FAIL}"
+echo ""
+echo "=== Timing ==="
+echo "Baseline:  ${T1_MS} ms"
+echo "Traced:    ${T2_MS} ms"
+echo "Overhead:  ${OVERHEAD}%"
 
 if [ "${FAIL}" -gt 0 ]; then
     echo ""

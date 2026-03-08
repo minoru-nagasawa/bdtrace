@@ -86,13 +86,14 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     setup_child(pid);
 
     ProcessState ps(pid, getpid());
+    ps.cached_cwd = read_proc_link(pid, "cwd");
     procs_[pid] = ps;
 
     ProcessRecord rec;
     rec.pid = pid;
     rec.ppid = getpid();
     rec.cmdline = read_cmdline(pid);
-    rec.cwd = read_proc_link(pid, "cwd");
+    rec.cwd = ps.cached_cwd;
     rec.start_time_us = now_us();
     session_.on_process_start(rec);
 
@@ -194,6 +195,31 @@ void PtraceBackend::stop() {
 static std::string normalize_path(const std::string& path) {
     if (path.empty()) return path;
 
+    // Fast path: if no "." or ".." components and no "//", skip normalization
+    bool needs_normalize = false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '.') {
+            // Check if it's a component boundary
+            bool at_start = (i == 0 || path[i - 1] == '/');
+            if (at_start) {
+                // "." or ".." component?
+                size_t next = i + 1;
+                if (next >= path.size() || path[next] == '/') {
+                    needs_normalize = true;
+                    break;
+                }
+                if (path[next] == '.' && (next + 1 >= path.size() || path[next + 1] == '/')) {
+                    needs_normalize = true;
+                    break;
+                }
+            }
+        } else if (path[i] == '/' && i + 1 < path.size() && path[i + 1] == '/') {
+            needs_normalize = true;
+            break;
+        }
+    }
+    if (!needs_normalize) return path;
+
     // Split into components
     std::vector<std::string> parts;
     bool absolute = (path[0] == '/');
@@ -229,13 +255,23 @@ static std::string normalize_path(const std::string& path) {
     return result;
 }
 
-std::string PtraceBackend::resolve_path(int pid, const std::string& path) {
+std::string PtraceBackend::resolve_path_cached(int pid, const std::string& path) {
     if (path.empty()) return path;
     std::string full;
     if (path[0] == '/') {
         full = path;
     } else {
-        std::string cwd = read_proc_link(pid, "cwd");
+        // Use cached cwd instead of reading /proc every time
+        std::map<int, ProcessState>::iterator it = procs_.find(pid);
+        std::string cwd;
+        if (it != procs_.end() && !it->second.cached_cwd.empty()) {
+            cwd = it->second.cached_cwd;
+        } else {
+            cwd = read_proc_link(pid, "cwd");
+            if (it != procs_.end()) {
+                it->second.cached_cwd = cwd;
+            }
+        }
         if (cwd.empty()) return path;
         full = cwd + "/" + path;
     }
@@ -245,7 +281,7 @@ std::string PtraceBackend::resolve_path(int pid, const std::string& path) {
 void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mode, int fd) {
     std::string path = read_string(pid, addr);
     if (!path.empty() && !should_filter_path(path)) {
-        path = resolve_path(pid, path);
+        path = resolve_path_cached(pid, path);
         if (should_filter_path(path)) return;
         FileAccessRecord fa;
         fa.pid = pid;
@@ -262,7 +298,7 @@ void PtraceBackend::record_access(int pid, unsigned long addr, FileAccessMode mo
 void PtraceBackend::record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val) {
     std::string path = read_string(pid, addr);
     if (!path.empty() && !should_filter_path(path)) {
-        path = resolve_path(pid, path);
+        path = resolve_path_cached(pid, path);
         if (should_filter_path(path)) return;
         FailedAccessRecord fa;
         fa.pid = pid;
@@ -491,12 +527,16 @@ void PtraceBackend::handle_syscall_stop(int pid) {
         else if (sc == SYS_CHDIR_NR) {
             if (rax >= 0 && ps.pending_path_addr) {
                 record_access(pid, ps.pending_path_addr, FA_CHDIR);
+                // Update cached cwd
+                ps.cached_cwd = read_proc_link(pid, "cwd");
             }
         }
         // --- fchdir(fd) - read cwd from /proc ---
         else if (sc == SYS_FCHDIR_NR) {
             if (rax >= 0) {
                 std::string cwd = read_proc_link(pid, "cwd");
+                // Update cached cwd
+                ps.cached_cwd = cwd;
                 if (!cwd.empty() && !should_filter_path(cwd)) {
                     FileAccessRecord fa;
                     fa.pid = pid;
@@ -524,6 +564,13 @@ void PtraceBackend::handle_fork_event(int pid) {
     LOG_DEBUG("Fork: %d -> %d", pid, (int)child_pid);
 
     ProcessState ps((int)child_pid, pid);
+    // Inherit parent's cached cwd (fork preserves cwd)
+    std::map<int, ProcessState>::iterator parent_it = procs_.find(pid);
+    if (parent_it != procs_.end() && !parent_it->second.cached_cwd.empty()) {
+        ps.cached_cwd = parent_it->second.cached_cwd;
+    } else {
+        ps.cached_cwd = read_proc_link((int)child_pid, "cwd");
+    }
     procs_[(int)child_pid] = ps;
 
     ProcessRecord rec;
@@ -531,7 +578,7 @@ void PtraceBackend::handle_fork_event(int pid) {
     rec.ppid = pid;
     rec.start_time_us = now_us();
     rec.cmdline = read_cmdline((int)child_pid);
-    rec.cwd = read_proc_link((int)child_pid, "cwd");
+    rec.cwd = ps.cached_cwd;
     session_.on_process_start(rec);
 }
 
@@ -556,20 +603,22 @@ void PtraceBackend::handle_exec_event(int pid) {
         it->second.pending_syscall = -1;
         it->second.pending_path_addr = 0;
         it->second.pending_path_addr2 = 0;
+        // Refresh cached cwd (exec may change via interpreter path)
+        it->second.cached_cwd = read_proc_link(pid, "cwd");
     }
 
     ProcessRecord rec;
     rec.pid = pid;
     if (it != procs_.end()) {
         rec.ppid = it->second.ppid;
+        rec.cwd = it->second.cached_cwd;
+    } else {
+        rec.cwd = read_proc_link(pid, "cwd");
     }
     rec.cmdline = cmdline;
-    rec.cwd = read_proc_link(pid, "cwd");
     rec.start_time_us = now_us();
 
-    char sql_buf[128];
-    std::snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM processes WHERE pid = %d", pid);
-    session_.db().exec_raw(sql_buf);
+    session_.delete_process(pid);
     session_.on_process_start(rec);
 }
 
@@ -596,9 +645,9 @@ void PtraceBackend::handle_exit_event(int pid, int status) {
 }
 
 std::string PtraceBackend::read_string(int pid, unsigned long addr, size_t max_len) {
-    std::string result;
-    if (addr == 0) return result;
+    if (addr == 0) return std::string();
 
+    std::string result;
     for (size_t i = 0; i < max_len; i += sizeof(long)) {
         errno = 0;
         long word = PT(PTRACE_PEEKDATA, pid, addr + i, 0);

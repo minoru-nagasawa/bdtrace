@@ -34,7 +34,7 @@ private:
     std::string read_string(int pid, unsigned long addr, size_t max_len = 4096);
     std::string read_cmdline(int pid);
     std::string read_proc_link(int pid, const char* entry);
-    std::string resolve_path(int pid, const std::string& path);
+    std::string resolve_path_cached(int pid, const std::string& path);
     bool should_filter_path(const std::string& path);
     void record_access(int pid, unsigned long addr, FileAccessMode mode, int fd = -1);
     void record_failed_access(int pid, unsigned long addr, FileAccessMode mode, int errno_val);
