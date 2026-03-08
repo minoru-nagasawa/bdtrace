@@ -1022,6 +1022,183 @@ static void serve_static(struct mg_connection *c, struct mg_http_message *hm) {
 #endif
 }
 
+// --- New analysis handlers ---
+
+static void handle_process_io(struct mg_connection *c, int pid,
+                               const std::string& query) {
+    bool tree = get_query_param(query, "tree") == "1";
+    DependencyGraph g;
+    build_dependency_graph(*g_db, g);
+    ProcessIO pio;
+    classify_process_io(*g_db, g, pid, tree, pio);
+
+    JsonWriter w;
+    w.beginObject();
+    w.key("inputs").beginArray();
+    for (std::set<std::string>::const_iterator it = pio.inputs.begin();
+         it != pio.inputs.end(); ++it) w.val(*it);
+    w.endArray();
+    w.key("outputs").beginArray();
+    for (std::set<std::string>::const_iterator it = pio.outputs.begin();
+         it != pio.outputs.end(); ++it) w.val(*it);
+    w.endArray();
+    w.key("internal").beginArray();
+    for (std::set<std::string>::const_iterator it = pio.internal.begin();
+         it != pio.internal.end(); ++it) w.val(*it);
+    w.endArray();
+    w.endObject();
+    send_json(c, w.str());
+}
+
+static void handle_impact(struct mg_connection *c, const std::string& query) {
+    int top_n = 20;
+    std::string top_s = get_query_param(query, "top");
+    if (!top_s.empty()) top_n = std::atoi(top_s.c_str());
+
+    DependencyGraph g;
+    build_dependency_graph(*g_db, g);
+    std::vector<ImpactEntry> entries;
+    compute_impact(g, entries, top_n);
+
+    JsonWriter w;
+    w.beginArray();
+    for (size_t i = 0; i < entries.size(); ++i) {
+        w.beginObject();
+        w.key("file").val(entries[i].file);
+        w.key("affected_procs").val(entries[i].affected_count);
+        w.key("affected_duration_us").val(entries[i].affected_duration_us);
+        w.endObject();
+    }
+    w.endArray();
+    send_json(c, w.str());
+}
+
+static void handle_races(struct mg_connection *c) {
+    DependencyGraph g;
+    build_dependency_graph(*g_db, g);
+    std::vector<RaceEntry> races;
+    detect_races(g, races);
+
+    JsonWriter w;
+    w.beginObject();
+    w.key("count").val((int)races.size());
+    w.key("races").beginArray();
+    for (size_t i = 0; i < races.size(); ++i) {
+        w.beginObject();
+        w.key("file").val(races[i].file);
+        w.key("writer_pid").val(races[i].writer_pid);
+        w.key("reader_pid").val(races[i].reader_pid);
+        w.key("overlap_us").val(races[i].overlap_us);
+        std::map<int, ProcessRecord>::const_iterator wp =
+            g.proc_map.find(races[i].writer_pid);
+        std::map<int, ProcessRecord>::const_iterator rp =
+            g.proc_map.find(races[i].reader_pid);
+        w.key("writer_cmd").val(wp != g.proc_map.end() ? wp->second.cmdline : "");
+        w.key("reader_cmd").val(rp != g.proc_map.end() ? rp->second.cmdline : "");
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+    send_json(c, w.str());
+}
+
+static void handle_rebuild_api(struct mg_connection *c, const std::string& query) {
+    std::string changed_str = get_query_param(query, "changed");
+    if (changed_str.empty()) {
+        mg_http_reply(c, 400, "", "changed parameter required");
+        return;
+    }
+
+    DependencyGraph g;
+    build_dependency_graph(*g_db, g);
+
+    // Parse comma-separated changed files
+    std::set<std::string> changed_files;
+    size_t start = 0;
+    while (start < changed_str.size()) {
+        size_t comma = changed_str.find(',', start);
+        if (comma == std::string::npos) comma = changed_str.size();
+        std::string f = changed_str.substr(start, comma - start);
+        if (!f.empty()) {
+            if (g.file_to_readers.find(f) != g.file_to_readers.end()) {
+                changed_files.insert(f);
+            }
+            std::string prefix = f;
+            if (!prefix.empty() && prefix[prefix.size() - 1] != '/') prefix += '/';
+            std::map<std::string, std::set<int> >::const_iterator it =
+                g.file_to_readers.lower_bound(prefix);
+            while (it != g.file_to_readers.end()) {
+                if (it->first.compare(0, prefix.size(), prefix) != 0) break;
+                changed_files.insert(it->first);
+                ++it;
+            }
+        }
+        start = comma + 1;
+    }
+
+    std::set<int> affected = rebuild_bfs(g, changed_files);
+    RebuildEstimate est;
+    compute_rebuild_estimate(g, affected, est);
+
+    JsonWriter w;
+    w.beginObject();
+    w.key("affected_count").val(est.affected_count);
+    w.key("serial_estimate_us").val(est.serial_estimate_us);
+    w.key("longest_single_us").val(est.longest_single_us);
+    w.key("affected").beginArray();
+    for (std::set<int>::const_iterator it = affected.begin();
+         it != affected.end(); ++it) {
+        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
+        if (pit == g.proc_map.end()) continue;
+        w.beginObject();
+        w.key("pid").val(pit->second.pid);
+        w.key("cmdline").val(pit->second.cmdline);
+        w.key("duration_us").val(pit->second.end_time_us - pit->second.start_time_us);
+        w.endObject();
+    }
+    w.endArray();
+    w.endObject();
+    send_json(c, w.str());
+}
+
+static void write_rdeps_json(JsonWriter& w, const DependencyGraph& g,
+                              const RdepsNode& node) {
+    w.beginObject();
+    w.key("file").val(node.file);
+    w.key("via_pid").val(node.via_pid);
+    if (node.via_pid != 0) {
+        std::map<int, ProcessRecord>::const_iterator pit =
+            g.proc_map.find(node.via_pid);
+        w.key("via_cmd").val(pit != g.proc_map.end() ? pit->second.cmdline : "");
+    }
+    w.key("children").beginArray();
+    for (size_t i = 0; i < node.children.size(); ++i) {
+        write_rdeps_json(w, g, node.children[i]);
+    }
+    w.endArray();
+    w.endObject();
+}
+
+static void handle_rdeps(struct mg_connection *c, const std::string& query) {
+    std::string file = get_query_param(query, "file");
+    if (file.empty()) {
+        mg_http_reply(c, 400, "", "file parameter required");
+        return;
+    }
+    int depth = 3;
+    std::string depth_s = get_query_param(query, "depth");
+    if (!depth_s.empty()) depth = std::atoi(depth_s.c_str());
+
+    DependencyGraph g;
+    build_dependency_graph(*g_db, g);
+    RdepsNode root;
+    compute_rdeps(g, file, depth, root);
+
+    JsonWriter w;
+    write_rdeps_json(w, g, root);
+    send_json(c, w.str());
+}
+
 // --- Main event handler ---
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev != MG_EV_HTTP_MSG) return;
@@ -1064,6 +1241,18 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         handle_failures(c, query);
     } else if (uri == "/api/diagnostics") {
         handle_diagnostics(c);
+    } else if (starts_with(uri, "/api/processes/") && uri.find("/io") != std::string::npos) {
+        int pid = extract_pid_from_uri(uri, "/api/processes/", "/io");
+        if (pid > 0) handle_process_io(c, pid, query);
+        else mg_http_reply(c, 400, "", "Bad PID");
+    } else if (uri == "/api/impact") {
+        handle_impact(c, query);
+    } else if (uri == "/api/races") {
+        handle_races(c);
+    } else if (uri == "/api/rebuild") {
+        handle_rebuild_api(c, query);
+    } else if (uri == "/api/rdeps") {
+        handle_rdeps(c, query);
     } else {
         serve_static(c, hm);
     }

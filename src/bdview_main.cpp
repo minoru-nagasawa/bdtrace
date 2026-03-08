@@ -24,7 +24,7 @@ static void usage() {
         "  slowest <db> [-n N]            Top N slowest processes (default 10)\n"
         "  files <db> [-p PID | -f PATH]  File access info\n"
         "  trace <db> [-p PID | -f PATH] [-w N]  Files with process ancestry\n"
-        "  rebuild <db> --changed F [--changed F2 ...] [--collapse CMD ...]  Minimal rebuild set\n"
+        "  rebuild <db> --changed F [--changed F2 ...] [--collapse CMD ...] [--estimate]  Minimal rebuild set\n"
         "  timeline <db> [--min-duration MS]  Gantt chart of process execution\n"
         "  critical <db>                  Critical path analysis\n"
         "  hotspot <db> [--top N] [--dir] File/directory hotspots\n"
@@ -32,6 +32,10 @@ static void usage() {
         "  parallel <db>                  Parallelism analysis\n"
         "  diff <db1> <db2>               Compare two trace databases\n"
         "  diagnose <db>                  Auto-detect build problems\n"
+        "  pio <db> -p PID [--tree]       Process I/O summary (inputs/outputs)\n"
+        "  impact <db> [--top N]          Impact ranking of source files\n"
+        "  races <db>                     Detect parallel build race conditions\n"
+        "  rdeps <db> -f PATH [--depth N] Reverse file dependencies\n"
     );
 }
 
@@ -394,33 +398,15 @@ static int cmd_trace(Database& db, int filter_pid, const std::string& filter_pat
 
 // --- rebuild ---
 static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_args,
-                       const std::set<std::string>& collapse_names) {
-    std::vector<FileAccessRecord> all_accesses;
-    std::vector<ProcessRecord> all_procs;
-    db.get_all_file_accesses(all_accesses);
-    db.get_all_processes(all_procs);
-
-    std::map<std::string, std::set<int> > file_to_readers;
-    std::map<int, std::set<std::string> > pid_to_outputs;
-    std::map<int, ProcessRecord> proc_map;
-
-    for (size_t i = 0; i < all_accesses.size(); ++i) {
-        const FileAccessRecord& fa = all_accesses[i];
-        if (is_input_mode(fa.mode)) {
-            file_to_readers[fa.filename].insert(fa.pid);
-        }
-        if (is_output_mode(fa.mode)) {
-            pid_to_outputs[fa.pid].insert(fa.filename);
-        }
-    }
-    for (size_t i = 0; i < all_procs.size(); ++i) {
-        proc_map[all_procs[i].pid] = all_procs[i];
-    }
+                       const std::set<std::string>& collapse_names,
+                       bool estimate) {
+    DependencyGraph g;
+    build_dependency_graph(db, g);
 
     std::set<std::string> changed_files;
     for (size_t a = 0; a < changed_args.size(); ++a) {
         const std::string& arg = changed_args[a];
-        if (file_to_readers.find(arg) != file_to_readers.end()) {
+        if (g.file_to_readers.find(arg) != g.file_to_readers.end()) {
             changed_files.insert(arg);
         }
         std::string prefix = arg;
@@ -428,62 +414,22 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
             prefix += '/';
         }
         std::map<std::string, std::set<int> >::const_iterator it =
-            file_to_readers.lower_bound(prefix);
-        while (it != file_to_readers.end()) {
+            g.file_to_readers.lower_bound(prefix);
+        while (it != g.file_to_readers.end()) {
             if (it->first.compare(0, prefix.size(), prefix) != 0) break;
             changed_files.insert(it->first);
             ++it;
         }
     }
 
-    std::set<int> affected;
-    std::queue<int> worklist;
-    for (std::set<std::string>::const_iterator fi = changed_files.begin();
-         fi != changed_files.end(); ++fi) {
-        const std::set<int>& readers = file_to_readers[*fi];
-        for (std::set<int>::const_iterator ri = readers.begin();
-             ri != readers.end(); ++ri) {
-            if (affected.find(*ri) == affected.end()) {
-                affected.insert(*ri);
-                worklist.push(*ri);
-            }
-        }
-    }
-    while (!worklist.empty()) {
-        int pid = worklist.front();
-        worklist.pop();
-        std::map<int, std::set<std::string> >::const_iterator oit =
-            pid_to_outputs.find(pid);
-        if (oit == pid_to_outputs.end()) continue;
-        const std::set<std::string>& outputs = oit->second;
-        for (std::set<std::string>::const_iterator fi = outputs.begin();
-             fi != outputs.end(); ++fi) {
-            std::map<std::string, std::set<int> >::const_iterator rit =
-                file_to_readers.find(*fi);
-            if (rit == file_to_readers.end()) continue;
-            const std::set<int>& readers = rit->second;
-            for (std::set<int>::const_iterator ri = readers.begin();
-                 ri != readers.end(); ++ri) {
-                if (affected.find(*ri) == affected.end()) {
-                    affected.insert(*ri);
-                    worklist.push(*ri);
-                }
-            }
-        }
-    }
-
-    std::map<int, std::vector<int> > pid_children;
-    for (std::map<int, ProcessRecord>::const_iterator it = proc_map.begin();
-         it != proc_map.end(); ++it) {
-        pid_children[it->second.ppid].push_back(it->first);
-    }
+    std::set<int> affected = rebuild_bfs(g, changed_files);
 
     std::set<int> collapsed_pids;
     std::set<int> hidden_pids;
     for (std::set<int>::const_iterator it = affected.begin();
          it != affected.end(); ++it) {
-        std::map<int, ProcessRecord>::const_iterator pit = proc_map.find(*it);
-        if (pit == proc_map.end()) continue;
+        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
+        if (pit == g.proc_map.end()) continue;
         if (collapse_names.find(cmd_name(pit->second.cmdline)) != collapse_names.end()) {
             collapsed_pids.insert(*it);
         }
@@ -495,8 +441,8 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
         while (!dq.empty()) {
             int p = dq.front();
             dq.pop();
-            std::map<int, std::vector<int> >::const_iterator ch = pid_children.find(p);
-            if (ch == pid_children.end()) continue;
+            std::map<int, std::vector<int> >::const_iterator ch = g.pid_children.find(p);
+            if (ch == g.pid_children.end()) continue;
             for (size_t i = 0; i < ch->second.size(); ++i) {
                 int child = ch->second[i];
                 if (affected.find(child) != affected.end()) {
@@ -510,12 +456,12 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
     std::set<int> has_output_child;
     for (std::set<int>::const_iterator it = affected.begin();
          it != affected.end(); ++it) {
-        if (pid_to_outputs.find(*it) == pid_to_outputs.end()) continue;
-        std::map<int, ProcessRecord>::const_iterator pit = proc_map.find(*it);
-        if (pit == proc_map.end()) continue;
+        if (g.pid_to_outputs.find(*it) == g.pid_to_outputs.end()) continue;
+        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
+        if (pit == g.proc_map.end()) continue;
         int ppid = pit->second.ppid;
         if (affected.find(ppid) != affected.end()
-            && pid_to_outputs.find(ppid) != pid_to_outputs.end()) {
+            && g.pid_to_outputs.find(ppid) != g.pid_to_outputs.end()) {
             has_output_child.insert(ppid);
         }
     }
@@ -525,12 +471,12 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
          it != affected.end(); ++it) {
         if (hidden_pids.find(*it) != hidden_pids.end()) continue;
         if (collapsed_pids.find(*it) != collapsed_pids.end()) {
-            result.push_back(proc_map.find(*it)->second);
+            result.push_back(g.proc_map.find(*it)->second);
             continue;
         }
-        if (pid_to_outputs.find(*it) != pid_to_outputs.end()
+        if (g.pid_to_outputs.find(*it) != g.pid_to_outputs.end()
             && has_output_child.find(*it) == has_output_child.end()) {
-            result.push_back(proc_map.find(*it)->second);
+            result.push_back(g.proc_map.find(*it)->second);
         }
     }
     std::sort(result.begin(), result.end(), cmp_start_time);
@@ -546,6 +492,144 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
         std::printf("  [%d] %s\n", result[i].pid, result[i].cmdline.c_str());
     }
 
+    if (estimate) {
+        RebuildEstimate est;
+        compute_rebuild_estimate(g, affected, est);
+        std::printf("\n--- Rebuild Estimate ---\n");
+        std::printf("  Affected processes: %d\n", est.affected_count);
+        std::printf("  Serial estimate:    %.1fs (sum of all durations)\n",
+                    est.serial_estimate_us / 1000000.0);
+        std::printf("  Longest single:     %.1fs (minimum possible time)\n",
+                    est.longest_single_us / 1000000.0);
+    }
+
+    return 0;
+}
+
+// --- pio ---
+static int cmd_pio(Database& db, int pid, bool tree) {
+    DependencyGraph g;
+    build_dependency_graph(db, g);
+
+    if (g.proc_map.find(pid) == g.proc_map.end()) {
+        std::fprintf(stderr, "bdview pio: PID %d not found\n", pid);
+        return 1;
+    }
+
+    ProcessIO pio;
+    classify_process_io(db, g, pid, tree, pio);
+
+    std::printf("=== Process I/O for PID %d%s ===\n", pid,
+                tree ? " (with descendants)" : "");
+
+    std::printf("\nInputs (%d):\n", (int)pio.inputs.size());
+    for (std::set<std::string>::const_iterator it = pio.inputs.begin();
+         it != pio.inputs.end(); ++it) {
+        std::printf("  R  %s\n", it->c_str());
+    }
+    std::printf("\nOutputs (%d):\n", (int)pio.outputs.size());
+    for (std::set<std::string>::const_iterator it = pio.outputs.begin();
+         it != pio.outputs.end(); ++it) {
+        std::printf("  W  %s\n", it->c_str());
+    }
+    if (!pio.internal.empty()) {
+        std::printf("\nInternal (%d):\n", (int)pio.internal.size());
+        for (std::set<std::string>::const_iterator it = pio.internal.begin();
+             it != pio.internal.end(); ++it) {
+            std::printf("  RW %s\n", it->c_str());
+        }
+    }
+    return 0;
+}
+
+// --- impact ---
+static int cmd_impact(Database& db, int top_n) {
+    DependencyGraph g;
+    build_dependency_graph(db, g);
+
+    std::vector<ImpactEntry> entries;
+    compute_impact(g, entries, top_n);
+
+    std::printf("=== Impact Ranking (top %d) ===\n", top_n);
+    std::printf("  %5s  %10s  %s\n", "PROCS", "DURATION", "FILE");
+    for (size_t i = 0; i < entries.size(); ++i) {
+        std::printf("  %5d  %9.1fs  %s\n",
+                    entries[i].affected_count,
+                    entries[i].affected_duration_us / 1000000.0,
+                    entries[i].file.c_str());
+    }
+    return 0;
+}
+
+// --- races ---
+static int cmd_races(Database& db) {
+    DependencyGraph g;
+    build_dependency_graph(db, g);
+
+    std::vector<RaceEntry> races;
+    detect_races(g, races);
+
+    if (races.empty()) {
+        std::printf("=== No Race Conditions Detected ===\n");
+        return 0;
+    }
+
+    std::printf("=== Race Conditions Detected: %d ===\n", (int)races.size());
+    for (size_t i = 0; i < races.size(); ++i) {
+        std::printf("\n  FILE: %s\n", races[i].file.c_str());
+        std::map<int, ProcessRecord>::const_iterator wp =
+            g.proc_map.find(races[i].writer_pid);
+        std::map<int, ProcessRecord>::const_iterator rp =
+            g.proc_map.find(races[i].reader_pid);
+        if (wp != g.proc_map.end()) {
+            std::printf("    Writer: [%d] %s\n",
+                        races[i].writer_pid, wp->second.cmdline.c_str());
+        }
+        if (rp != g.proc_map.end()) {
+            std::printf("    Reader: [%d] %s\n",
+                        races[i].reader_pid, rp->second.cmdline.c_str());
+        }
+        std::printf("    Overlap: %.3fs\n", races[i].overlap_us / 1000000.0);
+    }
+    return 0;
+}
+
+// --- rdeps ---
+static void print_rdeps_tree(const DependencyGraph& g,
+                             const RdepsNode& node, int indent) {
+    for (int i = 0; i < indent; ++i) std::printf("  ");
+    if (indent > 0) std::printf("-> ");
+    std::printf("%s", node.file.c_str());
+    if (node.via_pid != 0) {
+        std::map<int, ProcessRecord>::const_iterator pit =
+            g.proc_map.find(node.via_pid);
+        if (pit != g.proc_map.end()) {
+            std::printf("  (via [%d] %s)", node.via_pid,
+                        cmd_name(pit->second.cmdline).c_str());
+        }
+    }
+    std::printf("\n");
+    for (size_t i = 0; i < node.children.size(); ++i) {
+        print_rdeps_tree(g, node.children[i], indent + 1);
+    }
+}
+
+static int cmd_rdeps(Database& db, const std::string& path, int depth) {
+    DependencyGraph g;
+    build_dependency_graph(db, g);
+
+    if (g.file_to_readers.find(path) == g.file_to_readers.end()) {
+        std::fprintf(stderr, "bdview rdeps: file '%s' not found in trace\n",
+                     path.c_str());
+        return 1;
+    }
+
+    RdepsNode root;
+    compute_rdeps(g, path, depth, root);
+
+    std::printf("=== Reverse Dependencies for %s (depth %d) ===\n",
+                path.c_str(), depth);
+    print_rdeps_tree(g, root, 0);
     return 0;
 }
 
@@ -1309,18 +1393,21 @@ int main(int argc, char* argv[]) {
     } else if (command == "rebuild") {
         std::vector<std::string> changed;
         std::set<std::string> collapse;
+        bool estimate = false;
         for (int i = 3; i < argc; ++i) {
             if (std::strcmp(argv[i], "--changed") == 0 && i + 1 < argc) {
                 changed.push_back(argv[++i]);
             } else if (std::strcmp(argv[i], "--collapse") == 0 && i + 1 < argc) {
                 collapse.insert(argv[++i]);
+            } else if (std::strcmp(argv[i], "--estimate") == 0) {
+                estimate = true;
             }
         }
         if (changed.empty()) {
             std::fprintf(stderr, "bdview rebuild: --changed FILE required\n");
             return 1;
         }
-        return cmd_rebuild(db, changed, collapse);
+        return cmd_rebuild(db, changed, collapse, estimate);
     } else if (command == "timeline") {
         int min_dur = 0;
         for (int i = 3; i < argc; ++i) {
@@ -1354,6 +1441,46 @@ int main(int argc, char* argv[]) {
         return cmd_parallel(db);
     } else if (command == "diagnose") {
         return cmd_diagnose(db);
+    } else if (command == "pio") {
+        int pid = 0;
+        bool tree = false;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+                pid = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--tree") == 0) {
+                tree = true;
+            }
+        }
+        if (pid == 0) {
+            std::fprintf(stderr, "bdview pio: -p PID required\n");
+            return 1;
+        }
+        return cmd_pio(db, pid, tree);
+    } else if (command == "impact") {
+        int top_n = 20;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--top") == 0 && i + 1 < argc) {
+                top_n = std::atoi(argv[++i]);
+            }
+        }
+        return cmd_impact(db, top_n);
+    } else if (command == "races") {
+        return cmd_races(db);
+    } else if (command == "rdeps") {
+        std::string path;
+        int depth = 3;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+                path = argv[++i];
+            } else if (std::strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
+                depth = std::atoi(argv[++i]);
+            }
+        }
+        if (path.empty()) {
+            std::fprintf(stderr, "bdview rdeps: -f PATH required\n");
+            return 1;
+        }
+        return cmd_rdeps(db, path, depth);
     } else {
         std::fprintf(stderr, "bdview: unknown command: %s\n", command.c_str());
         usage();

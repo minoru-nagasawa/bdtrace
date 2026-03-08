@@ -1189,7 +1189,7 @@ var App = (function() {
     var app = document.getElementById('app');
     app.innerHTML = '';
 
-    var tabs = ['Critical Path', 'Hotspots', 'Failures', 'Diagnostics'];
+    var tabs = ['Critical Path', 'Hotspots', 'Failures', 'Diagnostics', 'Impact', 'Races', 'Rebuild', 'Rdeps'];
     var activeTab = 0;
 
     var tabRow = el('div', {className: 'analysis-tabs'});
@@ -1293,6 +1293,105 @@ var App = (function() {
           content.appendChild(card);
         }
       });
+    } else if (idx === 4) {
+      api('/api/impact?top=30', function(data) {
+        content.innerHTML = '';
+        content.appendChild(el('div', {className: 'section-title'}, 'Impact Ranking'));
+        if (!data || data.length === 0) {
+          content.appendChild(el('div', null, 'No impact data'));
+          return;
+        }
+        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, 'Source files ranked by rebuild impact (affected processes \u00d7 duration)'));
+        var tbl = makeTable(['Procs', 'Duration', 'File'], data.map(function(e) {
+          return [e.affected_procs, formatDuration(e.affected_duration_us), e.file];
+        }));
+        content.appendChild(tbl);
+      });
+    } else if (idx === 5) {
+      api('/api/races', function(data) {
+        content.innerHTML = '';
+        content.appendChild(el('div', {className: 'section-title'}, 'Race Condition Detection'));
+        if (!data.races || data.races.length === 0) {
+          content.appendChild(el('div', {style: 'color:var(--green)'}, 'No race conditions detected.'));
+          return;
+        }
+        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, data.count + ' potential race(s) found'));
+        var tbl = makeTable(['File', 'Writer', 'Reader', 'Overlap'], data.races.map(function(r) {
+          return [r.file, '[' + r.writer_pid + '] ' + shortenCmd(r.writer_cmd, 40), '[' + r.reader_pid + '] ' + shortenCmd(r.reader_cmd, 40), formatDuration(r.overlap_us)];
+        }));
+        content.appendChild(tbl);
+      });
+    } else if (idx === 6) {
+      content.innerHTML = '';
+      content.appendChild(el('div', {className: 'section-title'}, 'Rebuild Estimator'));
+      var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
+      var input = el('input', {type: 'text', placeholder: 'Enter changed file path(s), comma-separated', style: 'flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var btn = el('button', {style: 'padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer'}, 'Calculate');
+      row.appendChild(input);
+      row.appendChild(btn);
+      content.appendChild(row);
+      var resultDiv = el('div');
+      content.appendChild(resultDiv);
+      btn.onclick = function() {
+        var val = input.value.trim();
+        if (!val) return;
+        resultDiv.innerHTML = '<div class="loading">Calculating...</div>';
+        api('/api/rebuild?changed=' + encodeURIComponent(val) + '&estimate=1', function(data) {
+          resultDiv.innerHTML = '';
+          if (!data || data.affected_count === 0) {
+            resultDiv.appendChild(el('div', null, 'No affected processes for given files.'));
+            return;
+          }
+          resultDiv.appendChild(el('div', {style: 'margin-bottom:8px'}, 'Affected processes: ' + data.affected_count));
+          resultDiv.appendChild(el('div', {style: 'margin-bottom:8px'}, 'Serial estimate: ' + formatDuration(data.serial_estimate_us)));
+          resultDiv.appendChild(el('div', {style: 'margin-bottom:12px'}, 'Longest single: ' + formatDuration(data.longest_single_us)));
+          if (data.affected && data.affected.length > 0) {
+            var tbl = makeTable(['PID', 'Duration', 'Command'], data.affected.map(function(p) {
+              return [p.pid, formatDuration(p.duration_us), shortenCmd(p.cmdline, 60)];
+            }));
+            resultDiv.appendChild(tbl);
+          }
+        });
+      };
+    } else if (idx === 7) {
+      content.innerHTML = '';
+      content.appendChild(el('div', {className: 'section-title'}, 'Reverse Dependencies'));
+      var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
+      var input = el('input', {type: 'text', placeholder: 'Enter file path', style: 'flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var depthInput = el('input', {type: 'number', value: '3', min: '1', max: '10', style: 'width:60px;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var btn = el('button', {style: 'padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer'}, 'Search');
+      row.appendChild(input);
+      row.appendChild(el('span', {style: 'color:var(--fg2)'}, 'Depth:'));
+      row.appendChild(depthInput);
+      row.appendChild(btn);
+      content.appendChild(row);
+      var resultDiv = el('div');
+      content.appendChild(resultDiv);
+      btn.onclick = function() {
+        var val = input.value.trim();
+        if (!val) return;
+        var depth = parseInt(depthInput.value) || 3;
+        resultDiv.innerHTML = '<div class="loading">Searching...</div>';
+        api('/api/rdeps?file=' + encodeURIComponent(val) + '&depth=' + depth, function(data) {
+          resultDiv.innerHTML = '';
+          if (!data || !data.file) {
+            resultDiv.appendChild(el('div', null, 'File not found in trace.'));
+            return;
+          }
+          function renderNode(node, indent) {
+            var d = el('div', {style: 'padding:2px 0;padding-left:' + (indent * 20) + 'px'});
+            var arrow = indent > 0 ? '\u2192 ' : '';
+            var via = node.via_pid ? ' (via [' + node.via_pid + '] ' + shortenCmd(node.via_cmd || '', 30) + ')' : '';
+            d.appendChild(el('span', {style: 'color:var(--accent)'}, arrow + node.file));
+            if (via) d.appendChild(el('span', {style: 'color:var(--fg2)'}, via));
+            resultDiv.appendChild(d);
+            if (node.children) {
+              for (var i = 0; i < node.children.length; i++) renderNode(node.children[i], indent + 1);
+            }
+          }
+          renderNode(data, 0);
+        });
+      };
     }
   }
 
