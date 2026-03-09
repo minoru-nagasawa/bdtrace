@@ -47,9 +47,9 @@ bdview-web: src/web/bdview_web.o $(COMMON_OBJS) $(HELPER_OBJS) $(DB_OBJS) $(SQLI
 vendor/sqlite3.o: vendor/sqlite3.c
 	$(CC) $(CFLAGS) -DSQLITE_THREADSAFE=0 -c -o $@ $<
 
-# Mongoose compiled as C
+# Mongoose compiled as C (suppress warnings in third-party code)
 vendor/mongoose.o: vendor/mongoose.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -w -c -o $@ $<
 
 # Static asset embedding
 src/web/static_assets.h: static/index.html static/app.js static/app.css static/timeline.js
