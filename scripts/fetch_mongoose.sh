@@ -2,7 +2,7 @@
 # Fetch Mongoose embedded HTTP server
 set -e
 
-MONGOOSE_VERSION="7.14"
+MONGOOSE_VERSION="6.18"
 URL="https://raw.githubusercontent.com/cesanta/mongoose/${MONGOOSE_VERSION}/mongoose.c"
 URL_H="https://raw.githubusercontent.com/cesanta/mongoose/${MONGOOSE_VERSION}/mongoose.h"
 

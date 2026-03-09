@@ -49,7 +49,7 @@ vendor/sqlite3.o: vendor/sqlite3.c
 
 # Mongoose compiled as C
 vendor/mongoose.o: vendor/mongoose.c
-	$(CC) $(CFLAGS) -DMG_ENABLE_LINES=0 -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Static asset embedding
 src/web/static_assets.h: static/index.html static/app.js static/app.css static/timeline.js

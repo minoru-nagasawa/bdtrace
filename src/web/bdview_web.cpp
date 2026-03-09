@@ -74,11 +74,21 @@ static bool cmp_duration_desc(const ProcessRecord& a, const ProcessRecord& b) {
     return (a.end_time_us - a.start_time_us) > (b.end_time_us - b.start_time_us);
 }
 
+static void send_response(struct mg_connection *c, int status,
+                          const char* extra_headers,
+                          const char* body, size_t body_len) {
+    mg_send_head(c, status, (int64_t)body_len, extra_headers);
+    mg_send(c, body, (int)body_len);
+}
+
 static void send_json(struct mg_connection *c, const std::string& json) {
-    mg_http_reply(c, 200,
-        "Content-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n",
-        "%s", json.c_str());
+    send_response(c, 200,
+        "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *",
+        json.c_str(), json.size());
+}
+
+static void send_error(struct mg_connection *c, int status, const char* msg) {
+    send_response(c, status, "", msg, std::strlen(msg));
 }
 
 static bool starts_with(const std::string& s, const char* prefix) {
@@ -1040,23 +1050,22 @@ static void handle_diagnostics(struct mg_connection *c) {
 #ifndef BDVIEW_WEB_DEV_MODE
 static void serve_embedded(struct mg_connection *c, const char* data, unsigned int len, const char* ct) {
     char headers[256];
-    std::snprintf(headers, sizeof(headers), "Content-Type: %s\r\n", ct);
-    mg_http_reply(c, 200, headers, "%.*s", (int)len, data);
+    std::snprintf(headers, sizeof(headers), "Content-Type: %s", ct);
+    send_response(c, 200, headers, data, len);
 }
 #endif
 
-static void serve_static(struct mg_connection *c, struct mg_http_message *hm) {
-    std::string uri(hm->uri.buf, hm->uri.len);
+static void serve_static(struct mg_connection *c, struct http_message *hm) {
+    std::string uri(hm->uri.p ? hm->uri.p : "", hm->uri.len);
     if (uri == "/") uri = "/index.html";
 
     // Dev mode: serve from filesystem
     if (!g_static_dir.empty()) {
-        std::string path = g_static_dir + uri;
         // Use mongoose's built-in file serving
-        struct mg_http_serve_opts opts;
+        struct mg_serve_http_opts opts;
         std::memset(&opts, 0, sizeof(opts));
-        opts.root_dir = g_static_dir.c_str();
-        mg_http_serve_dir(c, hm, &opts);
+        opts.document_root = g_static_dir.c_str();
+        mg_serve_http(c, hm, opts);
         return;
     }
 
@@ -1071,10 +1080,10 @@ static void serve_static(struct mg_connection *c, struct mg_http_message *hm) {
     } else if (uri == "/timeline.js") {
         serve_embedded(c, asset_timeline_js, asset_timeline_js_len, "application/javascript");
     } else {
-        mg_http_reply(c, 404, "", "Not found");
+        send_error(c, 404, "Not found");
     }
 #else
-    mg_http_reply(c, 404, "", "Not found (dev mode requires --static-dir)");
+    send_error(c, 404, "Not found (dev mode requires --static-dir)");
 #endif
 }
 
@@ -1161,7 +1170,7 @@ static void handle_races(struct mg_connection *c) {
 static void handle_rebuild_api(struct mg_connection *c, const std::string& query) {
     std::string changed_str = get_query_param(query, "changed");
     if (changed_str.empty()) {
-        mg_http_reply(c, 400, "", "changed parameter required");
+        send_error(c, 400, "changed parameter required");
         return;
     }
 
@@ -1268,7 +1277,7 @@ static void write_rdeps_json(JsonWriter& w, const DependencyGraph& g,
 static void handle_rdeps(struct mg_connection *c, const std::string& query) {
     std::string file = get_query_param(query, "file");
     if (file.empty()) {
-        mg_http_reply(c, 400, "", "file parameter required");
+        send_error(c, 400, "file parameter required");
         return;
     }
     int depth = 3;
@@ -1287,11 +1296,11 @@ static void handle_rdeps(struct mg_connection *c, const std::string& query) {
 
 // --- Main event handler ---
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev != MG_EV_HTTP_MSG) return;
+    if (ev != MG_EV_HTTP_REQUEST) return;
 
-    struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-    std::string uri(hm->uri.buf, hm->uri.len);
-    std::string query(hm->query.buf, hm->query.len);
+    struct http_message *hm = (struct http_message *)ev_data;
+    std::string uri(hm->uri.p ? hm->uri.p : "", hm->uri.len);
+    std::string query(hm->query_string.p ? hm->query_string.p : "", hm->query_string.len);
 
     if (uri == "/api/summary") {
         handle_summary(c);
@@ -1300,11 +1309,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (starts_with(uri, "/api/processes/") && uri.find("/files") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/files");
         if (pid > 0) handle_process_files(c, pid);
-        else mg_http_reply(c, 400, "", "Bad PID");
+        else send_error(c, 400, "Bad PID");
     } else if (starts_with(uri, "/api/processes/") && uri.find("/children") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/children");
         if (pid > 0) handle_process_children(c, pid);
-        else mg_http_reply(c, 400, "", "Bad PID");
+        else send_error(c, 400, "Bad PID");
     } else if (uri == "/api/files") {
         handle_files(c);
     } else if (uri == "/api/files/by-path") {
@@ -1330,7 +1339,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (starts_with(uri, "/api/processes/") && uri.find("/io") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/io");
         if (pid > 0) handle_process_io(c, pid, query);
-        else mg_http_reply(c, 400, "", "Bad PID");
+        else send_error(c, 400, "Bad PID");
     } else if (uri == "/api/impact") {
         handle_impact(c, query);
     } else if (uri == "/api/races") {
@@ -1385,16 +1394,17 @@ int main(int argc, char* argv[]) {
     db.upgrade_schema();
     g_db = &db;
 
-    char listen_url[64];
-    std::snprintf(listen_url, sizeof(listen_url), "http://0.0.0.0:%d", port);
+    char listen_addr[32];
+    std::snprintf(listen_addr, sizeof(listen_addr), "%d", port);
 
     struct mg_mgr mgr;
-    mg_mgr_init(&mgr);
-    struct mg_connection *conn = mg_http_listen(&mgr, listen_url, ev_handler, NULL);
+    mg_mgr_init(&mgr, NULL);
+    struct mg_connection *conn = mg_bind(&mgr, listen_addr, ev_handler);
     if (!conn) {
-        std::fprintf(stderr, "Failed to start listener on %s\n", listen_url);
+        std::fprintf(stderr, "Failed to bind on port %d\n", port);
         return 1;
     }
+    mg_set_protocol_http_websocket(conn);
 
     std::printf("bdview-web: serving %s on http://localhost:%d\n", db_path.c_str(), port);
     if (!g_static_dir.empty()) {
