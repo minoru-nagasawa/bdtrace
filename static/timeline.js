@@ -189,13 +189,26 @@ var TimelineRenderer = (function() {
     ctx.stroke();
 
     // Scrollbar
+    var SB_W = 14;
+    var SB_MARGIN = 2;
     if (rows.length * ROW_H > h - ROW_H) {
       var totalH = rows.length * ROW_H;
       var viewH = h - ROW_H;
       var sbH = Math.max(20, viewH * viewH / totalH);
       var sbY = ROW_H + scrollY / totalH * viewH;
-      ctx.fillStyle = '#45475a88';
-      ctx.fillRect(w - 8, sbY, 6, sbH);
+      // Track
+      ctx.fillStyle = '#1e1e2e44';
+      ctx.fillRect(w - SB_W - SB_MARGIN, ROW_H, SB_W, viewH);
+      // Thumb
+      ctx.fillStyle = '#585b70cc';
+      var sbX = w - SB_W - SB_MARGIN;
+      if (ctx.roundRect) {
+        ctx.beginPath();
+        ctx.roundRect(sbX, sbY, SB_W, sbH, 4);
+        ctx.fill();
+      } else {
+        ctx.fillRect(sbX, sbY, SB_W, sbH);
+      }
     }
   }
 
@@ -250,6 +263,22 @@ var TimelineRenderer = (function() {
       var rect = canvas.getBoundingClientRect();
       var mx = e.clientX - rect.left;
       var my = e.clientY - rect.top;
+      // Check if click is on the scrollbar area
+      var SB_W = 14, SB_MARGIN = 2;
+      if (mx >= canvas.clientWidth - SB_W - SB_MARGIN * 2 && my > ROW_H) {
+        dragMode = 'sb';
+        dragStartX = mx;
+        dragStartY = my;
+        // Jump scroll position to click location
+        var viewH = canvas.clientHeight - ROW_H;
+        var totalH = rows.length * ROW_H;
+        var maxScroll = Math.max(0, totalH - viewH);
+        scrollY = Math.max(0, Math.min(maxScroll, (my - ROW_H) / viewH * totalH));
+        dragStartScrollY = scrollY;
+        canvas.style.cursor = 'grabbing';
+        render();
+        return;
+      }
       dragStartX = mx;
       dragStartY = my;
       dragStartViewLeft = viewLeft;
@@ -267,6 +296,15 @@ var TimelineRenderer = (function() {
       if (dragStartX >= 0) {
         var dx = mx - dragStartX;
         var dy = my - dragStartY;
+
+        if (dragMode === 'sb') {
+          var viewH = canvas.clientHeight - ROW_H;
+          var totalH = rows.length * ROW_H;
+          var maxScroll = Math.max(0, totalH - viewH);
+          scrollY = Math.max(0, Math.min(maxScroll, (my - ROW_H) / viewH * totalH));
+          render();
+          return;
+        }
 
         // Determine drag direction on first significant movement
         if (!dragMode && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
