@@ -21,6 +21,11 @@ std::string cmd_name_full(const std::string& cmdline, const std::string& cwd);
 std::string shorten_cmd(const std::string& cmdline, size_t max_len);
 const char* errno_name(int e);
 
+// --- Run compaction ---
+// Detect separate bdtrace runs by time gaps and shift later runs
+// so they appear immediately after the previous run.
+void compact_runs(std::vector<ProcessRecord>& procs);
+
 // --- Dependency graph ---
 
 struct DependencyGraph {

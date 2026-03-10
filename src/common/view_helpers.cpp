@@ -299,6 +299,73 @@ const char* errno_name(int e) {
     }
 }
 
+// --- Run compaction ---
+
+static bool proc_start_less(const ProcessRecord& a, const ProcessRecord& b) {
+    return a.start_time_us < b.start_time_us;
+}
+
+void compact_runs(std::vector<ProcessRecord>& procs) {
+    if (procs.size() <= 1) return;
+
+    // Sort by start_time to detect run boundaries
+    std::vector<ProcessRecord> sorted = procs;
+    std::sort(sorted.begin(), sorted.end(), proc_start_less);
+
+    // Detect runs: a new run starts when start_time > running max_end + threshold
+    static const int64_t GAP_THRESHOLD_US = 1000000; // 1 second
+    struct Run {
+        size_t first;
+        size_t last;
+        int64_t min_start;
+        int64_t max_end;
+    };
+
+    std::vector<Run> runs;
+    Run cur;
+    cur.first = 0;
+    cur.last = 0;
+    cur.min_start = sorted[0].start_time_us;
+    cur.max_end = sorted[0].end_time_us;
+
+    for (size_t i = 1; i < sorted.size(); ++i) {
+        if (sorted[i].start_time_us > cur.max_end + GAP_THRESHOLD_US) {
+            cur.last = i - 1;
+            runs.push_back(cur);
+            cur.first = i;
+            cur.min_start = sorted[i].start_time_us;
+            cur.max_end = sorted[i].end_time_us;
+        } else {
+            if (sorted[i].end_time_us > cur.max_end) {
+                cur.max_end = sorted[i].end_time_us;
+            }
+        }
+    }
+    cur.last = sorted.size() - 1;
+    runs.push_back(cur);
+
+    if (runs.size() <= 1) return;
+
+    // Build PID -> shift map from sorted order
+    std::map<int, int64_t> pid_shift;
+    int64_t cumulative_gap = 0;
+    for (size_t r = 1; r < runs.size(); ++r) {
+        cumulative_gap += runs[r].min_start - runs[r - 1].max_end;
+        for (size_t i = runs[r].first; i <= runs[r].last; ++i) {
+            pid_shift[sorted[i].pid] = cumulative_gap;
+        }
+    }
+
+    // Apply shifts to original vector
+    for (size_t i = 0; i < procs.size(); ++i) {
+        std::map<int, int64_t>::const_iterator it = pid_shift.find(procs[i].pid);
+        if (it != pid_shift.end()) {
+            procs[i].start_time_us -= it->second;
+            procs[i].end_time_us -= it->second;
+        }
+    }
+}
+
 // --- Dependency graph ---
 
 void build_dependency_graph(Database& db, DependencyGraph& g) {

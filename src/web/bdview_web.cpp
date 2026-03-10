@@ -213,6 +213,7 @@ static void handle_summary(struct mg_connection *c) {
 static void handle_processes(struct mg_connection *c) {
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
+    compact_runs(procs);
 
     // Count file accesses per PID
     std::vector<FileAccessRecord> all_fa;
@@ -573,6 +574,7 @@ static void handle_timeline(struct mg_connection *c, const std::string& query) {
 
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
+    compact_runs(procs);
 
     if (procs.empty()) {
         send_json(c, "{\"processes\":[],\"min_time_us\":0,\"max_time_us\":0}");
@@ -660,6 +662,7 @@ static void handle_timeline(struct mg_connection *c, const std::string& query) {
 static void handle_parallelism(struct mg_connection *c) {
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
+    compact_runs(procs);
 
     if (procs.empty()) {
         send_json(c, "{\"buckets\":[],\"max_parallelism\":0,\"total_time_us\":0}");
