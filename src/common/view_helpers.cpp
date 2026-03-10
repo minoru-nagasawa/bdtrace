@@ -305,6 +305,13 @@ static bool proc_start_less(const ProcessRecord& a, const ProcessRecord& b) {
     return a.start_time_us < b.start_time_us;
 }
 
+struct CompactRun {
+    size_t first;
+    size_t last;
+    int64_t min_start;
+    int64_t max_end;
+};
+
 void compact_runs(std::vector<ProcessRecord>& procs) {
     if (procs.size() <= 1) return;
 
@@ -314,15 +321,9 @@ void compact_runs(std::vector<ProcessRecord>& procs) {
 
     // Detect runs: a new run starts when start_time > running max_end + threshold
     static const int64_t GAP_THRESHOLD_US = 1000000; // 1 second
-    struct Run {
-        size_t first;
-        size_t last;
-        int64_t min_start;
-        int64_t max_end;
-    };
 
-    std::vector<Run> runs;
-    Run cur;
+    std::vector<CompactRun> runs;
+    CompactRun cur;
     cur.first = 0;
     cur.last = 0;
     cur.min_start = sorted[0].start_time_us;
