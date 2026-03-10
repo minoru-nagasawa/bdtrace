@@ -1481,7 +1481,7 @@ var App = (function() {
         var val = selectedFiles.length > 0 ? selectedFiles.join(',') : input.value.trim();
         if (!val) return;
         resultDiv.innerHTML = '<div class="loading">Calculating...</div>';
-        var collapseVal = collapseInput.value.trim();
+        var collapseVal = collapseInput.value.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s; }).join(',');
         var url = '/api/rebuild?changed=' + encodeURIComponent(val) + '&estimate=1';
         if (collapseVal) url += '&collapse=' + encodeURIComponent(collapseVal);
         api(url, function(data) {
