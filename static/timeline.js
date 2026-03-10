@@ -10,6 +10,9 @@ var TimelineRenderer = (function() {
   var scrollY = 0;    // px
   var ROW_H = 24;
   var LABEL_W = 180;
+  var SB_W = 14;
+  var SB_MARGIN = 2;
+  var SB_AREA = SB_W + SB_MARGIN * 2; // total reserved width for scrollbar
   var dpr = 1;
 
   // Interaction
@@ -96,7 +99,7 @@ var TimelineRenderer = (function() {
     ctx.fillRect(0, 0, w, ROW_H);
 
     // Draw time ticks
-    var barW = w - LABEL_W;
+    var barW = w - LABEL_W - SB_AREA;
     var tickInterval = niceInterval(totalDur, barW / 80);
     var firstTick = Math.ceil(viewLeft / tickInterval) * tickInterval;
 
@@ -159,12 +162,15 @@ var TimelineRenderer = (function() {
       var bw = barEnd - barStart;
       if (bw < 1) bw = 1;
 
-      // Clip to visible area
-      if (barEnd < LABEL_W || barStart > w) continue;
+      // Clip to visible area (exclude scrollbar)
+      var barRight = w - SB_AREA;
+      if (barEnd < LABEL_W || barStart > barRight) continue;
 
       var color = proc.exit_code !== 0 ? '#f38ba8' : hashColor(name);
       ctx.fillStyle = color;
-      ctx.fillRect(Math.max(barStart, LABEL_W), y + 3, Math.min(bw, w - Math.max(barStart, LABEL_W)), ROW_H - 6);
+      var clippedStart = Math.max(barStart, LABEL_W);
+      var clippedEnd = Math.min(barStart + bw, barRight);
+      ctx.fillRect(clippedStart, y + 3, clippedEnd - clippedStart, ROW_H - 6);
 
       // Bar label (if wide enough)
       if (bw > 40) {
@@ -188,20 +194,18 @@ var TimelineRenderer = (function() {
     ctx.lineTo(LABEL_W, h);
     ctx.stroke();
 
-    // Scrollbar
-    var SB_W = 14;
-    var SB_MARGIN = 2;
+    // Scrollbar (drawn in reserved area to the right of timeline bars)
     if (rows.length * ROW_H > h - ROW_H) {
       var totalH = rows.length * ROW_H;
       var viewH = h - ROW_H;
       var sbH = Math.max(20, viewH * viewH / totalH);
       var sbY = ROW_H + scrollY / totalH * viewH;
+      var sbX = w - SB_W - SB_MARGIN;
       // Track
       ctx.fillStyle = '#1e1e2e44';
-      ctx.fillRect(w - SB_W - SB_MARGIN, ROW_H, SB_W, viewH);
+      ctx.fillRect(sbX, ROW_H, SB_W, viewH);
       // Thumb
       ctx.fillStyle = '#585b70cc';
-      var sbX = w - SB_W - SB_MARGIN;
       if (ctx.roundRect) {
         ctx.beginPath();
         ctx.roundRect(sbX, sbY, SB_W, sbH, 4);
@@ -213,7 +217,7 @@ var TimelineRenderer = (function() {
   }
 
   function niceInterval(range, minPixels) {
-    var target = range * minPixels / ((canvas.clientWidth - LABEL_W) || 1);
+    var target = range * minPixels / ((canvas.clientWidth - LABEL_W - SB_AREA) || 1);
     var intervals = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
       10000, 20000, 50000, 100000, 200000, 500000, 1000000, 2000000, 5000000,
       10000000, 20000000, 50000000, 100000000];
@@ -236,7 +240,7 @@ var TimelineRenderer = (function() {
         // Horizontal zoom
         var rect = canvas.getBoundingClientRect();
         var mx = e.clientX - rect.left;
-        var frac = (mx - LABEL_W) / (canvas.clientWidth - LABEL_W);
+        var frac = (mx - LABEL_W) / (canvas.clientWidth - LABEL_W - SB_AREA);
         frac = Math.max(0, Math.min(1, frac));
 
         var center = viewLeft + (viewRight - viewLeft) * frac;
@@ -264,8 +268,7 @@ var TimelineRenderer = (function() {
       var mx = e.clientX - rect.left;
       var my = e.clientY - rect.top;
       // Check if click is on the scrollbar area
-      var SB_W = 14, SB_MARGIN = 2;
-      if (mx >= canvas.clientWidth - SB_W - SB_MARGIN * 2 && my > ROW_H) {
+      if (mx >= canvas.clientWidth - SB_AREA && my > ROW_H) {
         dragMode = 'sb';
         dragStartX = mx;
         dragStartY = my;
@@ -288,44 +291,46 @@ var TimelineRenderer = (function() {
       canvas.style.cursor = 'grabbing';
     });
 
-    canvas.addEventListener('mousemove', function(e) {
+    // Document-level mousemove for drag (works outside canvas)
+    document.addEventListener('mousemove', function(e) {
+      if (dragStartX < 0) return;
       var rect = canvas.getBoundingClientRect();
       var mx = e.clientX - rect.left;
       var my = e.clientY - rect.top;
+      var dx = mx - dragStartX;
+      var dy = my - dragStartY;
 
-      if (dragStartX >= 0) {
-        var dx = mx - dragStartX;
-        var dy = my - dragStartY;
-
-        if (dragMode === 'sb') {
-          var viewH = canvas.clientHeight - ROW_H;
-          var totalH = rows.length * ROW_H;
-          var maxScroll = Math.max(0, totalH - viewH);
-          scrollY = Math.max(0, Math.min(maxScroll, (my - ROW_H) / viewH * totalH));
-          render();
-          return;
-        }
-
-        // Determine drag direction on first significant movement
-        if (!dragMode && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
-          dragMode = Math.abs(dy) > Math.abs(dx) ? 'v' : 'h';
-        }
-
-        if (dragMode === 'v') {
-          var maxScroll = Math.max(0, rows.length * ROW_H - (canvas.clientHeight - ROW_H));
-          scrollY = Math.max(0, Math.min(maxScroll, dragStartScrollY - dy));
-        } else if (dragMode === 'h') {
-          var barW = canvas.clientWidth - LABEL_W;
-          var range = dragStartViewRight - dragStartViewLeft;
-          var shift = -dx / barW * range;
-          viewLeft = dragStartViewLeft + shift;
-          viewRight = dragStartViewRight + shift;
-          if (viewLeft < data.min_time_us) { viewLeft = data.min_time_us; viewRight = viewLeft + range; }
-          if (viewRight > data.max_time_us) { viewRight = data.max_time_us; viewLeft = viewRight - range; }
-        }
+      if (dragMode === 'sb') {
+        var viewH = canvas.clientHeight - ROW_H;
+        var totalH = rows.length * ROW_H;
+        var maxScroll = Math.max(0, totalH - viewH);
+        scrollY = Math.max(0, Math.min(maxScroll, (my - ROW_H) / viewH * totalH));
         render();
         return;
       }
+
+      // Determine drag direction on first significant movement
+      if (!dragMode && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+        dragMode = Math.abs(dy) > Math.abs(dx) ? 'v' : 'h';
+      }
+
+      if (dragMode === 'v') {
+        var maxScroll = Math.max(0, rows.length * ROW_H - (canvas.clientHeight - ROW_H));
+        scrollY = Math.max(0, Math.min(maxScroll, dragStartScrollY - dy));
+      } else if (dragMode === 'h') {
+        var barW = canvas.clientWidth - LABEL_W - SB_AREA;
+        var range = dragStartViewRight - dragStartViewLeft;
+        var shift = -dx / barW * range;
+        viewLeft = dragStartViewLeft + shift;
+        viewRight = dragStartViewRight + shift;
+        if (viewLeft < data.min_time_us) { viewLeft = data.min_time_us; viewRight = viewLeft + range; }
+        if (viewRight > data.max_time_us) { viewRight = data.max_time_us; viewLeft = viewRight - range; }
+      }
+      render();
+    });
+
+    canvas.addEventListener('mousemove', function(e) {
+      if (dragStartX >= 0) return; // handled by document listener
 
       // Hover
       var rowIdx = Math.floor((my - ROW_H + scrollY) / ROW_H);
@@ -353,18 +358,22 @@ var TimelineRenderer = (function() {
       render();
     });
 
-    canvas.addEventListener('mouseup', function() {
+    function endDrag() {
+      var wasDragging = dragStartX >= 0;
       dragStartX = -1;
       dragMode = '';
       canvas.style.cursor = '';
+      return wasDragging;
+    }
+
+    document.addEventListener('mouseup', function() {
+      endDrag();
     });
 
     canvas.addEventListener('mouseleave', function() {
-      dragStartX = -1;
-      dragMode = '';
+      if (dragStartX >= 0) return; // don't cancel during drag
       hoveredRow = -1;
       tooltip.style.display = 'none';
-      canvas.style.cursor = '';
       render();
     });
 
