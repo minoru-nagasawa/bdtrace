@@ -293,9 +293,42 @@ static void handle_processes(struct mg_connection *c) {
     send_json(c, jw.str());
 }
 
-static void handle_process_files(struct mg_connection *c, int pid) {
+static void collect_descendant_pids_web(int pid,
+    const std::map<int, std::vector<int> >& children_map,
+    std::vector<int>& pids) {
+    pids.push_back(pid);
+    std::map<int, std::vector<int> >::const_iterator it = children_map.find(pid);
+    if (it == children_map.end()) return;
+    for (size_t i = 0; i < it->second.size(); ++i) {
+        collect_descendant_pids_web(it->second[i], children_map, pids);
+    }
+}
+
+static void handle_process_files(struct mg_connection *c, int pid,
+                                  const std::string& query) {
+    bool tree = get_query_param(query, "tree") == "1";
+
     std::vector<FileAccessRecord> accesses;
-    g_db->get_file_accesses_by_pid(pid, accesses);
+    if (tree) {
+        // Build children map from all processes
+        std::vector<ProcessRecord> all_procs;
+        g_db->get_all_processes(all_procs);
+        std::map<int, std::vector<int> > children_map;
+        for (size_t i = 0; i < all_procs.size(); ++i) {
+            children_map[all_procs[i].ppid].push_back(all_procs[i].pid);
+        }
+        // Collect all descendant PIDs
+        std::vector<int> pids;
+        collect_descendant_pids_web(pid, children_map, pids);
+        // Fetch file accesses for all PIDs
+        for (size_t i = 0; i < pids.size(); ++i) {
+            std::vector<FileAccessRecord> fa;
+            g_db->get_file_accesses_by_pid(pids[i], fa);
+            accesses.insert(accesses.end(), fa.begin(), fa.end());
+        }
+    } else {
+        g_db->get_file_accesses_by_pid(pid, accesses);
+    }
 
     JsonWriter jw;
     jw.beginArray();
@@ -1356,7 +1389,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         handle_processes(c);
     } else if (starts_with(uri, "/api/processes/") && uri.find("/files") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/files");
-        if (pid > 0) handle_process_files(c, pid);
+        if (pid > 0) handle_process_files(c, pid, query);
         else send_error(c, 400, "Bad PID");
     } else if (starts_with(uri, "/api/processes/") && uri.find("/children") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/children");

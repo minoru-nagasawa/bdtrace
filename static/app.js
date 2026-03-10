@@ -480,6 +480,23 @@ var App = (function() {
     function ensureChildren() {
       if (!childUl && hasChildren) {
         childUl = el('ul');
+        // Virtual "(process only)" node to show self-only file accesses
+        var selfLi = el('li');
+        var selfNode = el('div', {className: 'node'});
+        var selfTree = el('span', {className: 'node-tree'});
+        if (depth + 1 > 0) selfTree.style.paddingLeft = ((depth + 1) * 16) + 'px';
+        selfTree.appendChild(el('span', {className: 'toggle'}, ' '));
+        selfTree.appendChild(el('span', {className: 'cmd', style: 'font-style:italic;color:var(--fg2)'}, '(process only)'));
+        selfNode.appendChild(selfTree);
+        selfNode.onclick = function(e) {
+          e.stopPropagation();
+          var prev = document.querySelector('.tree .node.selected');
+          if (prev) prev.className = prev.className.replace(' selected', '');
+          selfNode.className += ' selected';
+          showProcessDetail(pid, proc, rightPanel, ctx.minStart, true);
+        };
+        selfLi.appendChild(selfNode);
+        childUl.appendChild(selfLi);
         for (var c = 0; c < children.length; c++) {
           childUl.appendChild(buildTreeNode(children[c], ctx, rightPanel, registry, depth + 1));
         }
@@ -521,9 +538,10 @@ var App = (function() {
     return li;
   }
 
-  function showProcessDetail(pid, proc, panel, minStart) {
+  function showProcessDetail(pid, proc, panel, minStart, selfOnly) {
     var titleEl = document.getElementById('proc-detail-title');
-    if (titleEl) titleEl.textContent = '[' + pid + '] ' + shortenCmd(proc.cmdline, 60);
+    var suffix = selfOnly ? ' (process only)' : '';
+    if (titleEl) titleEl.textContent = '[' + pid + '] ' + shortenCmd(proc.cmdline, 60) + suffix;
 
     var old = panel.querySelector('.proc-files');
     if (old) old.remove();
@@ -533,7 +551,9 @@ var App = (function() {
     container.appendChild(el('div', {className: 'loading'}, 'Loading files...'));
     panel.appendChild(container);
 
-    api('/api/processes/' + pid + '/files', function(files) {
+    var url = '/api/processes/' + pid + '/files';
+    if (!selfOnly) url += '?tree=1';
+    api(url, function(files) {
       container.innerHTML = '';
       container.appendChild(renderProcInfo(proc, minStart));
 
