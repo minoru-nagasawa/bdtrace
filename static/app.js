@@ -1529,21 +1529,22 @@ var App = (function() {
                 reasonTd.colSpan = cols.length;
                 reasonTd.style.cssText = 'font-size:12px;color:var(--fg2);background:var(--bg1);padding-left:32px';
                 var hasContent = false;
-                if (p.reads && p.reads.length > 0) {
-                  for (var rj = 0; rj < p.reads.length; rj++) {
-                    var line = document.createElement('div');
-                    line.textContent = 'Read  ' + p.reads[rj];
-                    reasonTd.appendChild(line);
-                    hasContent = true;
-                  }
-                }
-                if (p.writes && p.writes.length > 0) {
-                  for (var wj = 0; wj < p.writes.length; wj++) {
-                    var line = document.createElement('div');
-                    line.textContent = 'Write ' + p.writes[wj];
-                    reasonTd.appendChild(line);
-                    hasContent = true;
-                  }
+                var readSet = {};
+                var writeSet = {};
+                if (p.reads) for (var rj = 0; rj < p.reads.length; rj++) readSet[p.reads[rj]] = true;
+                if (p.writes) for (var wj = 0; wj < p.writes.length; wj++) writeSet[p.writes[wj]] = true;
+                // Collect all unique files and classify
+                var allFiles = {};
+                for (var f in readSet) allFiles[f] = true;
+                for (var f in writeSet) allFiles[f] = true;
+                var fileList = Object.keys(allFiles).sort();
+                for (var fi = 0; fi < fileList.length; fi++) {
+                  var f = fileList[fi];
+                  var label = (readSet[f] && writeSet[f]) ? 'Read/Write ' : readSet[f] ? 'Read       ' : 'Write      ';
+                  var line = document.createElement('div');
+                  line.textContent = label + f;
+                  reasonTd.appendChild(line);
+                  hasContent = true;
                 }
                 if (!hasContent) {
                   reasonTd.textContent = 'No chain details available';

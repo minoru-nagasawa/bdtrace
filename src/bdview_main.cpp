@@ -468,7 +468,7 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
                 agg_pids.push_back(ccit->second[j]);
             }
         }
-        // Read: deduplicated trigger files
+        // Collect reads and writes
         std::set<std::string> reads;
         for (size_t a = 0; a < agg_pids.size(); ++a) {
             std::map<int, std::vector<RebuildReason> >::const_iterator rit =
@@ -479,11 +479,7 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
                 }
             }
         }
-        for (std::set<std::string>::const_iterator ri = reads.begin();
-             ri != reads.end(); ++ri) {
-            std::printf("        Read  %s\n", ri->c_str());
-        }
-        // Write: outputs in the rebuild chain
+        std::set<std::string> writes;
         for (size_t a = 0; a < agg_pids.size(); ++a) {
             std::map<int, std::set<std::string> >::const_iterator oit =
                 g.pid_to_outputs.find(agg_pids[a]);
@@ -491,10 +487,21 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
                 for (std::set<std::string>::const_iterator fi = oit->second.begin();
                      fi != oit->second.end(); ++fi) {
                     if (chain_files.find(*fi) != chain_files.end()) {
-                        std::printf("        Write %s\n", fi->c_str());
+                        writes.insert(*fi);
                     }
                 }
             }
+        }
+        // Merge: show Read/Write for files in both sets
+        std::set<std::string> all_files;
+        all_files.insert(reads.begin(), reads.end());
+        all_files.insert(writes.begin(), writes.end());
+        for (std::set<std::string>::const_iterator fi = all_files.begin();
+             fi != all_files.end(); ++fi) {
+            bool r = reads.find(*fi) != reads.end();
+            bool w = writes.find(*fi) != writes.end();
+            const char* label = (r && w) ? "Read/Write" : r ? "Read      " : "Write     ";
+            std::printf("        %s %s\n", label, fi->c_str());
         }
     }
 
