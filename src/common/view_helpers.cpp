@@ -402,6 +402,54 @@ std::set<int> rebuild_bfs(const DependencyGraph& g,
     return affected;
 }
 
+std::map<int, std::vector<RebuildReason> > rebuild_bfs_reasons(
+    const DependencyGraph& g,
+    const std::set<std::string>& changed_files) {
+    std::map<int, std::vector<RebuildReason> > reason_map;
+    std::set<int> affected;
+    std::queue<int> worklist;
+
+    // Seed phase: PIDs that read a user-specified changed file
+    for (std::set<std::string>::const_iterator fi = changed_files.begin();
+         fi != changed_files.end(); ++fi) {
+        std::map<std::string, std::set<int> >::const_iterator rit =
+            g.file_to_readers.find(*fi);
+        if (rit == g.file_to_readers.end()) continue;
+        const std::set<int>& readers = rit->second;
+        for (std::set<int>::const_iterator ri = readers.begin();
+             ri != readers.end(); ++ri) {
+            if (affected.insert(*ri).second) {
+                worklist.push(*ri);
+            }
+            reason_map[*ri].push_back(RebuildReason(*fi, 0));
+        }
+    }
+    // Propagation phase: PIDs that read outputs of affected PIDs
+    while (!worklist.empty()) {
+        int pid = worklist.front();
+        worklist.pop();
+        std::map<int, std::set<std::string> >::const_iterator oit =
+            g.pid_to_outputs.find(pid);
+        if (oit == g.pid_to_outputs.end()) continue;
+        const std::set<std::string>& outputs = oit->second;
+        for (std::set<std::string>::const_iterator fi = outputs.begin();
+             fi != outputs.end(); ++fi) {
+            std::map<std::string, std::set<int> >::const_iterator rit =
+                g.file_to_readers.find(*fi);
+            if (rit == g.file_to_readers.end()) continue;
+            const std::set<int>& readers = rit->second;
+            for (std::set<int>::const_iterator ri = readers.begin();
+                 ri != readers.end(); ++ri) {
+                if (affected.insert(*ri).second) {
+                    worklist.push(*ri);
+                }
+                reason_map[*ri].push_back(RebuildReason(*fi, pid));
+            }
+        }
+    }
+    return reason_map;
+}
+
 // --- Process I/O classification ---
 
 static void collect_descendant_pids(const DependencyGraph& g, int pid,

@@ -1465,9 +1465,67 @@ var App = (function() {
           resultDiv.appendChild(el('div', {style: 'margin-bottom:12px'}, 'Longest single: ' + formatDuration(data.longest_single_us)));
           if (data.affected && data.affected.length > 0) {
             var minStart = data.trace_min_start_us || 0;
-            var tbl = makeTable(['PID', 'Start', 'Duration', 'Directory', 'Command'], data.affected.map(function(p) {
-              return [p.pid, formatRelSec(p.start_time_us - minStart), formatDuration(p.duration_us), p.cwd || '', p.cmdline];
-            }));
+            var tbl = document.createElement('table');
+            tbl.className = 'data-table';
+            var thead = document.createElement('thead');
+            var hr = document.createElement('tr');
+            var cols = ['', 'PID', 'Start', 'Duration', 'Directory', 'Command'];
+            for (var ci = 0; ci < cols.length; ci++) {
+              var th = document.createElement('th');
+              th.textContent = cols[ci];
+              hr.appendChild(th);
+            }
+            thead.appendChild(hr);
+            tbl.appendChild(thead);
+            var tbody = document.createElement('tbody');
+            for (var ri = 0; ri < data.affected.length; ri++) {
+              (function(p) {
+                var tr = document.createElement('tr');
+                var toggleTd = document.createElement('td');
+                toggleTd.style.cssText = 'cursor:pointer;user-select:none;width:20px;text-align:center';
+                toggleTd.textContent = '+';
+                tr.appendChild(toggleTd);
+                var vals = [p.pid, formatRelSec(p.start_time_us - minStart), formatDuration(p.duration_us), p.cwd || '', p.cmdline];
+                for (var vi = 0; vi < vals.length; vi++) {
+                  var td = document.createElement('td');
+                  td.textContent = vals[vi];
+                  tr.appendChild(td);
+                }
+                tbody.appendChild(tr);
+                // Reason detail row (hidden by default)
+                var reasonTr = document.createElement('tr');
+                reasonTr.style.display = 'none';
+                var reasonTd = document.createElement('td');
+                reasonTd.colSpan = cols.length;
+                reasonTd.style.cssText = 'font-size:12px;color:var(--fg2);background:var(--bg1);padding-left:32px';
+                if (p.reasons && p.reasons.length > 0) {
+                  for (var rj = 0; rj < p.reasons.length; rj++) {
+                    var r = p.reasons[rj];
+                    var line = document.createElement('div');
+                    if (r.source_pid === 0) {
+                      line.textContent = 'Reads ' + r.file + ' (changed)';
+                    } else {
+                      line.textContent = 'Reads ' + r.file + ' \u2190 PID ' + r.source_pid + ' ' + (r.source_cmd || '');
+                    }
+                    reasonTd.appendChild(line);
+                  }
+                } else {
+                  reasonTd.textContent = 'No reason details available';
+                }
+                reasonTr.appendChild(reasonTd);
+                tbody.appendChild(reasonTr);
+                toggleTd.onclick = function() {
+                  if (reasonTr.style.display === 'none') {
+                    reasonTr.style.display = '';
+                    toggleTd.textContent = '\u2212';
+                  } else {
+                    reasonTr.style.display = 'none';
+                    toggleTd.textContent = '+';
+                  }
+                };
+              })(data.affected[ri]);
+            }
+            tbl.appendChild(tbody);
             resultDiv.appendChild(tbl);
 
             // Copyable rebuild script

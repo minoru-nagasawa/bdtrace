@@ -36,6 +36,20 @@ void build_dependency_graph(Database& db, DependencyGraph& g);
 std::set<int> rebuild_bfs(const DependencyGraph& g,
                           const std::set<std::string>& changed_files);
 
+// Reason why a PID is in the rebuild set
+struct RebuildReason {
+    std::string file;   // trigger file
+    int source_pid;     // 0=user-specified changed file, non-0=PID that outputs this file
+
+    RebuildReason() : source_pid(0) {}
+    RebuildReason(const std::string& f, int src) : file(f), source_pid(src) {}
+};
+
+// BFS with reasons: returns map from affected PID to its rebuild reasons
+std::map<int, std::vector<RebuildReason> > rebuild_bfs_reasons(
+    const DependencyGraph& g,
+    const std::set<std::string>& changed_files);
+
 // --- Process I/O classification ---
 
 struct ProcessIO {

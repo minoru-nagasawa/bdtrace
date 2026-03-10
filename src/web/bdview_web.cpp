@@ -1201,7 +1201,15 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         start = comma + 1;
     }
 
-    std::set<int> affected = rebuild_bfs(g, changed_files);
+    std::map<int, std::vector<RebuildReason> > reason_map =
+        rebuild_bfs_reasons(g, changed_files);
+
+    // Build affected set from reason_map keys
+    std::set<int> affected;
+    for (std::map<int, std::vector<RebuildReason> >::const_iterator it =
+             reason_map.begin(); it != reason_map.end(); ++it) {
+        affected.insert(it->first);
+    }
 
     // Parse optional collapse parameter (comma-separated command names)
     std::set<std::string> collapse_names;
@@ -1249,6 +1257,26 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         w.key("cwd").val(rr.processes[i].cwd);
         w.key("start_time_us").val(rr.processes[i].start_time_us);
         w.key("duration_us").val(dur);
+        // Rebuild reasons for this PID
+        std::map<int, std::vector<RebuildReason> >::const_iterator rit =
+            reason_map.find(rr.processes[i].pid);
+        w.key("reasons").beginArray();
+        if (rit != reason_map.end()) {
+            const std::vector<RebuildReason>& reasons = rit->second;
+            for (size_t j = 0; j < reasons.size(); ++j) {
+                w.beginObject();
+                w.key("file").val(reasons[j].file);
+                w.key("source_pid").val(reasons[j].source_pid);
+                if (reasons[j].source_pid != 0) {
+                    std::map<int, ProcessRecord>::const_iterator sp =
+                        g.proc_map.find(reasons[j].source_pid);
+                    w.key("source_cmd").val(
+                        sp != g.proc_map.end() ? sp->second.cmdline : "");
+                }
+                w.endObject();
+            }
+        }
+        w.endArray();
         w.endObject();
     }
     w.endArray();
