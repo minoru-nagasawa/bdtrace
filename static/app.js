@@ -1498,19 +1498,25 @@ var App = (function() {
                 var reasonTd = document.createElement('td');
                 reasonTd.colSpan = cols.length;
                 reasonTd.style.cssText = 'font-size:12px;color:var(--fg2);background:var(--bg1);padding-left:32px';
-                if (p.reasons && p.reasons.length > 0) {
-                  for (var rj = 0; rj < p.reasons.length; rj++) {
-                    var r = p.reasons[rj];
+                var hasContent = false;
+                if (p.reads && p.reads.length > 0) {
+                  for (var rj = 0; rj < p.reads.length; rj++) {
                     var line = document.createElement('div');
-                    if (r.source_pid === 0) {
-                      line.textContent = 'Reads ' + r.file + ' (changed)';
-                    } else {
-                      line.textContent = 'Reads ' + r.file + ' \u2190 PID ' + r.source_pid + ' ' + (r.source_cmd || '');
-                    }
+                    line.textContent = 'Read  ' + p.reads[rj];
                     reasonTd.appendChild(line);
+                    hasContent = true;
                   }
-                } else {
-                  reasonTd.textContent = 'No reason details available';
+                }
+                if (p.writes && p.writes.length > 0) {
+                  for (var wj = 0; wj < p.writes.length; wj++) {
+                    var line = document.createElement('div');
+                    line.textContent = 'Write ' + p.writes[wj];
+                    reasonTd.appendChild(line);
+                    hasContent = true;
+                  }
+                }
+                if (!hasContent) {
+                  reasonTd.textContent = 'No chain details available';
                 }
                 reasonTr.appendChild(reasonTd);
                 tbody.appendChild(reasonTr);

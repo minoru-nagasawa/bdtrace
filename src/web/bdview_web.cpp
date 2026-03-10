@@ -1240,6 +1240,15 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         }
     }
 
+    // Collect all files in the rebuild chain (for filtering writes)
+    std::set<std::string> chain_files;
+    for (std::map<int, std::vector<RebuildReason> >::const_iterator it =
+             reason_map.begin(); it != reason_map.end(); ++it) {
+        for (size_t j = 0; j < it->second.size(); ++j) {
+            chain_files.insert(it->second[j].file);
+        }
+    }
+
     JsonWriter w;
     w.beginObject();
     w.key("affected_count").val((int)rr.processes.size());
@@ -1257,23 +1266,31 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         w.key("cwd").val(rr.processes[i].cwd);
         w.key("start_time_us").val(rr.processes[i].start_time_us);
         w.key("duration_us").val(dur);
-        // Rebuild reasons for this PID
+        // Relevant reads: deduplicated trigger files from reason_map
         std::map<int, std::vector<RebuildReason> >::const_iterator rit =
             reason_map.find(rr.processes[i].pid);
-        w.key("reasons").beginArray();
+        std::set<std::string> reads;
         if (rit != reason_map.end()) {
-            const std::vector<RebuildReason>& reasons = rit->second;
-            for (size_t j = 0; j < reasons.size(); ++j) {
-                w.beginObject();
-                w.key("file").val(reasons[j].file);
-                w.key("source_pid").val(reasons[j].source_pid);
-                if (reasons[j].source_pid != 0) {
-                    std::map<int, ProcessRecord>::const_iterator sp =
-                        g.proc_map.find(reasons[j].source_pid);
-                    w.key("source_cmd").val(
-                        sp != g.proc_map.end() ? sp->second.cmdline : "");
+            for (size_t j = 0; j < rit->second.size(); ++j) {
+                reads.insert(rit->second[j].file);
+            }
+        }
+        w.key("reads").beginArray();
+        for (std::set<std::string>::const_iterator ri = reads.begin();
+             ri != reads.end(); ++ri) {
+            w.val(*ri);
+        }
+        w.endArray();
+        // Relevant writes: outputs that are in the rebuild chain
+        w.key("writes").beginArray();
+        std::map<int, std::set<std::string> >::const_iterator oit =
+            g.pid_to_outputs.find(rr.processes[i].pid);
+        if (oit != g.pid_to_outputs.end()) {
+            for (std::set<std::string>::const_iterator fi = oit->second.begin();
+                 fi != oit->second.end(); ++fi) {
+                if (chain_files.find(*fi) != chain_files.end()) {
+                    w.val(*fi);
                 }
-                w.endObject();
             }
         }
         w.endArray();
