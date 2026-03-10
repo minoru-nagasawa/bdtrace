@@ -1468,13 +1468,23 @@ var App = (function() {
         if (!searchWrap.contains(e.target)) { suggestBox.style.display = 'none'; suggestIndex = -1; }
       });
 
+      // Collapse option
+      var collapseRow = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
+      collapseRow.appendChild(el('span', {style: 'color:var(--fg2);font-size:12px;white-space:nowrap'}, 'Collapse:'));
+      var collapseInput = el('input', {type: 'text', placeholder: 'e.g. make,sh,bash', style: 'flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px;font-size:12px'});
+      collapseRow.appendChild(collapseInput);
+      content.appendChild(collapseRow);
+
       var resultDiv = el('div');
       content.appendChild(resultDiv);
       btn.onclick = function() {
         var val = selectedFiles.length > 0 ? selectedFiles.join(',') : input.value.trim();
         if (!val) return;
         resultDiv.innerHTML = '<div class="loading">Calculating...</div>';
-        api('/api/rebuild?changed=' + encodeURIComponent(val) + '&estimate=1', function(data) {
+        var collapseVal = collapseInput.value.trim();
+        var url = '/api/rebuild?changed=' + encodeURIComponent(val) + '&estimate=1';
+        if (collapseVal) url += '&collapse=' + encodeURIComponent(collapseVal);
+        api(url, function(data) {
           resultDiv.innerHTML = '';
           if (!data || data.affected_count === 0) {
             resultDiv.appendChild(el('div', null, 'No affected processes for given files.'));
