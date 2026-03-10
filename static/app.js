@@ -1533,18 +1533,22 @@ var App = (function() {
                 var writeSet = {};
                 if (p.reads) for (var rj = 0; rj < p.reads.length; rj++) readSet[p.reads[rj]] = true;
                 if (p.writes) for (var wj = 0; wj < p.writes.length; wj++) writeSet[p.writes[wj]] = true;
-                // Collect all unique files and classify
-                var allFiles = {};
-                for (var f in readSet) allFiles[f] = true;
-                for (var f in writeSet) allFiles[f] = true;
-                var fileList = Object.keys(allFiles).sort();
-                for (var fi = 0; fi < fileList.length; fi++) {
-                  var f = fileList[fi];
-                  var label = (readSet[f] && writeSet[f]) ? 'Read/Write ' : readSet[f] ? 'Read       ' : 'Write      ';
-                  var line = document.createElement('div');
-                  line.textContent = label + f;
-                  reasonTd.appendChild(line);
-                  hasContent = true;
+                // Output in order: Read, Write, Read/Write
+                var allFiles = Object.keys(readSet).concat(Object.keys(writeSet)).filter(function(f, i, a) { return a.indexOf(f) === i; }).sort();
+                var groups = [
+                  {test: function(f) { return readSet[f] && !writeSet[f]; }, label: 'Read       '},
+                  {test: function(f) { return writeSet[f] && !readSet[f]; }, label: 'Write      '},
+                  {test: function(f) { return readSet[f] && writeSet[f]; }, label: 'Read/Write '}
+                ];
+                for (var gi = 0; gi < groups.length; gi++) {
+                  for (var fi = 0; fi < allFiles.length; fi++) {
+                    if (groups[gi].test(allFiles[fi])) {
+                      var line = document.createElement('div');
+                      line.textContent = groups[gi].label + allFiles[fi];
+                      reasonTd.appendChild(line);
+                      hasContent = true;
+                    }
+                  }
                 }
                 if (!hasContent) {
                   reasonTd.textContent = 'No chain details available';

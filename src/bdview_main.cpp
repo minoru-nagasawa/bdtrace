@@ -492,16 +492,21 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
                 }
             }
         }
-        // Merge: show Read/Write for files in both sets
-        std::set<std::string> all_files;
-        all_files.insert(reads.begin(), reads.end());
-        all_files.insert(writes.begin(), writes.end());
-        for (std::set<std::string>::const_iterator fi = all_files.begin();
-             fi != all_files.end(); ++fi) {
-            bool r = reads.find(*fi) != reads.end();
-            bool w = writes.find(*fi) != writes.end();
-            const char* label = (r && w) ? "Read/Write" : r ? "Read      " : "Write     ";
-            std::printf("        %s %s\n", label, fi->c_str());
+        // Output in order: Read, Write, Read/Write
+        for (std::set<std::string>::const_iterator fi = reads.begin();
+             fi != reads.end(); ++fi) {
+            if (writes.find(*fi) == writes.end())
+                std::printf("        Read       %s\n", fi->c_str());
+        }
+        for (std::set<std::string>::const_iterator fi = writes.begin();
+             fi != writes.end(); ++fi) {
+            if (reads.find(*fi) == reads.end())
+                std::printf("        Write      %s\n", fi->c_str());
+        }
+        for (std::set<std::string>::const_iterator fi = reads.begin();
+             fi != reads.end(); ++fi) {
+            if (writes.find(*fi) != writes.end())
+                std::printf("        Read/Write %s\n", fi->c_str());
         }
     }
 
