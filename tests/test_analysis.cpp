@@ -764,6 +764,29 @@ void test_collapse_linker_chain() {
     ASSERT_TRUE(names1.find("collect2") == names1.end());
     ASSERT_TRUE(names1.find("g++") != names1.end());
 
+    // Verify collapsed_children: g++ (PID 200) should have hidden descendants
+    // that include PID 202 (ld, which is affected)
+    std::map<int, std::vector<int> >::const_iterator cc200 =
+        rr1.collapsed_children.find(200);
+    ASSERT_TRUE(cc200 != rr1.collapsed_children.end());
+    bool has_ld = false;
+    for (size_t i = 0; i < cc200->second.size(); ++i) {
+        if (cc200->second[i] == 202) has_ld = true;
+    }
+    ASSERT_TRUE(has_ld);
+
+    // g++ (PID 100) should have hidden descendants 101 (cc1plus) and 102 (as)
+    std::map<int, std::vector<int> >::const_iterator cc100 =
+        rr1.collapsed_children.find(100);
+    ASSERT_TRUE(cc100 != rr1.collapsed_children.end());
+    bool has_cc1 = false, has_as = false;
+    for (size_t i = 0; i < cc100->second.size(); ++i) {
+        if (cc100->second[i] == 101) has_cc1 = true;
+        if (cc100->second[i] == 102) has_as = true;
+    }
+    ASSERT_TRUE(has_cc1);
+    ASSERT_TRUE(has_as);
+
     // Collapse collect2: should hide ld but not cc1plus or as
     std::set<std::string> collapse_collect2;
     collapse_collect2.insert("collect2");
@@ -771,6 +794,16 @@ void test_collapse_linker_chain() {
     std::set<std::string> names2 = result_cmd_names(rr2);
     ASSERT_TRUE(names2.find("ld") == names2.end());
     ASSERT_TRUE(names2.find("collect2") != names2.end());
+
+    // collapsed_children for collect2 (PID 201) should include ld (PID 202)
+    std::map<int, std::vector<int> >::const_iterator cc201 =
+        rr2.collapsed_children.find(201);
+    ASSERT_TRUE(cc201 != rr2.collapsed_children.end());
+    bool has_ld2 = false;
+    for (size_t i = 0; i < cc201->second.size(); ++i) {
+        if (cc201->second[i] == 202) has_ld2 = true;
+    }
+    ASSERT_TRUE(has_ld2);
 }
 
 void run_analysis_tests() {

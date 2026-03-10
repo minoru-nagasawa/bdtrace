@@ -93,6 +93,8 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result);
 struct RebuildResult {
     std::vector<ProcessRecord> processes;  // filtered leaf processes
     int total_affected;                    // total before filtering
+    // For collapsed processes: PID -> list of hidden descendant PIDs it represents
+    std::map<int, std::vector<int> > collapsed_children;
 };
 
 // Filter affected PIDs to minimal rebuild set (leaf processes with outputs).

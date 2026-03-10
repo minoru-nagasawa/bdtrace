@@ -457,28 +457,42 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
         }
         std::printf("  [%d] %s\n", rr.processes[i].pid, rr.processes[i].cmdline.c_str());
 
-        // Read: deduplicated trigger files
+        // Collect PIDs to aggregate (self + hidden descendants if collapsed)
         int pid = rr.processes[i].pid;
-        std::map<int, std::vector<RebuildReason> >::const_iterator rit =
-            reason_map.find(pid);
-        if (rit != reason_map.end()) {
-            std::set<std::string> reads;
-            for (size_t j = 0; j < rit->second.size(); ++j) {
-                reads.insert(rit->second[j].file);
-            }
-            for (std::set<std::string>::const_iterator ri = reads.begin();
-                 ri != reads.end(); ++ri) {
-                std::printf("        Read  %s\n", ri->c_str());
+        std::vector<int> agg_pids;
+        agg_pids.push_back(pid);
+        std::map<int, std::vector<int> >::const_iterator ccit =
+            rr.collapsed_children.find(pid);
+        if (ccit != rr.collapsed_children.end()) {
+            for (size_t j = 0; j < ccit->second.size(); ++j) {
+                agg_pids.push_back(ccit->second[j]);
             }
         }
+        // Read: deduplicated trigger files
+        std::set<std::string> reads;
+        for (size_t a = 0; a < agg_pids.size(); ++a) {
+            std::map<int, std::vector<RebuildReason> >::const_iterator rit =
+                reason_map.find(agg_pids[a]);
+            if (rit != reason_map.end()) {
+                for (size_t j = 0; j < rit->second.size(); ++j) {
+                    reads.insert(rit->second[j].file);
+                }
+            }
+        }
+        for (std::set<std::string>::const_iterator ri = reads.begin();
+             ri != reads.end(); ++ri) {
+            std::printf("        Read  %s\n", ri->c_str());
+        }
         // Write: outputs in the rebuild chain
-        std::map<int, std::set<std::string> >::const_iterator oit =
-            g.pid_to_outputs.find(pid);
-        if (oit != g.pid_to_outputs.end()) {
-            for (std::set<std::string>::const_iterator fi = oit->second.begin();
-                 fi != oit->second.end(); ++fi) {
-                if (chain_files.find(*fi) != chain_files.end()) {
-                    std::printf("        Write %s\n", fi->c_str());
+        for (size_t a = 0; a < agg_pids.size(); ++a) {
+            std::map<int, std::set<std::string> >::const_iterator oit =
+                g.pid_to_outputs.find(agg_pids[a]);
+            if (oit != g.pid_to_outputs.end()) {
+                for (std::set<std::string>::const_iterator fi = oit->second.begin();
+                     fi != oit->second.end(); ++fi) {
+                    if (chain_files.find(*fi) != chain_files.end()) {
+                        std::printf("        Write %s\n", fi->c_str());
+                    }
                 }
             }
         }

@@ -730,6 +730,7 @@ RebuildResult filter_rebuild_set(const DependencyGraph& g,
             collapsed_pids.insert(pit->first);
         }
     }
+    std::map<int, std::vector<int> > collapsed_children_map;
     for (std::set<int>::const_iterator ci = collapsed_pids.begin();
          ci != collapsed_pids.end(); ++ci) {
         std::queue<int> dq;
@@ -743,6 +744,7 @@ RebuildResult filter_rebuild_set(const DependencyGraph& g,
                 int child = ch->second[i];
                 if (affected.find(child) != affected.end()) {
                     hidden_pids.insert(child);
+                    collapsed_children_map[*ci].push_back(child);
                 }
                 dq.push(child);
             }
@@ -807,6 +809,7 @@ RebuildResult filter_rebuild_set(const DependencyGraph& g,
         if (hidden_pids.find(*ci) != hidden_pids.end()) continue;
         res.processes.push_back(g.proc_map.find(*ci)->second);
     }
+    res.collapsed_children = collapsed_children_map;
     std::sort(res.processes.begin(), res.processes.end(), cmp_start_time);
     return res;
 }

@@ -1302,13 +1302,25 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         w.key("cwd").val(rr.processes[i].cwd);
         w.key("start_time_us").val(rr.processes[i].start_time_us);
         w.key("duration_us").val(dur);
+        // Collect PIDs to aggregate (self + hidden descendants if collapsed)
+        std::vector<int> agg_pids;
+        agg_pids.push_back(rr.processes[i].pid);
+        std::map<int, std::vector<int> >::const_iterator ccit =
+            rr.collapsed_children.find(rr.processes[i].pid);
+        if (ccit != rr.collapsed_children.end()) {
+            for (size_t j = 0; j < ccit->second.size(); ++j) {
+                agg_pids.push_back(ccit->second[j]);
+            }
+        }
         // Relevant reads: deduplicated trigger files from reason_map
-        std::map<int, std::vector<RebuildReason> >::const_iterator rit =
-            reason_map.find(rr.processes[i].pid);
         std::set<std::string> reads;
-        if (rit != reason_map.end()) {
-            for (size_t j = 0; j < rit->second.size(); ++j) {
-                reads.insert(rit->second[j].file);
+        for (size_t a = 0; a < agg_pids.size(); ++a) {
+            std::map<int, std::vector<RebuildReason> >::const_iterator rit =
+                reason_map.find(agg_pids[a]);
+            if (rit != reason_map.end()) {
+                for (size_t j = 0; j < rit->second.size(); ++j) {
+                    reads.insert(rit->second[j].file);
+                }
             }
         }
         w.key("reads").beginArray();
@@ -1318,16 +1330,23 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         }
         w.endArray();
         // Relevant writes: outputs that are in the rebuild chain
-        w.key("writes").beginArray();
-        std::map<int, std::set<std::string> >::const_iterator oit =
-            g.pid_to_outputs.find(rr.processes[i].pid);
-        if (oit != g.pid_to_outputs.end()) {
-            for (std::set<std::string>::const_iterator fi = oit->second.begin();
-                 fi != oit->second.end(); ++fi) {
-                if (chain_files.find(*fi) != chain_files.end()) {
-                    w.val(*fi);
+        std::set<std::string> writes;
+        for (size_t a = 0; a < agg_pids.size(); ++a) {
+            std::map<int, std::set<std::string> >::const_iterator oit =
+                g.pid_to_outputs.find(agg_pids[a]);
+            if (oit != g.pid_to_outputs.end()) {
+                for (std::set<std::string>::const_iterator fi = oit->second.begin();
+                     fi != oit->second.end(); ++fi) {
+                    if (chain_files.find(*fi) != chain_files.end()) {
+                        writes.insert(*fi);
+                    }
                 }
             }
+        }
+        w.key("writes").beginArray();
+        for (std::set<std::string>::const_iterator wi = writes.begin();
+             wi != writes.end(); ++wi) {
+            w.val(*wi);
         }
         w.endArray();
         w.endObject();
