@@ -95,4 +95,4 @@ embed_static: src/web/static_assets.h
 clean:
 	rm -f bdtrace bdview bdview-web test_all
 	find . -name '*.o' -delete
-	rm -f *.db
+	rm -f *.db *.db-shm *.db-wal
