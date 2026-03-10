@@ -422,8 +422,25 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
         }
     }
 
-    std::set<int> affected = rebuild_bfs(g, changed_files);
+    std::map<int, std::vector<RebuildReason> > reason_map =
+        rebuild_bfs_reasons(g, changed_files);
+
+    std::set<int> affected;
+    for (std::map<int, std::vector<RebuildReason> >::const_iterator it =
+             reason_map.begin(); it != reason_map.end(); ++it) {
+        affected.insert(it->first);
+    }
+
     RebuildResult rr = filter_rebuild_set(g, affected, collapse_names);
+
+    // Collect chain files for filtering writes
+    std::set<std::string> chain_files;
+    for (std::map<int, std::vector<RebuildReason> >::const_iterator it =
+             reason_map.begin(); it != reason_map.end(); ++it) {
+        for (size_t j = 0; j < it->second.size(); ++j) {
+            chain_files.insert(it->second[j].file);
+        }
+    }
 
     std::printf("=== Minimal Rebuild Set for:");
     for (size_t i = 0; i < changed_args.size(); ++i) {
@@ -439,6 +456,32 @@ static int cmd_rebuild(Database& db, const std::vector<std::string>& changed_arg
             last_cwd = rr.processes[i].cwd;
         }
         std::printf("  [%d] %s\n", rr.processes[i].pid, rr.processes[i].cmdline.c_str());
+
+        // Read: deduplicated trigger files
+        int pid = rr.processes[i].pid;
+        std::map<int, std::vector<RebuildReason> >::const_iterator rit =
+            reason_map.find(pid);
+        if (rit != reason_map.end()) {
+            std::set<std::string> reads;
+            for (size_t j = 0; j < rit->second.size(); ++j) {
+                reads.insert(rit->second[j].file);
+            }
+            for (std::set<std::string>::const_iterator ri = reads.begin();
+                 ri != reads.end(); ++ri) {
+                std::printf("        Read  %s\n", ri->c_str());
+            }
+        }
+        // Write: outputs in the rebuild chain
+        std::map<int, std::set<std::string> >::const_iterator oit =
+            g.pid_to_outputs.find(pid);
+        if (oit != g.pid_to_outputs.end()) {
+            for (std::set<std::string>::const_iterator fi = oit->second.begin();
+                 fi != oit->second.end(); ++fi) {
+                if (chain_files.find(*fi) != chain_files.end()) {
+                    std::printf("        Write %s\n", fi->c_str());
+                }
+            }
+        }
     }
 
     if (estimate) {
