@@ -719,15 +719,15 @@ RebuildResult filter_rebuild_set(const DependencyGraph& g,
     RebuildResult res;
     res.total_affected = (int)affected.size();
 
-    // Collapse: find processes matching collapse_names, hide their descendants
+    // Collapse: find ALL processes matching collapse_names (not just affected),
+    // then hide their affected descendants.  The collapse process itself is
+    // promoted into the result only when it has affected descendants.
     std::set<int> collapsed_pids;
     std::set<int> hidden_pids;
-    for (std::set<int>::const_iterator it = affected.begin();
-         it != affected.end(); ++it) {
-        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(*it);
-        if (pit == g.proc_map.end()) continue;
+    for (std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.begin();
+         pit != g.proc_map.end(); ++pit) {
         if (collapse_names.find(cmd_name(pit->second.cmdline)) != collapse_names.end()) {
-            collapsed_pids.insert(*it);
+            collapsed_pids.insert(pit->first);
         }
     }
     for (std::set<int>::const_iterator ci = collapsed_pids.begin();
@@ -763,17 +763,49 @@ RebuildResult filter_rebuild_set(const DependencyGraph& g,
         }
     }
 
+    // Determine which collapsed PIDs have affected descendants (to include them)
+    std::set<int> collapsed_with_descendants;
+    for (std::set<int>::const_iterator ci = collapsed_pids.begin();
+         ci != collapsed_pids.end(); ++ci) {
+        // Check if any hidden_pid is a descendant of this collapsed pid
+        std::queue<int> dq;
+        dq.push(*ci);
+        bool has_affected_desc = false;
+        while (!dq.empty() && !has_affected_desc) {
+            int p = dq.front();
+            dq.pop();
+            std::map<int, std::vector<int> >::const_iterator ch = g.pid_children.find(p);
+            if (ch == g.pid_children.end()) continue;
+            for (size_t i = 0; i < ch->second.size(); ++i) {
+                if (hidden_pids.find(ch->second[i]) != hidden_pids.end()) {
+                    has_affected_desc = true;
+                    break;
+                }
+                dq.push(ch->second[i]);
+            }
+        }
+        if (has_affected_desc || affected.find(*ci) != affected.end()) {
+            collapsed_with_descendants.insert(*ci);
+        }
+    }
+
     for (std::set<int>::const_iterator it = affected.begin();
          it != affected.end(); ++it) {
         if (hidden_pids.find(*it) != hidden_pids.end()) continue;
         if (collapsed_pids.find(*it) != collapsed_pids.end()) {
-            res.processes.push_back(g.proc_map.find(*it)->second);
+            // Will be added from collapsed_with_descendants
             continue;
         }
         if (g.pid_to_outputs.find(*it) != g.pid_to_outputs.end()
             && has_output_child.find(*it) == has_output_child.end()) {
             res.processes.push_back(g.proc_map.find(*it)->second);
         }
+    }
+    // Add collapsed processes (both affected and non-affected with affected descendants)
+    for (std::set<int>::const_iterator ci = collapsed_with_descendants.begin();
+         ci != collapsed_with_descendants.end(); ++ci) {
+        if (hidden_pids.find(*ci) != hidden_pids.end()) continue;
+        res.processes.push_back(g.proc_map.find(*ci)->second);
     }
     std::sort(res.processes.begin(), res.processes.end(), cmp_start_time);
     return res;

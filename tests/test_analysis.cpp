@@ -667,6 +667,112 @@ void test_rdeps_transitive() {
 // Entry point
 // =================================================================
 
+// =================================================================
+// Collapse tests (unit test with synthetic DependencyGraph)
+// =================================================================
+
+// Helper: create a ProcessRecord
+static ProcessRecord make_proc(int pid, int ppid, const std::string& cmd) {
+    ProcessRecord p;
+    p.pid = pid;
+    p.ppid = ppid;
+    p.cmdline = cmd;
+    p.cwd = "/workspace";
+    p.start_time_us = pid * 1000;
+    p.end_time_us = pid * 1000 + 500;
+    p.exit_code = 0;
+    p.user_time_us = 0;
+    p.sys_time_us = 0;
+    p.peak_rss_kb = 0;
+    p.io_read_bytes = 0;
+    p.io_write_bytes = 0;
+    return p;
+}
+
+// Helper: get cmd_names from RebuildResult
+static std::set<std::string> result_cmd_names(const RebuildResult& rr) {
+    std::set<std::string> names;
+    for (size_t i = 0; i < rr.processes.size(); ++i) {
+        names.insert(cmd_name(rr.processes[i].cmdline));
+    }
+    return names;
+}
+
+// Simulate: g++ (link) -> collect2 -> ld
+// cc1plus (compile) -> as -> ld reads .o
+// Collapsing g++ should hide collect2 and ld
+void test_collapse_linker_chain() {
+    // Build a synthetic dependency graph:
+    //   PID 100: g++ -c -o main.o main.cpp      (compile driver)
+    //     PID 101: cc1plus main.cpp -o /tmp/cc.s  (compiler)
+    //     PID 102: as -o main.o /tmp/cc.s          (assembler)
+    //   PID 200: g++ -o app main.o                (link driver)
+    //     PID 201: collect2 -o app main.o          (collect2)
+    //       PID 202: ld -o app main.o              (linker)
+    DependencyGraph g;
+
+    g.proc_map[100] = make_proc(100, 1, "g++ -c -o main.o main.cpp");
+    g.proc_map[101] = make_proc(101, 100, "/usr/lib/gcc/x86_64/cc1plus main.cpp -o /tmp/cc.s");
+    g.proc_map[102] = make_proc(102, 100, "as -o main.o /tmp/cc.s");
+    g.proc_map[200] = make_proc(200, 1, "g++ -o app main.o");
+    g.proc_map[201] = make_proc(201, 200, "/usr/lib/gcc/x86_64/collect2 -o app main.o");
+    g.proc_map[202] = make_proc(202, 201, "/usr/bin/ld -o app main.o");
+
+    g.pid_children[1].push_back(100);
+    g.pid_children[1].push_back(200);
+    g.pid_children[100].push_back(101);
+    g.pid_children[100].push_back(102);
+    g.pid_children[200].push_back(201);
+    g.pid_children[201].push_back(202);
+
+    // File dependencies:
+    // main.cpp -> cc1plus writes /tmp/cc.s
+    // /tmp/cc.s -> as writes main.o
+    // main.o -> ld writes app
+    g.file_to_readers["main.cpp"].insert(101);
+    g.pid_to_outputs[101].insert("/tmp/cc.s");
+    g.file_to_readers["/tmp/cc.s"].insert(102);
+    g.pid_to_outputs[102].insert("main.o");
+    g.file_to_readers["main.o"].insert(202);
+    g.pid_to_outputs[202].insert("app");
+
+    // Changed file: main.cpp
+    std::set<std::string> changed;
+    changed.insert("main.cpp");
+    std::set<int> affected = rebuild_bfs(g, changed);
+
+    // All three workers should be affected: 101, 102, 202
+    ASSERT_TRUE(affected.find(101) != affected.end());
+    ASSERT_TRUE(affected.find(102) != affected.end());
+    ASSERT_TRUE(affected.find(202) != affected.end());
+
+    // Without collapse: leaf filter should show cc1plus, as, ld
+    std::set<std::string> no_collapse;
+    RebuildResult rr0 = filter_rebuild_set(g, affected, no_collapse);
+    std::set<std::string> names0 = result_cmd_names(rr0);
+    ASSERT_TRUE(names0.find("ld") != names0.end());
+
+    // Collapse g++: should show g++ (compile) and g++ (link) only
+    // cc1plus, as, collect2, ld should all be hidden
+    std::set<std::string> collapse_gpp;
+    collapse_gpp.insert("g++");
+    RebuildResult rr1 = filter_rebuild_set(g, affected, collapse_gpp);
+    std::set<std::string> names1 = result_cmd_names(rr1);
+    ASSERT_TRUE(names1.find("ld") == names1.end());
+    ASSERT_TRUE(names1.find("cc1plus") == names1.end());
+    ASSERT_TRUE(names1.find("as") == names1.end());
+    ASSERT_TRUE(names1.find("collect2") == names1.end());
+    ASSERT_TRUE(names1.find("g++") != names1.end());
+
+    // Collapse collect2: should hide ld but not cc1plus or as
+    std::set<std::string> collapse_collect2;
+    collapse_collect2.insert("collect2");
+    RebuildResult rr2 = filter_rebuild_set(g, affected, collapse_collect2);
+    std::set<std::string> names2 = result_cmd_names(rr2);
+    ASSERT_TRUE(names2.find("ld") == names2.end());
+    ASSERT_TRUE(names2.find("collect2") != names2.end());
+}
+
 void run_analysis_tests() {
     std::printf("=== DependencyGraph Tests ===\n");
     RUN_TEST(test_depgraph_basic);
@@ -695,4 +801,7 @@ void run_analysis_tests() {
     std::printf("=== Reverse Dependency Tests ===\n");
     RUN_TEST(test_rdeps_direct);
     RUN_TEST(test_rdeps_transitive);
+
+    std::printf("=== Collapse Tests ===\n");
+    RUN_TEST(test_collapse_linker_chain);
 }
