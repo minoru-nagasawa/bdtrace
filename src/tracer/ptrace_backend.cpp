@@ -28,6 +28,8 @@
 namespace bdtrace {
 
 static volatile sig_atomic_t g_child_pid = 0;
+static struct sigaction g_old_sigint;
+static struct sigaction g_old_sigterm;
 
 static void signal_handler(int sig) {
     if (g_child_pid > 0) {
@@ -76,8 +78,8 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
-    sigaction(SIGINT, &sa, 0);
-    sigaction(SIGTERM, &sa, 0);
+    sigaction(SIGINT, &sa, &g_old_sigint);
+    sigaction(SIGTERM, &sa, &g_old_sigterm);
 
     // Wait for child's initial SIGSTOP
     int status;
@@ -183,6 +185,11 @@ int PtraceBackend::run_event_loop() {
             PT(PTRACE_SYSCALL, pid, 0, (long)sig);
         }
     }
+
+    // Restore original signal handlers and clear stale PID
+    g_child_pid = 0;
+    sigaction(SIGINT, &g_old_sigint, 0);
+    sigaction(SIGTERM, &g_old_sigterm, 0);
 
     session_.finalize();
     return 0;

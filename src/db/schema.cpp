@@ -20,7 +20,9 @@ const char* get_schema_sql() {
         "  peak_rss_kb INTEGER DEFAULT 0,"
         "  io_read_bytes INTEGER DEFAULT 0,"
         "  io_write_bytes INTEGER DEFAULT 0,"
-        "  cwd TEXT DEFAULT ''"
+        "  cwd TEXT DEFAULT '',"
+        "  file_count INTEGER DEFAULT 0,"
+        "  fail_count INTEGER DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
         "CREATE TABLE IF NOT EXISTS file_accesses ("
@@ -42,6 +44,7 @@ const char* get_schema_sql() {
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
+        "CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename);"
         ;
 }
 
@@ -73,6 +76,13 @@ const char* get_schema_v3_upgrade_sql() {
 const char* get_schema_v4_upgrade_sql() {
     return
         "ALTER TABLE processes ADD COLUMN cwd TEXT DEFAULT '';"
+        ;
+}
+
+const char* get_schema_v5_upgrade_sql() {
+    return
+        "ALTER TABLE processes ADD COLUMN file_count INTEGER DEFAULT 0;"
+        "ALTER TABLE processes ADD COLUMN fail_count INTEGER DEFAULT 0;"
         ;
 }
 

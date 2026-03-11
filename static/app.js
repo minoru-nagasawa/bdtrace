@@ -15,14 +15,52 @@ var App = (function() {
     if (cache[path]) { cb(cache[path]); return; }
     var xhr = new XMLHttpRequest();
     xhr.open('GET', path);
+    xhr.timeout = 60000; // 60 second timeout
     xhr.onload = function() {
       if (xhr.status === 200) {
-        var data = JSON.parse(xhr.responseText);
-        cache[path] = data;
-        cb(data);
+        try {
+          var data = JSON.parse(xhr.responseText);
+          cache[path] = data;
+          cb(data);
+        } catch (e) {
+          showError('Failed to parse response from ' + path);
+        }
+      } else {
+        showError('Server error: ' + xhr.status + ' for ' + path);
       }
     };
+    xhr.onerror = function() {
+      showError('Network error: could not reach server');
+    };
+    xhr.ontimeout = function() {
+      showError('Request timed out for ' + path + ' (60s)');
+    };
     xhr.send();
+  }
+
+  function showError(msg) {
+    var app = document.getElementById('app');
+    var existing = app.querySelector('.loading');
+    if (existing) {
+      existing.className = 'loading error';
+      existing.textContent = msg;
+    } else {
+      app.innerHTML = '<div class="loading error">' + msg + '</div>';
+    }
+  }
+
+  function startLoadingTimer(container) {
+    var loadingEl = container.querySelector('.loading');
+    if (!loadingEl) return null;
+    var start = Date.now();
+    var timerEl = document.createElement('span');
+    timerEl.className = 'elapsed';
+    loadingEl.appendChild(timerEl);
+    var timer = setInterval(function() {
+      var sec = ((Date.now() - start) / 1000).toFixed(0);
+      timerEl.textContent = sec + 's elapsed';
+    }, 1000);
+    return timer;
   }
 
   function el(tag, attrs, children) {
@@ -142,13 +180,21 @@ var App = (function() {
 
   // ---- Tree control helpers ----
   function expandAll(registry) {
-    var prev = 0;
-    while (registry.length > prev) {
-      prev = registry.length;
+    var pending = 0;
+    function tryExpand() {
+      var anyStarted = false;
       for (var i = 0; i < registry.length; i++) {
-        if (registry[i].hasChildren) registry[i].expand();
+        if (registry[i].hasChildren && !registry[i].isExpanded()) {
+          anyStarted = true;
+          pending++;
+          registry[i].expand(function() {
+            pending--;
+            if (pending === 0) tryExpand();
+          });
+        }
       }
     }
+    tryExpand();
   }
 
   function collapseAll(registry) {
@@ -175,8 +221,10 @@ var App = (function() {
   function renderSummary() {
     var app = document.getElementById('app');
     app.innerHTML = '<div class="loading">Loading...</div>';
+    var loadTimer = startLoadingTimer(app);
 
     api('/api/summary', function(s) {
+      if (loadTimer) clearInterval(loadTimer);
       app.innerHTML = '';
 
       var row = el('div', {className: 'kpi-row'}, [
@@ -353,7 +401,7 @@ var App = (function() {
     var app = document.getElementById('app');
     app.innerHTML = '<div class="loading">Loading...</div>';
 
-    api('/api/processes', function(data) {
+    api('/api/processes?lazy=1', function(data) {
       app.innerHTML = '';
       var wrapper = el('div');
       viewDom['processes'] = wrapper;
@@ -385,7 +433,7 @@ var App = (function() {
     }
 
     var nodeRegistry = [];
-    var ctx = { procMap: procMap, childMap: data.children_map, totalDur: totalDur, totalCpu: totalCpu, minStart: minStart };
+    var ctx = { procMap: procMap, totalDur: totalDur, totalCpu: totalCpu, minStart: minStart };
 
     // Toolbar with column selector
     var colSelector = makeColumnSelector();
@@ -433,8 +481,7 @@ var App = (function() {
     var proc = ctx.procMap[pid];
     if (!proc) return el('li');
     var dur = proc.end_time_us - proc.start_time_us;
-    var children = ctx.childMap[pid] || [];
-    var hasChildren = children.length > 0;
+    var hasChildren = !!proc.has_children;
     var expanded = false;
 
     var li = el('li');
@@ -477,39 +524,63 @@ var App = (function() {
 
     var childUl = null;
 
-    function ensureChildren() {
-      if (!childUl && hasChildren) {
-        childUl = el('ul');
-        // Virtual "(process only)" node to show self-only file accesses
-        var selfLi = el('li');
-        var selfNode = el('div', {className: 'node'});
-        var selfTree = el('span', {className: 'node-tree'});
-        if (depth + 1 > 0) selfTree.style.paddingLeft = ((depth + 1) * 16) + 'px';
-        selfTree.appendChild(el('span', {className: 'toggle'}, ' '));
-        selfTree.appendChild(el('span', {className: 'cmd', style: 'font-style:italic;color:var(--fg2)'}, '(process only)'));
-        selfNode.appendChild(selfTree);
-        selfNode.onclick = function(e) {
-          e.stopPropagation();
-          var prev = document.querySelector('.tree .node.selected');
-          if (prev) prev.className = prev.className.replace(' selected', '');
-          selfNode.className += ' selected';
-          showProcessDetail(pid, proc, rightPanel, ctx.minStart, true);
-        };
-        selfLi.appendChild(selfNode);
-        childUl.appendChild(selfLi);
-        for (var c = 0; c < children.length; c++) {
-          childUl.appendChild(buildTreeNode(children[c], ctx, rightPanel, registry, depth + 1));
+    var childrenLoaded = false;
+
+    function ensureChildren(cb) {
+      if (childUl) { if (cb) cb(); return; }
+      if (!hasChildren) { if (cb) cb(); return; }
+      childUl = el('ul');
+      // Virtual "(process only)" node to show self-only file accesses
+      var selfLi = el('li');
+      var selfNode = el('div', {className: 'node'});
+      var selfTree = el('span', {className: 'node-tree'});
+      if (depth + 1 > 0) selfTree.style.paddingLeft = ((depth + 1) * 16) + 'px';
+      selfTree.appendChild(el('span', {className: 'toggle'}, ' '));
+      selfTree.appendChild(el('span', {className: 'cmd', style: 'font-style:italic;color:var(--fg2)'}, '(process only)'));
+      selfNode.appendChild(selfTree);
+      selfNode.onclick = function(e) {
+        e.stopPropagation();
+        var prev = document.querySelector('.tree .node.selected');
+        if (prev) prev.className = prev.className.replace(' selected', '');
+        selfNode.className += ' selected';
+        showProcessDetail(pid, proc, rightPanel, ctx.minStart, true);
+      };
+      selfLi.appendChild(selfNode);
+      childUl.appendChild(selfLi);
+
+      // Add loading indicator
+      var loadingLi = el('li');
+      loadingLi.appendChild(el('div', {className: 'loading', style: 'padding:8px;text-align:left'}, 'Loading...'));
+      childUl.appendChild(loadingLi);
+      li.appendChild(childUl);
+
+      // Fetch children from API
+      api('/api/processes/' + pid + '/children', function(childProcs) {
+        // Remove loading indicator
+        if (loadingLi.parentNode) loadingLi.parentNode.removeChild(loadingLi);
+
+        // Update ctx.procMap with new children
+        for (var c = 0; c < childProcs.length; c++) {
+          ctx.procMap[childProcs[c].pid] = childProcs[c];
         }
-        li.appendChild(childUl);
-      }
+
+        // Build child tree nodes
+        for (var c = 0; c < childProcs.length; c++) {
+          childUl.appendChild(buildTreeNode(childProcs[c].pid, ctx, rightPanel, registry, depth + 1));
+        }
+        childrenLoaded = true;
+        if (cb) cb();
+      });
     }
 
-    function doExpand() {
-      if (!hasChildren || expanded) return;
+    function doExpand(onDone) {
+      if (!hasChildren || expanded) { if (onDone) onDone(); return; }
       expanded = true;
       toggle.textContent = '-';
-      ensureChildren();
-      childUl.style.display = '';
+      ensureChildren(function() {
+        if (childUl) childUl.style.display = '';
+        if (onDone) onDone();
+      });
     }
 
     function doCollapse() {
@@ -519,8 +590,9 @@ var App = (function() {
       if (childUl) childUl.style.display = 'none';
     }
 
+    var regEntry = { expand: doExpand, collapse: doCollapse, hasChildren: hasChildren, isExpanded: function() { return expanded; } };
     if (registry) {
-      registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+      registry.push(regEntry);
     }
 
     node.onclick = function(e) {
@@ -551,70 +623,127 @@ var App = (function() {
     container.appendChild(el('div', {className: 'loading'}, 'Loading files...'));
     panel.appendChild(container);
 
-    var url = '/api/processes/' + pid + '/files';
-    if (!selfOnly) url += '?tree=1';
-    api(url, function(files) {
+    var baseUrl = '/api/processes/' + pid + '/filedirs?prefix=/';
+    if (!selfOnly) baseUrl += '&tree=1';
+    api(baseUrl, function(data) {
       container.innerHTML = '';
       container.appendChild(renderProcInfo(proc, minStart));
 
-      if (files.length === 0) {
+      if (data.entries.length === 0) {
         container.appendChild(el('div', {style: 'color:var(--fg2)'}, 'No file accesses'));
         return;
       }
 
-      var fileMap = {};
-      for (var i = 0; i < files.length; i++) {
-        var f = files[i];
-        if (!fileMap[f.filename]) {
-          fileMap[f.filename] = {modes: {}, count: 0, fds: {}};
-        }
-        fileMap[f.filename].count++;
-        fileMap[f.filename].modes[f.mode_str] = true;
-        if (f.fd >= 0) fileMap[f.filename].fds[f.fd] = true;
-      }
-
-      var absTree = {}, relTree = {};
-      var filenames = Object.keys(fileMap);
-      for (var i = 0; i < filenames.length; i++) {
-        var fname = filenames[i];
-        var isAbs = fname.charAt(0) === '/';
-        var parts = fname.split('/').filter(function(p) { return p !== ''; });
-        var node = isAbs ? absTree : relTree;
-        for (var p = 0; p < parts.length; p++) {
-          if (!node[parts[p]]) node[parts[p]] = {_info: null, _children: {}};
-          if (p === parts.length - 1) {
-            node[parts[p]]._info = fileMap[fname];
-          } else {
-            node = node[parts[p]]._children;
-          }
-        }
-      }
-
-      var tree = {};
-      if (Object.keys(absTree).length > 0) {
-        tree['/'] = {_info: null, _children: absTree};
-      }
-      var relKeys = Object.keys(relTree);
-      for (var i = 0; i < relKeys.length; i++) {
-        tree[relKeys[i]] = relTree[relKeys[i]];
-      }
-
-      // Toolbar for proc file tree
       var pfRegistry = [];
       container.appendChild(makeTreeToolbar(pfRegistry));
 
       var fileHdr = el('div', {className: 'tree-header'});
-      fileHdr.appendChild(el('span', {className: 'th-tree'}, 'File'));
-      fileHdr.appendChild(el('span', {className: 'th-col'}, 'Mode'));
-      fileHdr.appendChild(el('span', {className: 'th-col th-exit'}, 'Count'));
+      fileHdr.appendChild(el('span', {className: 'th-tree', style: 'flex:1'}, 'File'));
+      var hdrCols = el('span', {className: 'node-cols'});
+      hdrCols.appendChild(el('span', {className: 'th-col'}, 'Mode'));
+      hdrCols.appendChild(el('span', {className: 'th-col th-exit'}, 'Count'));
+      fileHdr.appendChild(hdrCols);
       container.appendChild(fileHdr);
 
       var treeDiv = el('div', {className: 'tree'});
-      treeDiv.appendChild(buildProcFileTree(tree, pfRegistry, 0));
+      // Wrap under a "/" root node
+      var rootEntry = {name: '/', type: 'dir', count: data.total_count, reads: 0, writes: 0};
+      for (var ei = 0; ei < data.entries.length; ei++) {
+        rootEntry.reads += data.entries[ei].reads;
+        rootEntry.writes += data.entries[ei].writes;
+      }
+      treeDiv.appendChild(buildLazyFileTree([rootEntry], '', pid, selfOnly, pfRegistry, 0, data.entries));
       container.appendChild(treeDiv);
 
-      container.appendChild(el('div', {style: 'margin-top:8px;color:var(--fg2);font-size:11px'}, filenames.length + ' unique files, ' + files.length + ' total accesses'));
+      container.appendChild(el('div', {style: 'margin-top:8px;color:var(--fg2);font-size:11px'}, data.total_count + ' total accesses'));
     });
+  }
+
+  function buildLazyFileTree(entries, prefix, pid, selfOnly, registry, depth, preloadedChildren) {
+    var ul = el('ul');
+    entries.sort(function(a, b) {
+      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+    for (var i = 0; i < entries.length; i++) {
+      (function(entry, myPreloaded) {
+        var isDir = entry.type === 'dir';
+        var li = el('li');
+        var node = el('div', {className: 'node'});
+        if (depth > 0) node.style.paddingLeft = (depth * 16 + 6) + 'px';
+
+        var toggle = el('span', {className: 'toggle'}, isDir ? '+' : ' ');
+        var nameSpan = el('span', {className: 'cmd cmd-file'}, entry.name + (isDir && entry.name !== '/' ? '/' : ''));
+        node.appendChild(toggle);
+        node.appendChild(nameSpan);
+
+        var modeStr = '';
+        if (entry.reads > 0 && entry.writes > 0) modeStr = 'Read,Write';
+        else if (entry.reads > 0) modeStr = 'Read';
+        else if (entry.writes > 0) modeStr = 'Write';
+        var cols = el('span', {className: 'node-cols'});
+        cols.appendChild(el('span', {className: 'col-num'}, modeStr));
+        cols.appendChild(el('span', {className: 'col-num col-exit'}, entry.count > 1 ? 'x' + entry.count : '1'));
+        node.appendChild(cols);
+
+        var childUl = null;
+        var expanded = false;
+        var childrenLoaded = false;
+
+        function doExpand(cb) {
+          if (!isDir || expanded) { if (cb) cb(); return; }
+          expanded = true;
+          toggle.textContent = '-';
+          if (childrenLoaded) {
+            if (childUl) childUl.style.display = '';
+            if (cb) cb();
+            return;
+          }
+          if (myPreloaded) {
+            var childPrefix = prefix + entry.name + (entry.name === '/' ? '' : '/');
+            childUl = buildLazyFileTree(myPreloaded, childPrefix, pid, selfOnly, registry, depth + 1);
+            li.appendChild(childUl);
+            childrenLoaded = true;
+            if (cb) cb();
+            return;
+          }
+          var loadingEl = el('div', {className: 'loading', style: 'padding-left:' + ((depth + 1) * 16 + 6) + 'px'}, 'Loading...');
+          li.appendChild(loadingEl);
+          var childPrefix = prefix + entry.name + '/';
+          var fetchUrl = '/api/processes/' + pid + '/filedirs?prefix=' + encodeURIComponent(childPrefix);
+          if (!selfOnly) fetchUrl += '&tree=1';
+          api(fetchUrl, function(childData) {
+            if (loadingEl.parentNode) loadingEl.parentNode.removeChild(loadingEl);
+            childUl = buildLazyFileTree(childData.entries, childPrefix, pid, selfOnly, registry, depth + 1);
+            li.appendChild(childUl);
+            childrenLoaded = true;
+            if (cb) cb();
+          });
+        }
+
+        function doCollapse() {
+          if (!isDir || !expanded) return;
+          expanded = false;
+          toggle.textContent = '+';
+          if (childUl) childUl.style.display = 'none';
+        }
+
+        if (registry) {
+          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: isDir, isExpanded: function() { return expanded; } });
+        }
+
+        node.onclick = function(e) {
+          e.stopPropagation();
+          if (isDir) {
+            if (expanded) doCollapse(); else doExpand();
+          }
+        };
+
+        li.appendChild(node);
+        ul.appendChild(li);
+      })(entries[i], i === 0 ? preloadedChildren : undefined);
+    }
+    return ul;
   }
 
   // Shared proc info renderer (used in both Processes detail and Files detail)
@@ -981,8 +1110,10 @@ var App = (function() {
   function renderBottlenecks() {
     var app = document.getElementById('app');
     app.innerHTML = '<div class="loading">Loading...</div>';
+    var loadTimer = startLoadingTimer(app);
 
     api('/api/slowest?group_by=cmd_name', function(data) {
+      if (loadTimer) clearInterval(loadTimer);
       app.innerHTML = '';
       app.appendChild(el('div', {className: 'section-title'}, 'Bottleneck Analysis (grouped by command)'));
 
@@ -1238,9 +1369,11 @@ var App = (function() {
 
   function loadAnalysisTab(idx, content) {
     content.innerHTML = '<div class="loading">Loading...</div>';
+    var loadTimer = startLoadingTimer(content);
 
     if (idx === 0) {
       api('/api/critical-path', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Critical Path'));
         if (!data.path || data.path.length === 0) {
@@ -1262,6 +1395,7 @@ var App = (function() {
       });
     } else if (idx === 1) {
       api('/api/hotspots?top=30&by_dir=0', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'File Access Hotspots'));
         if (!data || data.length === 0) {
@@ -1275,6 +1409,7 @@ var App = (function() {
       });
     } else if (idx === 2) {
       api('/api/failures', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Failed File Accesses'));
         if (!data.total || data.total === 0) {
@@ -1299,6 +1434,7 @@ var App = (function() {
       });
     } else if (idx === 3) {
       api('/api/diagnostics', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Auto Diagnostics'));
         if (!data.issues || data.issues.length === 0) {
@@ -1316,6 +1452,7 @@ var App = (function() {
       });
     } else if (idx === 4) {
       api('/api/impact?top=30', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Impact Ranking'));
         if (!data || data.length === 0) {
@@ -1330,6 +1467,7 @@ var App = (function() {
       });
     } else if (idx === 5) {
       api('/api/races', function(data) {
+        if (loadTimer) clearInterval(loadTimer);
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Race Condition Detection'));
         if (!data.races || data.races.length === 0) {
@@ -1343,6 +1481,7 @@ var App = (function() {
         content.appendChild(tbl);
       });
     } else if (idx === 6) {
+      if (loadTimer) clearInterval(loadTimer);
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Rebuild Estimator'));
 
@@ -1601,6 +1740,7 @@ var App = (function() {
         });
       };
     } else if (idx === 7) {
+      if (loadTimer) clearInterval(loadTimer);
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Reverse Dependencies'));
       var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});

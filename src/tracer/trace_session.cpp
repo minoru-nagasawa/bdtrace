@@ -6,7 +6,7 @@ namespace bdtrace {
 static const int BATCH_SIZE = 5000;
 
 TraceSession::TraceSession()
-    : event_count_(0), in_transaction_(false)
+    : event_count_(0), in_transaction_(false), finalized_(false)
 {}
 
 TraceSession::~TraceSession() {
@@ -78,6 +78,10 @@ void TraceSession::finalize() {
     if (in_transaction_) {
         db_.commit_transaction();
         in_transaction_ = false;
+    }
+    if (!finalized_) {
+        finalized_ = true;
+        db_.populate_counts();
     }
 }
 

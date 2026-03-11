@@ -151,12 +151,13 @@ static void handle_summary(struct mg_connection *c) {
     }
     int64_t total_us = max_time - min_time;
 
-    std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
+    std::map<int, int> mode_counts;
+    g_db->get_file_access_summary(mode_counts);
     int read_count = 0, write_count = 0;
-    for (size_t i = 0; i < all_fa.size(); ++i) {
-        if (is_input_mode(all_fa[i].mode)) ++read_count;
-        if (is_output_mode(all_fa[i].mode)) ++write_count;
+    for (std::map<int, int>::const_iterator it = mode_counts.begin();
+         it != mode_counts.end(); ++it) {
+        if (is_input_mode(it->first)) read_count += it->second;
+        if (is_output_mode(it->first)) write_count += it->second;
     }
 
     int max_parallel = 0;
@@ -210,84 +211,96 @@ static void handle_summary(struct mg_connection *c) {
     send_json(c, jw.str());
 }
 
-static void handle_processes(struct mg_connection *c) {
-    std::vector<ProcessRecord> procs;
-    g_db->get_all_processes(procs);
-    compact_runs(procs);
+static void write_process_json(JsonWriter& jw, const ProcessRecord& proc,
+                               bool has_children) {
+    jw.beginObject();
+    jw.key("pid").val(proc.pid);
+    jw.key("ppid").val(proc.ppid);
+    jw.key("cmdline").val(proc.cmdline);
+    jw.key("start_time_us").val(proc.start_time_us);
+    jw.key("end_time_us").val(proc.end_time_us);
+    jw.key("exit_code").val(proc.exit_code);
+    jw.key("file_count").val(proc.file_count);
+    jw.key("fail_count").val(proc.fail_count);
+    jw.key("has_children").val(has_children);
+    jw.key("user_time_us").val(proc.user_time_us);
+    jw.key("sys_time_us").val(proc.sys_time_us);
+    jw.key("peak_rss_kb").val(proc.peak_rss_kb);
+    jw.key("io_read_bytes").val(proc.io_read_bytes);
+    jw.key("io_write_bytes").val(proc.io_write_bytes);
+    jw.endObject();
+}
 
-    // Count file accesses per PID
-    std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
-    std::map<int, int> file_counts;
-    for (size_t i = 0; i < all_fa.size(); ++i) {
-        file_counts[all_fa[i].pid]++;
-    }
+static void handle_processes(struct mg_connection *c, const std::string& query) {
+    bool lazy = (get_query_param(query, "lazy") == "1");
 
-    // Count failed accesses per PID
-    std::vector<FailedAccessRecord> all_fails;
-    g_db->get_all_failed_accesses(all_fails);
-    std::map<int, int> fail_counts;
-    for (size_t i = 0; i < all_fails.size(); ++i) {
-        fail_counts[all_fails[i].pid]++;
-    }
-
-    std::set<int> pids;
-    std::map<int, std::vector<int> > children_map;
-    for (size_t i = 0; i < procs.size(); ++i) {
-        pids.insert(procs[i].pid);
-        children_map[procs[i].ppid].push_back(procs[i].pid);
-    }
-
-    std::vector<int> roots;
-    for (size_t i = 0; i < procs.size(); ++i) {
-        if (pids.find(procs[i].ppid) == pids.end()) {
-            roots.push_back(procs[i].pid);
-        }
-    }
+    // Get set of PIDs that have children (uses idx_proc_ppid)
+    std::set<int> has_children_set;
+    g_db->get_pids_with_children(has_children_set);
 
     JsonWriter jw;
     jw.beginObject();
 
-    jw.key("processes").beginArray();
-    for (size_t i = 0; i < procs.size(); ++i) {
-        std::map<int, int>::const_iterator fc_it = file_counts.find(procs[i].pid);
-        int fc = (fc_it != file_counts.end()) ? fc_it->second : 0;
-        jw.beginObject();
-        jw.key("pid").val(procs[i].pid);
-        jw.key("ppid").val(procs[i].ppid);
-        jw.key("cmdline").val(procs[i].cmdline);
-        jw.key("start_time_us").val(procs[i].start_time_us);
-        jw.key("end_time_us").val(procs[i].end_time_us);
-        jw.key("exit_code").val(procs[i].exit_code);
-        std::map<int, int>::const_iterator fl_it = fail_counts.find(procs[i].pid);
-        int fl = (fl_it != fail_counts.end()) ? fl_it->second : 0;
-        jw.key("file_count").val(fc);
-        jw.key("fail_count").val(fl);
-        jw.key("user_time_us").val(procs[i].user_time_us);
-        jw.key("sys_time_us").val(procs[i].sys_time_us);
-        jw.key("peak_rss_kb").val(procs[i].peak_rss_kb);
-        jw.key("io_read_bytes").val(procs[i].io_read_bytes);
-        jw.key("io_write_bytes").val(procs[i].io_write_bytes);
-        jw.endObject();
-    }
-    jw.endArray();
+    if (lazy) {
+        // Lazy mode: only root processes from DB
+        std::vector<ProcessRecord> roots;
+        g_db->get_root_processes(roots);
+        compact_runs(roots);
 
-    jw.key("roots").beginArray();
-    for (size_t i = 0; i < roots.size(); ++i) jw.val(roots[i]);
-    jw.endArray();
-
-    jw.key("children_map").beginObject();
-    for (std::map<int, std::vector<int> >::const_iterator it = children_map.begin();
-         it != children_map.end(); ++it) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%d", it->first);
-        jw.key(buf).beginArray();
-        for (size_t j = 0; j < it->second.size(); ++j) {
-            jw.val(it->second[j]);
+        jw.key("processes").beginArray();
+        for (size_t i = 0; i < roots.size(); ++i) {
+            bool hc = has_children_set.find(roots[i].pid) != has_children_set.end();
+            write_process_json(jw, roots[i], hc);
         }
         jw.endArray();
+
+        jw.key("roots").beginArray();
+        for (size_t i = 0; i < roots.size(); ++i) jw.val(roots[i].pid);
+        jw.endArray();
+    } else {
+        // Full mode: all processes with children_map
+        std::vector<ProcessRecord> procs;
+        g_db->get_all_processes(procs);
+        compact_runs(procs);
+
+        std::set<int> pids;
+        std::map<int, std::vector<int> > children_map;
+        for (size_t i = 0; i < procs.size(); ++i) {
+            pids.insert(procs[i].pid);
+            children_map[procs[i].ppid].push_back(procs[i].pid);
+        }
+
+        std::vector<int> roots;
+        for (size_t i = 0; i < procs.size(); ++i) {
+            if (pids.find(procs[i].ppid) == pids.end()) {
+                roots.push_back(procs[i].pid);
+            }
+        }
+
+        jw.key("processes").beginArray();
+        for (size_t i = 0; i < procs.size(); ++i) {
+            bool hc = has_children_set.find(procs[i].pid) != has_children_set.end();
+            write_process_json(jw, procs[i], hc);
+        }
+        jw.endArray();
+
+        jw.key("roots").beginArray();
+        for (size_t i = 0; i < roots.size(); ++i) jw.val(roots[i]);
+        jw.endArray();
+
+        jw.key("children_map").beginObject();
+        for (std::map<int, std::vector<int> >::const_iterator it = children_map.begin();
+             it != children_map.end(); ++it) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%d", it->first);
+            jw.key(buf).beginArray();
+            for (size_t j = 0; j < it->second.size(); ++j) {
+                jw.val(it->second[j]);
+            }
+            jw.endArray();
+        }
+        jw.endObject();
     }
-    jw.endObject();
 
     jw.endObject();
     send_json(c, jw.str());
@@ -302,6 +315,90 @@ static void collect_descendant_pids_web(int pid,
     for (size_t i = 0; i < it->second.size(); ++i) {
         collect_descendant_pids_web(it->second[i], children_map, pids);
     }
+}
+
+struct FileDirEntry {
+    int count;
+    int reads;
+    int writes;
+    bool is_dir;
+    FileDirEntry() : count(0), reads(0), writes(0), is_dir(false) {}
+};
+
+struct FileDirScanCtx {
+    const std::set<int>* pids;
+    std::map<std::string, FileDirEntry>* entries;
+    size_t prefix_len;
+    int total_count;
+};
+
+static void filedirs_scan_cb(int pid, const char* filename, int mode, void* user_data) {
+    FileDirScanCtx* ctx = static_cast<FileDirScanCtx*>(user_data);
+    if (ctx->pids->find(pid) == ctx->pids->end()) return;
+    if (!filename) return;
+
+    const char* rest = filename + ctx->prefix_len;
+    if (*rest == '\0') return;
+
+    const char* slash = std::strchr(rest, '/');
+    std::string name;
+    bool is_dir;
+    if (slash) {
+        name.assign(rest, slash - rest);
+        is_dir = true;
+    } else {
+        name = rest;
+        is_dir = false;
+    }
+    if (name.empty()) return;
+
+    FileDirEntry& e = (*ctx->entries)[name];
+    e.count++;
+    if (is_dir) e.is_dir = true;
+    if (is_input_mode(mode)) e.reads++;
+    if (is_output_mode(mode)) e.writes++;
+    ctx->total_count++;
+}
+
+static void handle_process_filedirs(struct mg_connection *c, int pid,
+                                     const std::string& query) {
+    std::string prefix = get_query_param(query, "prefix");
+    if (prefix.empty()) prefix = "/";
+    bool tree = get_query_param(query, "tree") == "1";
+
+    // Collect target PIDs
+    std::set<int> pids;
+    pids.insert(pid);
+    if (tree) {
+        g_db->get_descendant_pids(pid, pids);
+    }
+
+    // Stream scan: only pid, filename, mode — no full record allocation
+    std::map<std::string, FileDirEntry> entries;
+    FileDirScanCtx ctx;
+    ctx.pids = &pids;
+    ctx.entries = &entries;
+    ctx.prefix_len = prefix.size();
+    ctx.total_count = 0;
+    g_db->scan_file_accesses_by_prefix(prefix, filedirs_scan_cb, &ctx);
+
+    JsonWriter jw;
+    jw.beginObject();
+    jw.key("total_count").val(ctx.total_count);
+    jw.key("entries").beginArray();
+    for (std::map<std::string, FileDirEntry>::const_iterator it = entries.begin();
+         it != entries.end(); ++it) {
+        jw.beginObject();
+        jw.key("name").val(it->first);
+        jw.key("type").val(it->second.is_dir ? "dir" : "file");
+        jw.key("count").val(it->second.count);
+        jw.key("reads").val(it->second.reads);
+        jw.key("writes").val(it->second.writes);
+        jw.endObject();
+    }
+    jw.endArray();
+    jw.endObject();
+    send_json(c, jw.str());
 }
 
 static void handle_process_files(struct mg_connection *c, int pid,
@@ -345,21 +442,21 @@ static void handle_process_files(struct mg_connection *c, int pid,
     send_json(c, jw.str());
 }
 
-static void handle_process_children(struct mg_connection *c, int pid) {
+static void handle_process_children(struct mg_connection *c, int pid,
+                                     const std::string& query) {
+    (void)query;
     std::vector<ProcessRecord> children;
     g_db->get_children(pid, children);
+
+    // Single query: which PIDs have children (uses idx_proc_ppid)
+    std::set<int> has_children_set;
+    g_db->get_pids_with_children(has_children_set);
 
     JsonWriter jw;
     jw.beginArray();
     for (size_t i = 0; i < children.size(); ++i) {
-        jw.beginObject();
-        jw.key("pid").val(children[i].pid);
-        jw.key("ppid").val(children[i].ppid);
-        jw.key("cmdline").val(children[i].cmdline);
-        jw.key("start_time_us").val(children[i].start_time_us);
-        jw.key("end_time_us").val(children[i].end_time_us);
-        jw.key("exit_code").val(children[i].exit_code);
-        jw.endObject();
+        bool hc = has_children_set.find(children[i].pid) != has_children_set.end();
+        write_process_json(jw, children[i], hc);
     }
     jw.endArray();
     send_json(c, jw.str());
@@ -463,16 +560,12 @@ static void handle_files_by_path(struct mg_connection *c, const std::string& pat
 
 static void handle_files_by_prefix(struct mg_connection *c, const std::string& prefix) {
     std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
-
-    std::string pfx = prefix;
-    if (!pfx.empty() && pfx[pfx.size() - 1] != '/') pfx += '/';
+    g_db->get_file_accesses_by_prefix(prefix, all_fa);
 
     // Group by (pid, filename): merge modes, keep earliest timestamp
     typedef std::pair<int, std::string> PidFile;
     std::map<PidFile, PidAccess> grouped;
     for (size_t i = 0; i < all_fa.size(); ++i) {
-        if (all_fa[i].filename.compare(0, pfx.size(), pfx) != 0) continue;
         PidFile key(all_fa[i].pid, all_fa[i].filename);
         std::map<PidFile, PidAccess>::iterator it = grouped.find(key);
         if (it == grouped.end()) {
@@ -1405,14 +1498,18 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (uri == "/api/summary") {
         handle_summary(c);
     } else if (uri == "/api/processes") {
-        handle_processes(c);
+        handle_processes(c, query);
+    } else if (starts_with(uri, "/api/processes/") && uri.find("/filedirs") != std::string::npos) {
+        int pid = extract_pid_from_uri(uri, "/api/processes/", "/filedirs");
+        if (pid > 0) handle_process_filedirs(c, pid, query);
+        else send_error(c, 400, "Bad PID");
     } else if (starts_with(uri, "/api/processes/") && uri.find("/files") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/files");
         if (pid > 0) handle_process_files(c, pid, query);
         else send_error(c, 400, "Bad PID");
     } else if (starts_with(uri, "/api/processes/") && uri.find("/children") != std::string::npos) {
         int pid = extract_pid_from_uri(uri, "/api/processes/", "/children");
-        if (pid > 0) handle_process_children(c, pid);
+        if (pid > 0) handle_process_children(c, pid, query);
         else send_error(c, 400, "Bad PID");
     } else if (uri == "/api/files") {
         handle_files(c);

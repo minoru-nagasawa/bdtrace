@@ -45,11 +45,14 @@ struct ProcessRecord {
     int64_t peak_rss_kb;
     int64_t io_read_bytes;
     int64_t io_write_bytes;
+    int file_count;
+    int fail_count;
 
     ProcessRecord()
         : pid(0), ppid(0), start_time_us(0), end_time_us(0), exit_code(-1)
         , user_time_us(0), sys_time_us(0), peak_rss_kb(0)
-        , io_read_bytes(0), io_write_bytes(0) {}
+        , io_read_bytes(0), io_write_bytes(0)
+        , file_count(0), fail_count(0) {}
 };
 
 struct FileAccessRecord {

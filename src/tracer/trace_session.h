@@ -29,6 +29,7 @@ private:
     Database db_;
     int event_count_;
     bool in_transaction_;
+    bool finalized_;
 
     void maybe_commit();
 };

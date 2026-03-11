@@ -7,6 +7,7 @@ const char* get_schema_sql();
 const char* get_schema_v2_upgrade_sql();
 const char* get_schema_v3_upgrade_sql();
 const char* get_schema_v4_upgrade_sql();
+const char* get_schema_v5_upgrade_sql();
 
 } // namespace bdtrace
 

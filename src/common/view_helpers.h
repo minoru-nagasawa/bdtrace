@@ -31,6 +31,7 @@ void compact_runs(std::vector<ProcessRecord>& procs);
 struct DependencyGraph {
     std::map<std::string, std::set<int> > file_to_readers;
     std::map<int, std::set<std::string> > pid_to_outputs;
+    std::map<std::string, std::set<int> > file_to_writers;
     std::map<int, ProcessRecord> proc_map;
     std::map<int, std::vector<int> > pid_children;
 };

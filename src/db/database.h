@@ -3,6 +3,8 @@
 
 #include <string>
 #include <vector>
+#include <map>
+#include <set>
 #include <stdint.h>
 #include "../common/types.h"
 
@@ -46,6 +48,19 @@ public:
     bool get_file_accesses_by_name(const std::string& filename, std::vector<FileAccessRecord>& out);
     bool get_all_file_accesses(std::vector<FileAccessRecord>& out);
     bool get_all_failed_accesses(std::vector<FailedAccessRecord>& out);
+    bool get_root_processes(std::vector<ProcessRecord>& out);
+    bool get_pids_with_children(std::set<int>& out);
+    bool get_descendant_pids(int root_pid, std::set<int>& out);
+    bool populate_counts();
+    bool get_file_count_by_pid(std::map<int, int>& out);
+    bool get_failed_count_by_pid(std::map<int, int>& out);
+    bool get_file_access_summary(std::map<int, int>& mode_counts);
+    bool get_file_accesses_by_prefix(const std::string& prefix, std::vector<FileAccessRecord>& out);
+
+    // Lightweight: callback receives (pid, filename, mode) for each row in range
+    // Returns number of rows processed, or -1 on error
+    typedef void (*FileScanCallback)(int pid, const char* filename, int mode, void* user_data);
+    int scan_file_accesses_by_prefix(const std::string& prefix, FileScanCallback cb, void* user_data);
     int get_process_count();
     int get_file_access_count();
     int get_failed_access_count();

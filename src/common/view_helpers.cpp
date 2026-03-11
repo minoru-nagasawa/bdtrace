@@ -382,11 +382,22 @@ void build_dependency_graph(Database& db, DependencyGraph& g) {
         }
         if (is_output_mode(fa.mode)) {
             g.pid_to_outputs[fa.pid].insert(fa.filename);
+            g.file_to_writers[fa.filename].insert(fa.pid);
         }
     }
     for (size_t i = 0; i < all_procs.size(); ++i) {
         g.proc_map[all_procs[i].pid] = all_procs[i];
         g.pid_children[all_procs[i].ppid].push_back(all_procs[i].pid);
+    }
+
+    // Pre-compute which PIDs read any file (for efficient shell redirect fixup)
+    std::set<int> pid_reads_any;
+    for (std::map<std::string, std::set<int> >::const_iterator fit =
+             g.file_to_readers.begin(); fit != g.file_to_readers.end(); ++fit) {
+        for (std::set<int>::const_iterator sit = fit->second.begin();
+             sit != fit->second.end(); ++sit) {
+            pid_reads_any.insert(*sit);
+        }
     }
 
     // Shell redirect fixup: when a child process has no outputs but reads
@@ -407,15 +418,7 @@ void build_dependency_graph(Database& db, DependencyGraph& g) {
             if (g.pid_to_outputs.find(child) != g.pid_to_outputs.end())
                 continue;
             // Only propagate if child reads files (is a real worker process)
-            if (g.file_to_readers.empty()) continue;
-            bool child_reads = false;
-            for (std::map<std::string, std::set<int> >::const_iterator fit =
-                     g.file_to_readers.begin(); fit != g.file_to_readers.end(); ++fit) {
-                if (fit->second.find(child) != fit->second.end()) {
-                    child_reads = true;
-                    break;
-                }
-            }
+            bool child_reads = (pid_reads_any.find(child) != pid_reads_any.end());
             if (!child_reads) continue;
 
             // Propagate parent's outputs to this child
@@ -423,6 +426,7 @@ void build_dependency_graph(Database& db, DependencyGraph& g) {
             for (std::set<std::string>::const_iterator fi = pouts.begin();
                  fi != pouts.end(); ++fi) {
                 g.pid_to_outputs[child].insert(*fi);
+                g.file_to_writers[*fi].insert(child);
             }
         }
     }
@@ -659,14 +663,10 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result) {
         const std::set<int>& readers = fit->second;
 
         // Find writers for this file
-        std::set<int> writers;
-        for (std::map<int, std::set<std::string> >::const_iterator pit =
-                 g.pid_to_outputs.begin(); pit != g.pid_to_outputs.end(); ++pit) {
-            if (pit->second.find(file) != pit->second.end()) {
-                writers.insert(pit->first);
-            }
-        }
-        if (writers.empty()) continue;
+        std::map<std::string, std::set<int> >::const_iterator wit =
+            g.file_to_writers.find(file);
+        if (wit == g.file_to_writers.end()) continue;
+        const std::set<int>& writers = wit->second;
 
         for (std::set<int>::const_iterator wi = writers.begin();
              wi != writers.end(); ++wi) {

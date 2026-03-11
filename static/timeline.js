@@ -332,6 +332,10 @@ var TimelineRenderer = (function() {
     canvas.addEventListener('mousemove', function(e) {
       if (dragStartX >= 0) return; // handled by document listener
 
+      var rect = canvas.getBoundingClientRect();
+      var mx = e.clientX - rect.left;
+      var my = e.clientY - rect.top;
+
       // Hover
       var rowIdx = Math.floor((my - ROW_H + scrollY) / ROW_H);
       if (rowIdx >= 0 && rowIdx < rows.length && my > ROW_H) {

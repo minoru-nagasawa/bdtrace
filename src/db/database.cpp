@@ -4,6 +4,7 @@
 #include "../../vendor/sqlite3.h"
 
 #include <cstring>
+#include <map>
 
 namespace bdtrace {
 
@@ -103,6 +104,23 @@ bool Database::upgrade_schema() {
             sqlite3_finalize(stmt);
         }
     }
+
+    // Check if file_count column exists; if not, upgrade to v5
+    {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(db_, "SELECT file_count FROM processes LIMIT 0", -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            LOG_INFO("Upgrading schema to v5 (denormalized counts)...");
+            exec("ALTER TABLE processes ADD COLUMN file_count INTEGER DEFAULT 0");
+            exec("ALTER TABLE processes ADD COLUMN fail_count INTEGER DEFAULT 0");
+            populate_counts();
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // Ensure failed_accesses filename index exists (added retroactively)
+    exec("CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename)");
 
     return true;
 }
@@ -280,12 +298,16 @@ static ProcessRecord row_to_process(sqlite3_stmt* stmt) {
         const char* cwd = (const char*)sqlite3_column_text(stmt, 11);
         if (cwd) r.cwd = cwd;
     }
+    if (col_count > 13) {
+        r.file_count = sqlite3_column_int(stmt, 12);
+        r.fail_count = sqlite3_column_int(stmt, 13);
+    }
     return r;
 }
 
 bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd, file_count, fail_count FROM processes ORDER BY start_time_us", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         out.push_back(row_to_process(stmt));
@@ -296,7 +318,7 @@ bool Database::get_all_processes(std::vector<ProcessRecord>& out) {
 
 bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd, file_count, fail_count FROM processes WHERE ppid = ? ORDER BY start_time_us", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, ppid);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -308,7 +330,7 @@ bool Database::get_children(int ppid, std::vector<ProcessRecord>& out) {
 
 bool Database::get_process(int pid, ProcessRecord& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd FROM processes WHERE pid = ?", &stmt))
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, cwd, file_count, fail_count FROM processes WHERE pid = ?", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, pid);
     bool found = false;
@@ -318,6 +340,61 @@ bool Database::get_process(int pid, ProcessRecord& out) {
     }
     sqlite3_finalize(stmt);
     return found;
+}
+
+bool Database::get_root_processes(std::vector<ProcessRecord>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, "
+                 "user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, "
+                 "cwd, file_count, fail_count FROM processes "
+                 "WHERE ppid NOT IN (SELECT pid FROM processes) "
+                 "ORDER BY start_time_us", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out.push_back(row_to_process(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_pids_with_children(std::set<int>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT DISTINCT ppid FROM processes", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out.insert(sqlite3_column_int(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_descendant_pids(int root_pid, std::set<int>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare(
+            "WITH RECURSIVE descendants(pid) AS ("
+            "  SELECT pid FROM processes WHERE ppid = ?"
+            "  UNION ALL"
+            "  SELECT p.pid FROM processes p"
+            "    JOIN descendants d ON p.ppid = d.pid"
+            ") SELECT pid FROM descendants", &stmt))
+        return false;
+    sqlite3_bind_int(stmt, 1, root_pid);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out.insert(sqlite3_column_int(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::populate_counts() {
+    if (!db_) return false;
+    if (!exec("UPDATE processes SET file_count = "
+              "(SELECT COUNT(*) FROM file_accesses WHERE file_accesses.pid = processes.pid)"))
+        return false;
+    if (!exec("UPDATE processes SET fail_count = "
+              "(SELECT COUNT(*) FROM failed_accesses WHERE failed_accesses.pid = processes.pid)"))
+        return false;
+    return true;
 }
 
 static FileAccessRecord row_to_file_access(sqlite3_stmt* stmt) {
@@ -383,6 +460,91 @@ bool Database::get_all_failed_accesses(std::vector<FailedAccessRecord>& out) {
     }
     sqlite3_finalize(stmt);
     return true;
+}
+
+bool Database::get_file_count_by_pid(std::map<int, int>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, COUNT(*) FROM file_accesses GROUP BY pid", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out[sqlite3_column_int(stmt, 0)] = sqlite3_column_int(stmt, 1);
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_failed_count_by_pid(std::map<int, int>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, COUNT(*) FROM failed_accesses GROUP BY pid", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out[sqlite3_column_int(stmt, 0)] = sqlite3_column_int(stmt, 1);
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_file_access_summary(std::map<int, int>& mode_counts) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT mode, COUNT(*) FROM file_accesses GROUP BY mode", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        mode_counts[sqlite3_column_int(stmt, 0)] = sqlite3_column_int(stmt, 1);
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_file_accesses_by_prefix(const std::string& prefix, std::vector<FileAccessRecord>& out) {
+    std::string pfx = prefix;
+    if (!pfx.empty() && pfx[pfx.size() - 1] != '/') pfx += '/';
+    // Calculate upper bound for range query: increment last char
+    std::string upper = pfx;
+    if (!upper.empty()) {
+        upper[upper.size() - 1] = upper[upper.size() - 1] + 1;
+    }
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE filename >= ? AND filename < ?", &stmt))
+        return false;
+    sqlite3_bind_text(stmt, 1, pfx.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, upper.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        FileAccessRecord r;
+        r.pid = sqlite3_column_int(stmt, 0);
+        r.filename = (const char*)sqlite3_column_text(stmt, 1);
+        r.mode = static_cast<FileAccessMode>(sqlite3_column_int(stmt, 2));
+        r.fd = sqlite3_column_int(stmt, 3);
+        r.timestamp_us = sqlite3_column_int64(stmt, 4);
+        out.push_back(r);
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+int Database::scan_file_accesses_by_prefix(const std::string& prefix,
+                                           FileScanCallback cb, void* user_data) {
+    std::string pfx = prefix;
+    if (!pfx.empty() && pfx[pfx.size() - 1] != '/') pfx += '/';
+    std::string upper = pfx;
+    if (!upper.empty()) {
+        upper[upper.size() - 1] = upper[upper.size() - 1] + 1;
+    }
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, filename, mode FROM file_accesses "
+                 "WHERE filename >= ? AND filename < ?", &stmt))
+        return -1;
+    sqlite3_bind_text(stmt, 1, pfx.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, upper.c_str(), -1, SQLITE_TRANSIENT);
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int pid = sqlite3_column_int(stmt, 0);
+        const char* fn = (const char*)sqlite3_column_text(stmt, 1);
+        int mode = sqlite3_column_int(stmt, 2);
+        cb(pid, fn, mode, user_data);
+        ++count;
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 int Database::get_process_count() {

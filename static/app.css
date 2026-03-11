@@ -186,6 +186,7 @@ tr:hover td { background: var(--bg3); }
 
 .tree .pid { color: var(--fg2); font-size: 11px; flex-shrink: 0; }
 .tree .cmd { color: var(--fg); flex-shrink: 0; }
+.tree .cmd.cmd-file { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tree .dur { color: var(--accent2); font-size: 11px; margin-left: auto; }
 .tree .exit-err { color: var(--red); }
 .tree .slow { color: var(--orange); }
@@ -203,6 +204,7 @@ tr:hover td { background: var(--bg3); }
   flex-shrink: 0;
   margin-left: auto;
   padding-left: 8px;
+  gap: 12px;
 }
 
 /* Tree grid columns */
@@ -377,6 +379,38 @@ tr:hover td { background: var(--bg3); }
   text-align: center;
   padding: 40px;
   color: var(--fg2);
+}
+
+.loading::before {
+  content: '';
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading .elapsed {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--fg2);
+  opacity: 0.7;
+}
+
+.loading.error::before {
+  display: none;
+}
+.loading.error {
+  color: var(--red);
 }
 
 /* Column selector menu */
