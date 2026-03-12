@@ -25,6 +25,7 @@ const char* get_schema_sql() {
         "  fail_count INTEGER DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
+        "CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us);"
         "CREATE TABLE IF NOT EXISTS file_accesses ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  pid INTEGER NOT NULL,"

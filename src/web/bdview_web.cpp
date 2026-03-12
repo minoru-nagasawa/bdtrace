@@ -28,13 +28,6 @@ static Database* g_db = NULL;
 static std::string g_static_dir;
 
 // --- Structs (must be at file scope for C++03 template compatibility) ---
-struct FileStat {
-    int access_count;
-    int read_count;
-    int write_count;
-    std::set<int> pids;
-    FileStat() : access_count(0), read_count(0), write_count(0) {}
-};
 
 struct AccumData {
     int total;
@@ -64,6 +57,15 @@ struct DfsEntry {
     int pid;
     int depth;
 };
+
+// Callback context for hotspot directory aggregation
+struct HotspotDirScanCtx {
+    std::map<std::string, AccumData> accum;
+};
+
+static bool cmp_hotspot_desc(const HotspotEntry& a, const HotspotEntry& b) {
+    return a.total > b.total;
+}
 
 // --- Helpers ---
 static bool cmp_start_time(const ProcessRecord& a, const ProcessRecord& b) {
@@ -306,17 +308,6 @@ static void handle_processes(struct mg_connection *c, const std::string& query) 
     send_json(c, jw.str());
 }
 
-static void collect_descendant_pids_web(int pid,
-    const std::map<int, std::vector<int> >& children_map,
-    std::vector<int>& pids) {
-    pids.push_back(pid);
-    std::map<int, std::vector<int> >::const_iterator it = children_map.find(pid);
-    if (it == children_map.end()) return;
-    for (size_t i = 0; i < it->second.size(); ++i) {
-        collect_descendant_pids_web(it->second[i], children_map, pids);
-    }
-}
-
 struct FileDirEntry {
     int count;
     int reads;
@@ -407,22 +398,11 @@ static void handle_process_files(struct mg_connection *c, int pid,
 
     std::vector<FileAccessRecord> accesses;
     if (tree) {
-        // Build children map from all processes
-        std::vector<ProcessRecord> all_procs;
-        g_db->get_all_processes(all_procs);
-        std::map<int, std::vector<int> > children_map;
-        for (size_t i = 0; i < all_procs.size(); ++i) {
-            children_map[all_procs[i].ppid].push_back(all_procs[i].pid);
-        }
-        // Collect all descendant PIDs
-        std::vector<int> pids;
-        collect_descendant_pids_web(pid, children_map, pids);
-        // Fetch file accesses for all PIDs
-        for (size_t i = 0; i < pids.size(); ++i) {
-            std::vector<FileAccessRecord> fa;
-            g_db->get_file_accesses_by_pid(pids[i], fa);
-            accesses.insert(accesses.end(), fa.begin(), fa.end());
-        }
+        // Use recursive CTE + batch query instead of N+1
+        std::set<int> desc_pids;
+        g_db->get_descendant_pids(pid, desc_pids);
+        desc_pids.insert(pid);
+        g_db->get_file_accesses_by_pids(desc_pids, accesses);
     } else {
         g_db->get_file_accesses_by_pid(pid, accesses);
     }
@@ -463,28 +443,18 @@ static void handle_process_children(struct mg_connection *c, int pid,
 }
 
 static void handle_files(struct mg_connection *c) {
-    std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
-
-    std::map<std::string, FileStat> file_map;
-    for (size_t i = 0; i < all_fa.size(); ++i) {
-        FileStat& fs = file_map[all_fa[i].filename];
-        fs.access_count++;
-        if (is_input_mode(all_fa[i].mode)) fs.read_count++;
-        if (is_output_mode(all_fa[i].mode)) fs.write_count++;
-        fs.pids.insert(all_fa[i].pid);
-    }
+    std::vector<FileStatRow> stats;
+    g_db->get_file_stats_grouped(stats);
 
     JsonWriter jw;
     jw.beginArray();
-    for (std::map<std::string, FileStat>::const_iterator it = file_map.begin();
-         it != file_map.end(); ++it) {
+    for (size_t i = 0; i < stats.size(); ++i) {
         jw.beginObject();
-        jw.key("path").val(it->first);
-        jw.key("access_count").val(it->second.access_count);
-        jw.key("read_count").val(it->second.read_count);
-        jw.key("write_count").val(it->second.write_count);
-        jw.key("process_count").val((int)it->second.pids.size());
+        jw.key("path").val(stats[i].filename);
+        jw.key("access_count").val(stats[i].access_count);
+        jw.key("read_count").val(stats[i].read_count);
+        jw.key("write_count").val(stats[i].write_count);
+        jw.key("process_count").val(stats[i].process_count);
         jw.endObject();
     }
     jw.endArray();
@@ -516,8 +486,10 @@ static void handle_files_by_path(struct mg_connection *c, const std::string& pat
 
     // Group by PID: merge modes, keep earliest timestamp
     std::map<int, PidAccess> pid_map;
+    std::set<int> unique_pids;
     for (size_t i = 0; i < accesses.size(); ++i) {
         int pid = accesses[i].pid;
+        unique_pids.insert(pid);
         std::map<int, PidAccess>::iterator it = pid_map.find(pid);
         if (it == pid_map.end()) {
             PidAccess pa;
@@ -532,12 +504,16 @@ static void handle_files_by_path(struct mg_connection *c, const std::string& pat
         }
     }
 
+    // Batch load all referenced processes
+    std::map<int, ProcessRecord> proc_cache;
+    g_db->get_processes_by_pids(unique_pids, proc_cache);
+
     JsonWriter jw;
     jw.beginArray();
     for (std::map<int, PidAccess>::const_iterator it = pid_map.begin();
          it != pid_map.end(); ++it) {
-        ProcessRecord proc;
-        bool found = g_db->get_process(it->first, proc);
+        std::map<int, ProcessRecord>::const_iterator pi = proc_cache.find(it->first);
+        bool found = (pi != proc_cache.end());
         // Build combined mode string
         std::string modes;
         for (std::set<int>::const_iterator mi = it->second.modes.begin();
@@ -547,11 +523,11 @@ static void handle_files_by_path(struct mg_connection *c, const std::string& pat
         }
         jw.beginObject();
         jw.key("pid").val(it->first);
-        jw.key("cmdline").val(found ? proc.cmdline : std::string());
+        jw.key("cmdline").val(found ? pi->second.cmdline : std::string());
         jw.key("mode").val(-1);
         jw.key("mode_str").val(modes);
         jw.key("timestamp_us").val(it->second.first_timestamp);
-        if (found) write_proc_info(jw, proc);
+        if (found) write_proc_info(jw, pi->second);
         jw.endObject();
     }
     jw.endArray();
@@ -565,7 +541,9 @@ static void handle_files_by_prefix(struct mg_connection *c, const std::string& p
     // Group by (pid, filename): merge modes, keep earliest timestamp
     typedef std::pair<int, std::string> PidFile;
     std::map<PidFile, PidAccess> grouped;
+    std::set<int> unique_pids;
     for (size_t i = 0; i < all_fa.size(); ++i) {
+        unique_pids.insert(all_fa[i].pid);
         PidFile key(all_fa[i].pid, all_fa[i].filename);
         std::map<PidFile, PidAccess>::iterator it = grouped.find(key);
         if (it == grouped.end()) {
@@ -580,12 +558,16 @@ static void handle_files_by_prefix(struct mg_connection *c, const std::string& p
         }
     }
 
+    // Batch load all referenced processes
+    std::map<int, ProcessRecord> proc_cache;
+    g_db->get_processes_by_pids(unique_pids, proc_cache);
+
     JsonWriter jw;
     jw.beginArray();
     for (std::map<PidFile, PidAccess>::const_iterator it = grouped.begin();
          it != grouped.end(); ++it) {
-        ProcessRecord proc;
-        bool found = g_db->get_process(it->first.first, proc);
+        std::map<int, ProcessRecord>::const_iterator pi = proc_cache.find(it->first.first);
+        bool found = (pi != proc_cache.end());
         std::string modes;
         for (std::set<int>::const_iterator mi = it->second.modes.begin();
              mi != it->second.modes.end(); ++mi) {
@@ -594,11 +576,11 @@ static void handle_files_by_prefix(struct mg_connection *c, const std::string& p
         }
         jw.beginObject();
         jw.key("pid").val(it->first.first);
-        jw.key("cmdline").val(found ? proc.cmdline : std::string());
+        jw.key("cmdline").val(found ? pi->second.cmdline : std::string());
         jw.key("filename").val(it->first.second);
         jw.key("mode_str").val(modes);
         jw.key("timestamp_us").val(it->second.first_timestamp);
-        if (found) write_proc_info(jw, proc);
+        if (found) write_proc_info(jw, pi->second);
         jw.endObject();
     }
     jw.endArray();
@@ -909,47 +891,57 @@ static void handle_critical_path(struct mg_connection *c) {
     send_json(c, jw.str());
 }
 
+static void hotspot_dir_scan_cb(int pid, const char* filename, int mode, void* user_data) {
+    HotspotDirScanCtx* ctx = (HotspotDirScanCtx*)user_data;
+    const char* last_slash = std::strrchr(filename, '/');
+    std::string key;
+    if (last_slash) key.assign(filename, last_slash - filename + 1);
+    else key = filename;
+    AccumData& d = ctx->accum[key];
+    d.total++;
+    if (is_input_mode(mode)) d.reads++;
+    if (is_output_mode(mode)) d.writes++;
+    d.pids.insert(pid);
+}
+
 static void handle_hotspots(struct mg_connection *c, const std::string& query) {
     std::string top_str = get_query_param(query, "top");
     std::string by_dir_str = get_query_param(query, "by_dir");
     int top_n = top_str.empty() ? 20 : std::atoi(top_str.c_str());
     bool by_dir = (by_dir_str == "1");
 
-    std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
-
-    std::map<std::string, AccumData> accum;
-    for (size_t i = 0; i < all_fa.size(); ++i) {
-        std::string key = all_fa[i].filename;
-        if (by_dir) {
-            size_t slash = key.rfind('/');
-            if (slash != std::string::npos) key = key.substr(0, slash + 1);
-        }
-        AccumData& d = accum[key];
-        d.total++;
-        if (is_input_mode(all_fa[i].mode)) d.reads++;
-        if (is_output_mode(all_fa[i].mode)) d.writes++;
-        d.pids.insert(all_fa[i].pid);
-    }
-
     std::vector<HotspotEntry> entries;
-    for (std::map<std::string, AccumData>::const_iterator it = accum.begin();
-         it != accum.end(); ++it) {
-        HotspotEntry e;
-        e.name = it->first;
-        e.total = it->second.total;
-        e.reads = it->second.reads;
-        e.writes = it->second.writes;
-        e.num_procs = (int)it->second.pids.size();
-        entries.push_back(e);
-    }
 
-    // Sort by total desc
-    for (size_t i = 0; i < entries.size(); ++i) {
-        for (size_t j = i + 1; j < entries.size(); ++j) {
-            if (entries[j].total > entries[i].total) std::swap(entries[i], entries[j]);
+    if (by_dir) {
+        // Use scan callback to avoid loading all FileAccessRecords
+        HotspotDirScanCtx ctx;
+        g_db->scan_all_file_accesses(hotspot_dir_scan_cb, &ctx);
+        for (std::map<std::string, AccumData>::const_iterator it = ctx.accum.begin();
+             it != ctx.accum.end(); ++it) {
+            HotspotEntry e;
+            e.name = it->first;
+            e.total = it->second.total;
+            e.reads = it->second.reads;
+            e.writes = it->second.writes;
+            e.num_procs = (int)it->second.pids.size();
+            entries.push_back(e);
+        }
+    } else {
+        // Use SQL GROUP BY — much faster than loading all rows
+        std::vector<FileStatRow> stats;
+        g_db->get_file_stats_grouped(stats);
+        for (size_t i = 0; i < stats.size(); ++i) {
+            HotspotEntry e;
+            e.name = stats[i].filename;
+            e.total = stats[i].access_count;
+            e.reads = stats[i].read_count;
+            e.writes = stats[i].write_count;
+            e.num_procs = stats[i].process_count;
+            entries.push_back(e);
         }
     }
+
+    std::sort(entries.begin(), entries.end(), cmp_hotspot_desc);
 
     int count = top_n;
     if (count > (int)entries.size()) count = (int)entries.size();
@@ -1035,8 +1027,6 @@ static void handle_failures(struct mg_connection *c, const std::string& query) {
 static void handle_diagnostics(struct mg_connection *c) {
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
-    std::vector<FileAccessRecord> all_fa;
-    g_db->get_all_file_accesses(all_fa);
 
     JsonWriter jw;
     jw.beginObject();
@@ -1122,27 +1112,12 @@ static void handle_diagnostics(struct mg_connection *c) {
         }
     }
 
-    // 3. Hotfile
+    // 3. Hotfile (SQL query instead of loading all file accesses)
     {
-        std::map<std::string, std::set<int> > file_pids;
-        for (size_t i = 0; i < all_fa.size(); ++i) {
-            if (is_input_mode(all_fa[i].mode)) {
-                file_pids[all_fa[i].filename].insert(all_fa[i].pid);
-            }
-        }
         int dup_count = 0;
         std::string worst_file;
         int worst_count = 0;
-        for (std::map<std::string, std::set<int> >::const_iterator it = file_pids.begin();
-             it != file_pids.end(); ++it) {
-            if ((int)it->second.size() > 10) {
-                dup_count++;
-                if ((int)it->second.size() > worst_count) {
-                    worst_count = (int)it->second.size();
-                    worst_file = it->first;
-                }
-            }
-        }
+        g_db->get_hotfile_stats(10, dup_count, worst_file, worst_count);
         if (dup_count > 0) {
             char msg[256];
             std::snprintf(msg, sizeof(msg), "%d files accessed by >10 processes", dup_count);

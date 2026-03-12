@@ -63,7 +63,8 @@ src/web/bdview_web.o: src/web/bdview_web.cpp src/web/static_assets.h
 
 # Tests
 TEST_LIBS = $(COMMON_OBJS) $(HELPER_OBJS) $(DB_OBJS) $(SQLITE_OBJ)
-TEST_SRCS = tests/test_main.cpp tests/test_database.cpp tests/test_trace_simple.cpp \
+TEST_SRCS = tests/test_main.cpp tests/test_database.cpp tests/test_scalability.cpp \
+            tests/test_trace_simple.cpp \
             tests/test_trace_fork.cpp tests/test_trace_file_io.cpp tests/test_rebuild.cpp \
             tests/test_transparency.cpp tests/test_shell_patterns.cpp \
             tests/test_analysis.cpp tests/test_cmd_name.cpp

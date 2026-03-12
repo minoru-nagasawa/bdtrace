@@ -13,11 +13,13 @@ void run_transparency_tests();
 void run_shell_pattern_tests();
 void run_analysis_tests();
 void run_cmd_name_tests();
+void run_scalability_tests();
 
 int main() {
     bdtrace::log_init(bdtrace::LOG_ERROR);
 
     run_database_tests();
+    run_scalability_tests();
     run_trace_simple_tests();
     run_trace_fork_tests();
     run_trace_file_io_tests();

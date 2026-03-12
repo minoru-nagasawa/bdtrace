@@ -13,6 +13,16 @@ struct sqlite3_stmt;
 
 namespace bdtrace {
 
+// Aggregated file statistics (result of GROUP BY filename)
+struct FileStatRow {
+    std::string filename;
+    int access_count;
+    int read_count;
+    int write_count;
+    int process_count;
+    FileStatRow() : access_count(0), read_count(0), write_count(0), process_count(0) {}
+};
+
 class Database {
 public:
     Database();
@@ -56,11 +66,17 @@ public:
     bool get_failed_count_by_pid(std::map<int, int>& out);
     bool get_file_access_summary(std::map<int, int>& mode_counts);
     bool get_file_accesses_by_prefix(const std::string& prefix, std::vector<FileAccessRecord>& out);
+    bool get_file_accesses_by_pids(const std::set<int>& pids, std::vector<FileAccessRecord>& out);
+    bool get_processes_by_pids(const std::set<int>& pids, std::map<int, ProcessRecord>& out);
+    bool get_file_stats_grouped(std::vector<FileStatRow>& out);
+    bool get_hotfile_stats(int min_procs, int& file_count,
+                           std::string& worst_file, int& worst_procs);
 
     // Lightweight: callback receives (pid, filename, mode) for each row in range
     // Returns number of rows processed, or -1 on error
     typedef void (*FileScanCallback)(int pid, const char* filename, int mode, void* user_data);
     int scan_file_accesses_by_prefix(const std::string& prefix, FileScanCallback cb, void* user_data);
+    int scan_all_file_accesses(FileScanCallback cb, void* user_data);
     int get_process_count();
     int get_file_access_count();
     int get_failed_access_count();

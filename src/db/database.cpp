@@ -4,6 +4,7 @@
 #include "../../vendor/sqlite3.h"
 
 #include <cstring>
+#include <cstdio>
 #include <map>
 
 namespace bdtrace {
@@ -119,8 +120,9 @@ bool Database::upgrade_schema() {
         }
     }
 
-    // Ensure failed_accesses filename index exists (added retroactively)
+    // Ensure retroactive indexes exist
     exec("CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename)");
+    exec("CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us)");
 
     return true;
 }
@@ -545,6 +547,120 @@ int Database::scan_file_accesses_by_prefix(const std::string& prefix,
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+int Database::scan_all_file_accesses(FileScanCallback cb, void* user_data) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare("SELECT pid, filename, mode FROM file_accesses", &stmt))
+        return -1;
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int pid = sqlite3_column_int(stmt, 0);
+        const char* fn = (const char*)sqlite3_column_text(stmt, 1);
+        int mode = sqlite3_column_int(stmt, 2);
+        cb(pid, fn, mode, user_data);
+        ++count;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+bool Database::get_file_stats_grouped(std::vector<FileStatRow>& out) {
+    sqlite3_stmt* stmt = 0;
+    if (!prepare(
+            "SELECT filename, COUNT(*), "
+            "SUM(CASE WHEN mode IN (0,2,3,4,5,9) THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN mode IN (1,2,8,10,12,14,17,18) THEN 1 ELSE 0 END), "
+            "COUNT(DISTINCT pid) "
+            "FROM file_accesses GROUP BY filename", &stmt))
+        return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        FileStatRow r;
+        const char* fn = (const char*)sqlite3_column_text(stmt, 0);
+        if (fn) r.filename = fn;
+        r.access_count = sqlite3_column_int(stmt, 1);
+        r.read_count = sqlite3_column_int(stmt, 2);
+        r.write_count = sqlite3_column_int(stmt, 3);
+        r.process_count = sqlite3_column_int(stmt, 4);
+        out.push_back(r);
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_file_accesses_by_pids(const std::set<int>& pids,
+                                          std::vector<FileAccessRecord>& out) {
+    if (pids.empty()) return true;
+    std::string sql = "SELECT pid, filename, mode, fd, timestamp_us "
+                      "FROM file_accesses WHERE pid IN (";
+    bool first = true;
+    for (std::set<int>::const_iterator it = pids.begin(); it != pids.end(); ++it) {
+        if (!first) sql += ",";
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", *it);
+        sql += buf;
+        first = false;
+    }
+    sql += ")";
+    sqlite3_stmt* stmt = 0;
+    if (!prepare(sql.c_str(), &stmt)) return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out.push_back(row_to_file_access(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_processes_by_pids(const std::set<int>& pids,
+                                      std::map<int, ProcessRecord>& out) {
+    if (pids.empty()) return true;
+    std::string sql = "SELECT pid, ppid, cmdline, start_time_us, end_time_us, exit_code, "
+                      "user_time_us, sys_time_us, peak_rss_kb, io_read_bytes, io_write_bytes, "
+                      "cwd, file_count, fail_count FROM processes WHERE pid IN (";
+    bool first = true;
+    for (std::set<int>::const_iterator it = pids.begin(); it != pids.end(); ++it) {
+        if (!first) sql += ",";
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", *it);
+        sql += buf;
+        first = false;
+    }
+    sql += ")";
+    sqlite3_stmt* stmt = 0;
+    if (!prepare(sql.c_str(), &stmt)) return false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ProcessRecord r = row_to_process(stmt);
+        out[r.pid] = r;
+    }
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::get_hotfile_stats(int min_procs, int& file_count,
+                                  std::string& worst_file, int& worst_procs) {
+    file_count = 0;
+    worst_procs = 0;
+    worst_file.clear();
+    sqlite3_stmt* stmt = 0;
+    if (!prepare(
+            "SELECT filename, COUNT(DISTINCT pid) as num_procs "
+            "FROM file_accesses "
+            "WHERE mode IN (0,2,3,4,5,9) "
+            "GROUP BY filename "
+            "HAVING COUNT(DISTINCT pid) > ? "
+            "ORDER BY num_procs DESC", &stmt))
+        return false;
+    sqlite3_bind_int(stmt, 1, min_procs);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (file_count == 0) {
+            const char* fn = (const char*)sqlite3_column_text(stmt, 0);
+            if (fn) worst_file = fn;
+            worst_procs = sqlite3_column_int(stmt, 1);
+        }
+        ++file_count;
+    }
+    sqlite3_finalize(stmt);
+    return true;
 }
 
 int Database::get_process_count() {
