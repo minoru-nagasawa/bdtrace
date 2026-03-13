@@ -420,7 +420,7 @@ var App = (function() {
     right.appendChild(el('div', {className: 'section-title', id: 'proc-detail-title'}, 'Select a process'));
 
     var totalDur = 0;
-    var totalCpu = 0;
+    var totalCpu = data.total_cpu_us || 0;
     var minStart = 0;
     var procs = data.processes;
     var procMap = {};
@@ -428,7 +428,7 @@ var App = (function() {
       procMap[procs[i].pid] = procs[i];
       var d = procs[i].end_time_us - procs[i].start_time_us;
       if (d > totalDur) totalDur = d;
-      totalCpu += (procs[i].user_time_us || 0) + (procs[i].sys_time_us || 0);
+      if (!totalCpu) totalCpu += (procs[i].user_time_us || 0) + (procs[i].sys_time_us || 0);
       if (i === 0 || procs[i].start_time_us < minStart) minStart = procs[i].start_time_us;
     }
 
@@ -498,22 +498,34 @@ var App = (function() {
     treePart.appendChild(cmdSpan);
     node.appendChild(treePart);
 
-    var cpuTotal = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
-    var ioTotal = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
-    var fc = proc.fail_count || 0;
+    // Use descendant aggregates for parent nodes, own values for leaves
+    var dispFiles, dispFails, dispCpu, dispRss, dispIo;
+    if (hasChildren && proc.desc_file_count != null) {
+      dispFiles = proc.desc_file_count;
+      dispFails = proc.desc_fail_count || 0;
+      dispCpu = proc.desc_cpu_us || 0;
+      dispRss = proc.desc_peak_rss_kb || 0;
+      dispIo = proc.desc_io_bytes || 0;
+    } else {
+      dispFiles = proc.file_count;
+      dispFails = proc.fail_count || 0;
+      dispCpu = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
+      dispRss = proc.peak_rss_kb || 0;
+      dispIo = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
+    }
 
     var colsPart = el('span', {className: 'node-cols'});
     var cols = [
-      ['files', 'col-num', proc.file_count != null ? String(proc.file_count) : '-'],
-      ['fails', 'col-num' + (fc > 0 ? ' exit-err' : ''), fc > 0 ? String(fc) : '-'],
+      ['files', 'col-num', dispFiles != null ? String(dispFiles) : '-'],
+      ['fails', 'col-num' + (dispFails > 0 ? ' exit-err' : ''), dispFails > 0 ? String(dispFails) : '-'],
       ['duration', 'col-num col-dur' + (dur > ctx.totalDur * 0.25 ? ' slow' : ''), formatDuration(dur)],
       ['pctTime', 'col-num', formatPct(dur, ctx.totalDur)],
       ['start', 'col-num', formatRelSec(proc.start_time_us - ctx.minStart)],
       ['end', 'col-num', formatRelSec(proc.end_time_us - ctx.minStart)],
-      ['cpu', 'col-num', cpuTotal > 0 ? formatDuration(cpuTotal) : '-'],
-      ['pctCpu', 'col-num', formatPct(cpuTotal, ctx.totalCpu)],
-      ['rss', 'col-num', formatRss(proc.peak_rss_kb || 0)],
-      ['io', 'col-num', ioTotal > 0 ? formatBytes(ioTotal) : '-'],
+      ['cpu', 'col-num', dispCpu > 0 ? formatDuration(dispCpu) : '-'],
+      ['pctCpu', 'col-num', formatPct(dispCpu, ctx.totalCpu)],
+      ['rss', 'col-num', formatRss(dispRss)],
+      ['io', 'col-num', dispIo > 0 ? formatBytes(dispIo) : '-'],
       ['exit', 'col-num col-exit' + (proc.exit_code !== 0 ? ' exit-err' : ''), String(proc.exit_code)]
     ];
     for (var ci = 0; ci < cols.length; ci++) {
@@ -538,6 +550,29 @@ var App = (function() {
       selfTree.appendChild(el('span', {className: 'toggle'}, ' '));
       selfTree.appendChild(el('span', {className: 'cmd', style: 'font-style:italic;color:var(--fg2)'}, '(process only)'));
       selfNode.appendChild(selfTree);
+      // Show parent's own values in (process only) row
+      var selfCpu = (proc.user_time_us || 0) + (proc.sys_time_us || 0);
+      var selfIo = (proc.io_read_bytes || 0) + (proc.io_write_bytes || 0);
+      var selfFc = proc.fail_count || 0;
+      var selfColsPart = el('span', {className: 'node-cols'});
+      var selfCols = [
+        ['files', 'col-num', proc.file_count != null ? String(proc.file_count) : '-'],
+        ['fails', 'col-num' + (selfFc > 0 ? ' exit-err' : ''), selfFc > 0 ? String(selfFc) : '-'],
+        ['duration', 'col-num col-dur', formatDuration(dur)],
+        ['pctTime', 'col-num', formatPct(dur, ctx.totalDur)],
+        ['start', 'col-num', formatRelSec(proc.start_time_us - ctx.minStart)],
+        ['end', 'col-num', formatRelSec(proc.end_time_us - ctx.minStart)],
+        ['cpu', 'col-num', selfCpu > 0 ? formatDuration(selfCpu) : '-'],
+        ['pctCpu', 'col-num', formatPct(selfCpu, ctx.totalCpu)],
+        ['rss', 'col-num', formatRss(proc.peak_rss_kb || 0)],
+        ['io', 'col-num', selfIo > 0 ? formatBytes(selfIo) : '-'],
+        ['exit', 'col-num col-exit' + (proc.exit_code !== 0 ? ' exit-err' : ''), String(proc.exit_code)]
+      ];
+      for (var sci = 0; sci < selfCols.length; sci++) {
+        var ssp = el('span', {className: selfCols[sci][1], 'data-col': selfCols[sci][0]}, selfCols[sci][2]);
+        selfColsPart.appendChild(ssp);
+      }
+      selfNode.appendChild(selfColsPart);
       selfNode.onclick = function(e) {
         e.stopPropagation();
         var prev = document.querySelector('.tree .node.selected');

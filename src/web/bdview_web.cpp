@@ -28,6 +28,61 @@ static Database* g_db = NULL;
 static std::string g_static_dir;
 static DependencyGraph* g_dep_graph = NULL;
 
+// --- Descendant stats for process tree aggregation ---
+
+struct DescendantStats {
+    int desc_file_count;
+    int desc_fail_count;
+    int64_t desc_cpu_us;
+    int64_t desc_peak_rss_kb;
+    int64_t desc_io_bytes;
+    DescendantStats()
+        : desc_file_count(0), desc_fail_count(0)
+        , desc_cpu_us(0), desc_peak_rss_kb(0), desc_io_bytes(0) {}
+};
+
+static std::map<int, DescendantStats>* g_desc_stats = NULL;
+static int64_t g_total_cpu_us = 0;
+
+static DescendantStats compute_desc_one(int pid, const DependencyGraph& g,
+                                         std::map<int, DescendantStats>& cache) {
+    std::map<int, DescendantStats>::iterator cached = cache.find(pid);
+    if (cached != cache.end()) return cached->second;
+
+    DescendantStats ds;
+    std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(pid);
+    if (pit != g.proc_map.end()) {
+        const ProcessRecord& p = pit->second;
+        ds.desc_file_count = p.file_count;
+        ds.desc_fail_count = p.fail_count;
+        ds.desc_cpu_us = p.user_time_us + p.sys_time_us;
+        ds.desc_peak_rss_kb = p.peak_rss_kb;
+        ds.desc_io_bytes = p.io_read_bytes + p.io_write_bytes;
+    }
+
+    std::map<int, std::vector<int> >::const_iterator cit = g.pid_children.find(pid);
+    if (cit != g.pid_children.end()) {
+        for (size_t i = 0; i < cit->second.size(); ++i) {
+            DescendantStats child = compute_desc_one(cit->second[i], g, cache);
+            ds.desc_file_count += child.desc_file_count;
+            ds.desc_fail_count += child.desc_fail_count;
+            ds.desc_cpu_us += child.desc_cpu_us;
+            ds.desc_io_bytes += child.desc_io_bytes;
+            if (child.desc_peak_rss_kb > ds.desc_peak_rss_kb)
+                ds.desc_peak_rss_kb = child.desc_peak_rss_kb;
+        }
+    }
+
+    cache[pid] = ds;
+    return ds;
+}
+
+static const DescendantStats* lookup_desc(int pid) {
+    if (!g_desc_stats) return NULL;
+    std::map<int, DescendantStats>::const_iterator it = g_desc_stats->find(pid);
+    return (it != g_desc_stats->end()) ? &it->second : NULL;
+}
+
 static const DependencyGraph& get_dep_graph() {
     if (!g_dep_graph) {
         g_dep_graph = new DependencyGraph();
@@ -35,6 +90,17 @@ static const DependencyGraph& get_dep_graph() {
         LOG_INFO("Dependency graph built: %d processes, %d files",
                  (int)g_dep_graph->proc_map.size(),
                  (int)g_dep_graph->file_to_readers.size());
+
+        // Pre-compute descendant stats (O(n) with memoization)
+        g_desc_stats = new std::map<int, DescendantStats>();
+        g_total_cpu_us = 0;
+        for (std::map<int, ProcessRecord>::const_iterator it = g_dep_graph->proc_map.begin();
+             it != g_dep_graph->proc_map.end(); ++it) {
+            compute_desc_one(it->first, *g_dep_graph, *g_desc_stats);
+            g_total_cpu_us += it->second.user_time_us + it->second.sys_time_us;
+        }
+        LOG_INFO("Descendant stats computed for %d processes",
+                 (int)g_desc_stats->size());
     }
     return *g_dep_graph;
 }
@@ -226,7 +292,8 @@ static void handle_summary(struct mg_connection *c) {
 }
 
 static void write_process_json(JsonWriter& jw, const ProcessRecord& proc,
-                               bool has_children) {
+                               bool has_children,
+                               const DescendantStats* desc) {
     jw.beginObject();
     jw.key("pid").val(proc.pid);
     jw.key("ppid").val(proc.ppid);
@@ -242,6 +309,13 @@ static void write_process_json(JsonWriter& jw, const ProcessRecord& proc,
     jw.key("peak_rss_kb").val(proc.peak_rss_kb);
     jw.key("io_read_bytes").val(proc.io_read_bytes);
     jw.key("io_write_bytes").val(proc.io_write_bytes);
+    if (desc && has_children) {
+        jw.key("desc_file_count").val(desc->desc_file_count);
+        jw.key("desc_fail_count").val(desc->desc_fail_count);
+        jw.key("desc_cpu_us").val(desc->desc_cpu_us);
+        jw.key("desc_peak_rss_kb").val(desc->desc_peak_rss_kb);
+        jw.key("desc_io_bytes").val(desc->desc_io_bytes);
+    }
     jw.endObject();
 }
 
@@ -264,13 +338,15 @@ static void handle_processes(struct mg_connection *c, const std::string& query) 
         jw.key("processes").beginArray();
         for (size_t i = 0; i < roots.size(); ++i) {
             bool hc = has_children_set.find(roots[i].pid) != has_children_set.end();
-            write_process_json(jw, roots[i], hc);
+            write_process_json(jw, roots[i], hc, lookup_desc(roots[i].pid));
         }
         jw.endArray();
 
         jw.key("roots").beginArray();
         for (size_t i = 0; i < roots.size(); ++i) jw.val(roots[i].pid);
         jw.endArray();
+
+        jw.key("total_cpu_us").val(g_total_cpu_us);
     } else {
         // Full mode: all processes with children_map
         std::vector<ProcessRecord> procs;
@@ -294,7 +370,7 @@ static void handle_processes(struct mg_connection *c, const std::string& query) 
         jw.key("processes").beginArray();
         for (size_t i = 0; i < procs.size(); ++i) {
             bool hc = has_children_set.find(procs[i].pid) != has_children_set.end();
-            write_process_json(jw, procs[i], hc);
+            write_process_json(jw, procs[i], hc, lookup_desc(procs[i].pid));
         }
         jw.endArray();
 
@@ -448,7 +524,7 @@ static void handle_process_children(struct mg_connection *c, int pid,
     jw.beginArray();
     for (size_t i = 0; i < children.size(); ++i) {
         bool hc = has_children_set.find(children[i].pid) != has_children_set.end();
-        write_process_json(jw, children[i], hc);
+        write_process_json(jw, children[i], hc, lookup_desc(children[i].pid));
     }
     jw.endArray();
     send_json(c, jw.str());
