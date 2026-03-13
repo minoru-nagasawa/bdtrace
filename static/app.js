@@ -7,7 +7,7 @@ var App = (function() {
 
   // Persistent column visibility for process tree
   var procColumns = {
-    files: true, duration: true, pctTime: true, start: false, end: false,
+    files: true, duration: true, pctTime: true, start: true, end: true,
     cpu: true, pctCpu: true, rss: true, io: true, fails: true, exit: true
   };
 
