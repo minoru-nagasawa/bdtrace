@@ -825,12 +825,13 @@ var App = (function() {
           }
         }
 
-        function doExpand() {
-          if (!hasChildren || expanded) return;
+        function doExpand(cb) {
+          if (!hasChildren || expanded) { if (cb) cb(); return; }
           expanded = true;
           toggle.textContent = '-';
           ensureChildren();
           childUl.style.display = '';
+          if (cb) cb();
         }
 
         function doCollapse() {
@@ -841,7 +842,7 @@ var App = (function() {
         }
 
         if (registry) {
-          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren, isExpanded: function() { return expanded; } });
         }
 
         node.onclick = function(e) {
@@ -960,12 +961,13 @@ var App = (function() {
           }
         }
 
-        function doExpand() {
-          if (!hasChildren || expanded) return;
+        function doExpand(cb) {
+          if (!hasChildren || expanded) { if (cb) cb(); return; }
           expanded = true;
           toggle.textContent = '-';
           ensureChildren();
           childUl.style.display = '';
+          if (cb) cb();
         }
 
         function doCollapse() {
@@ -976,7 +978,7 @@ var App = (function() {
         }
 
         if (registry) {
-          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren });
+          registry.push({ expand: doExpand, collapse: doCollapse, hasChildren: hasChildren, isExpanded: function() { return expanded; } });
         }
 
         node.onclick = function(e) {
@@ -1368,6 +1370,19 @@ var App = (function() {
   }
 
   var _analysisLoading = false;
+
+  // Shared file path cache for autocomplete (Rebuild, Rdeps)
+  var _cachedFilePaths = null;
+  function getFilePaths(cb) {
+    if (_cachedFilePaths) { cb(_cachedFilePaths); return; }
+    api('/api/files', function(data) {
+      _cachedFilePaths = [];
+      if (data) {
+        for (var i = 0; i < data.length; i++) _cachedFilePaths.push(data[i].path);
+      }
+      cb(_cachedFilePaths);
+    });
+  }
   function loadAnalysisTab(idx, content) {
     if (_analysisLoading) return; // P3.4: prevent duplicate requests
     _analysisLoading = true;
@@ -1538,13 +1553,7 @@ var App = (function() {
 
       // Fetch file list for autocomplete
       var allFilePaths = [];
-      api('/api/files', function(data) {
-        if (data) {
-          for (var fi = 0; fi < data.length; fi++) {
-            allFilePaths.push(data[fi].path);
-          }
-        }
-      });
+      getFilePaths(function(paths) { allFilePaths = paths; });
 
       var suggestIndex = -1;
       var suggestMatches = [];
@@ -1765,19 +1774,99 @@ var App = (function() {
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Reverse Dependencies'));
       var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
-      var input = el('input', {type: 'text', placeholder: 'Enter file path', style: 'flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var searchWrap = el('div', {style: 'flex:1;position:relative'});
+      var input = el('input', {type: 'text', placeholder: 'Type to search files...', style: 'width:100%;box-sizing:border-box;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
+      var suggestBox = el('div', {style: 'display:none;position:absolute;left:0;right:0;top:100%;max-height:200px;overflow-y:auto;background:var(--bg2);border:1px solid var(--border);border-radius:0 0 4px 4px;z-index:100'});
+      searchWrap.appendChild(input);
+      searchWrap.appendChild(suggestBox);
       var depthInput = el('input', {type: 'number', value: '3', min: '1', max: '10', style: 'width:60px;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:4px'});
       var btn = el('button', {style: 'padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer'}, 'Search');
-      row.appendChild(input);
+      row.appendChild(searchWrap);
       row.appendChild(el('span', {style: 'color:var(--fg2)'}, 'Depth:'));
       row.appendChild(depthInput);
       row.appendChild(btn);
       content.appendChild(row);
+
+      // Autocomplete
+      var rdepsFilePaths = [];
+      getFilePaths(function(paths) { rdepsFilePaths = paths; });
+      var rdepsSuggestIndex = -1;
+      var rdepsSuggestMatches = [];
+
+      function rdepsSelectSuggestion(path) {
+        input.value = path;
+        suggestBox.style.display = 'none';
+        rdepsSuggestIndex = -1;
+      }
+
+      function rdepsUpdateHighlight() {
+        var items = suggestBox.children;
+        for (var i = 0; i < items.length; i++) {
+          items[i].style.background = i === rdepsSuggestIndex ? 'var(--bg3)' : '';
+        }
+        if (rdepsSuggestIndex >= 0 && rdepsSuggestIndex < items.length) {
+          items[rdepsSuggestIndex].scrollIntoView({block: 'nearest'});
+        }
+      }
+
+      function rdepsShowSuggestions(query) {
+        suggestBox.innerHTML = '';
+        rdepsSuggestIndex = -1;
+        if (!query) { suggestBox.style.display = 'none'; return; }
+        var q = query.toLowerCase();
+        rdepsSuggestMatches = [];
+        for (var fi = 0; fi < rdepsFilePaths.length; fi++) {
+          if (rdepsFilePaths[fi].toLowerCase().indexOf(q) >= 0) {
+            rdepsSuggestMatches.push(rdepsFilePaths[fi]);
+            if (rdepsSuggestMatches.length >= 20) break;
+          }
+        }
+        if (rdepsSuggestMatches.length === 0) { suggestBox.style.display = 'none'; return; }
+        for (var mi = 0; mi < rdepsSuggestMatches.length; mi++) {
+          (function(path, idx) {
+            var item = el('div', {style: 'padding:4px 8px;cursor:pointer;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'}, path);
+            item.title = path;
+            item.onmouseenter = function() { rdepsSuggestIndex = idx; rdepsUpdateHighlight(); };
+            item.onclick = function() { rdepsSelectSuggestion(path); };
+            suggestBox.appendChild(item);
+          })(rdepsSuggestMatches[mi], mi);
+        }
+        suggestBox.style.display = 'block';
+      }
+
+      input.oninput = function() { rdepsShowSuggestions(input.value.trim()); };
+      input.onkeydown = function(e) {
+        if (suggestBox.style.display !== 'none' && rdepsSuggestMatches.length > 0) {
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            rdepsSuggestIndex = rdepsSuggestIndex < rdepsSuggestMatches.length - 1 ? rdepsSuggestIndex + 1 : 0;
+            rdepsUpdateHighlight();
+            return;
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            rdepsSuggestIndex = rdepsSuggestIndex > 0 ? rdepsSuggestIndex - 1 : rdepsSuggestMatches.length - 1;
+            rdepsUpdateHighlight();
+            return;
+          } else if (e.key === 'Enter' && rdepsSuggestIndex >= 0) {
+            e.preventDefault();
+            rdepsSelectSuggestion(rdepsSuggestMatches[rdepsSuggestIndex]);
+            return;
+          }
+        }
+        if (e.key === 'Enter') {
+          btn.click();
+        }
+      };
+      document.addEventListener('click', function(e) {
+        if (!searchWrap.contains(e.target)) { suggestBox.style.display = 'none'; rdepsSuggestIndex = -1; }
+      });
+
       var resultDiv = el('div');
       content.appendChild(resultDiv);
       btn.onclick = function() {
         var val = input.value.trim();
         if (!val) return;
+        suggestBox.style.display = 'none';
         var depth = parseInt(depthInput.value) || 3;
         resultDiv.innerHTML = '<div class="loading">Searching...</div>';
         api('/api/rdeps?file=' + encodeURIComponent(val) + '&depth=' + depth, function(data) {
