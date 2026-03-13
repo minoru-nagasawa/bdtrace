@@ -25,13 +25,35 @@ public:
 
     Database& db() { return db_; }
 
+    // Progress counters (P1.3)
+    int process_count() const { return process_count_; }
+    int file_access_count() const { return file_access_count_; }
+    int failed_access_count() const { return failed_access_count_; }
+
+    // Error tracking (P1.1)
+    int write_error_count() const { return write_error_count_; }
+    bool has_fatal_errors() const { return consecutive_errors_ >= 50; }
+
 private:
     Database db_;
     int event_count_;
     bool in_transaction_;
     bool finalized_;
 
+    // P1.1: Error tracking
+    int write_error_count_;
+    int consecutive_errors_;
+
+    // P1.2: WAL checkpoint tracking
+    int total_event_count_;
+
+    // P1.3: Progress counters
+    int process_count_;
+    int file_access_count_;
+    int failed_access_count_;
+
     void maybe_commit();
+    void check_write_result(bool ok, const char* op);
 };
 
 } // namespace bdtrace

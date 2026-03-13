@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <signal.h>
 
 static void usage() {
     std::fprintf(stderr,
@@ -45,6 +46,9 @@ int main(int argc, char* argv[]) {
         usage();
         return 1;
     }
+
+    // P1.4: Ignore SIGPIPE to prevent crash when stderr pipe breaks
+    signal(SIGPIPE, SIG_IGN);
 
     bdtrace::log_init(log_level);
 

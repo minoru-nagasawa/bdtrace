@@ -123,6 +123,27 @@ bool Database::upgrade_schema() {
     // Ensure retroactive indexes exist
     exec("CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename)");
     exec("CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us)");
+    exec("CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename)");
+
+    // P2.6: Re-populate counts if all are zero (interrupted trace recovery)
+    {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(db_,
+            "SELECT COUNT(*) FROM processes WHERE file_count > 0", -1, &stmt, 0);
+        if (rc == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0) {
+                int fa_count = get_file_access_count();
+                if (fa_count > 0) {
+                    LOG_INFO("Detected interrupted trace (counts are zero), re-populating...");
+                    sqlite3_finalize(stmt);
+                    populate_counts();
+                    analyze();
+                    return true;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
 
     return true;
 }
@@ -141,6 +162,30 @@ bool Database::exec(const char* sql) {
 
 bool Database::exec_raw(const std::string& sql) {
     return exec(sql.c_str());
+}
+
+bool Database::wal_checkpoint() {
+    return exec("PRAGMA wal_checkpoint(PASSIVE)");
+}
+
+bool Database::analyze() {
+    return exec("ANALYZE");
+}
+
+int64_t Database::get_db_size_bytes() {
+    int64_t page_count = 0, page_size = 0;
+    sqlite3_stmt* stmt = 0;
+    if (prepare("PRAGMA page_count", &stmt)) {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            page_count = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    if (prepare("PRAGMA page_size", &stmt)) {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            page_size = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return page_count * page_size;
 }
 
 bool Database::prepare(const char* sql, sqlite3_stmt** stmt) {
@@ -390,12 +435,22 @@ bool Database::get_descendant_pids(int root_pid, std::set<int>& out) {
 
 bool Database::populate_counts() {
     if (!db_) return false;
-    if (!exec("UPDATE processes SET file_count = "
-              "(SELECT COUNT(*) FROM file_accesses WHERE file_accesses.pid = processes.pid)"))
+    // P3.6: Use GROUP BY + batch UPDATE instead of correlated subqueries
+    // Reset all to 0 first
+    if (!exec("UPDATE processes SET file_count = 0, fail_count = 0"))
         return false;
-    if (!exec("UPDATE processes SET fail_count = "
-              "(SELECT COUNT(*) FROM failed_accesses WHERE failed_accesses.pid = processes.pid)"))
+    // Batch update file_count using a JOIN pattern
+    if (!exec("UPDATE processes SET file_count = COALESCE("
+              "(SELECT cnt FROM (SELECT pid, COUNT(*) as cnt FROM file_accesses GROUP BY pid) fa "
+              "WHERE fa.pid = processes.pid), 0)"))
         return false;
+    // Batch update fail_count
+    if (has_table("failed_accesses")) {
+        if (!exec("UPDATE processes SET fail_count = COALESCE("
+                  "(SELECT cnt FROM (SELECT pid, COUNT(*) as cnt FROM failed_accesses GROUP BY pid) fa "
+                  "WHERE fa.pid = processes.pid), 0)"))
+            return false;
+    }
     return true;
 }
 

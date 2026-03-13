@@ -76,7 +76,8 @@ struct ImpactEntry {
 };
 
 void compute_impact(const DependencyGraph& g,
-                    std::vector<ImpactEntry>& result, int top_n);
+                    std::vector<ImpactEntry>& result, int top_n,
+                    int64_t deadline_us = 0);
 
 // --- Race detection ---
 
@@ -87,7 +88,9 @@ struct RaceEntry {
     int64_t overlap_us;
 };
 
-void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result);
+// Returns true if completed, false if truncated by deadline
+bool detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result,
+                  int64_t deadline_us = 0);
 
 // --- Rebuild estimate ---
 

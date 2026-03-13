@@ -28,10 +28,12 @@
 namespace bdtrace {
 
 static volatile sig_atomic_t g_child_pid = 0;
+static volatile sig_atomic_t g_stop_requested = 0;
 static struct sigaction g_old_sigint;
 static struct sigaction g_old_sigterm;
 
 static void signal_handler(int sig) {
+    g_stop_requested = 1;
     if (g_child_pid > 0) {
         kill(g_child_pid, sig);
     }
@@ -121,7 +123,47 @@ void PtraceBackend::setup_child(int pid) {
 }
 
 int PtraceBackend::run_event_loop() {
+    int64_t start_time = now_us();
+    int64_t last_report_time = start_time;
+
     while (running_ && !procs_.empty()) {
+        // P1.3: Progress reporting every 60 seconds
+        int64_t now = now_us();
+        if (now - last_report_time >= 60000000LL) {
+            int64_t elapsed_us = now - start_time;
+            int hours = (int)(elapsed_us / 3600000000LL);
+            int mins = (int)((elapsed_us % 3600000000LL) / 60000000LL);
+            int secs = (int)((elapsed_us % 60000000LL) / 1000000LL);
+            int procs = session_.process_count();
+            int files = session_.file_access_count();
+            int ev_per_sec = 0;
+            if (elapsed_us > 0) {
+                ev_per_sec = (int)((int64_t)(procs + files) * 1000000LL / elapsed_us);
+            }
+            int64_t db_bytes = session_.db().get_db_size_bytes();
+            int db_mb = (int)(db_bytes / (1024 * 1024));
+            std::fprintf(stderr,
+                "[bdtrace] %02d:%02d:%02d | %d procs | %d files | %d ev/s | DB: %d MB",
+                hours, mins, secs, procs, files, ev_per_sec, db_mb);
+            if (session_.write_error_count() > 0) {
+                std::fprintf(stderr, " | %d errors", session_.write_error_count());
+            }
+            std::fprintf(stderr, "\n");
+            last_report_time = now;
+        }
+
+        // P1.1: Stop on fatal DB errors
+        if (session_.has_fatal_errors()) {
+            LOG_ERROR("Too many consecutive DB write errors, stopping trace");
+            break;
+        }
+
+        // P2.6: Graceful stop on signal - set running_ to false for natural drain
+        if (g_stop_requested && running_) {
+            LOG_INFO("Signal received, draining remaining events...");
+            running_ = false;
+        }
+
         int status;
         pid_t pid = waitpid(-1, &status, __WALL);
 

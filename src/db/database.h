@@ -84,6 +84,15 @@ public:
 
     const std::string& last_error() const { return last_error_; }
 
+    // WAL checkpoint (P1.2)
+    bool wal_checkpoint();
+
+    // Run ANALYZE for optimizer statistics (P1.5)
+    bool analyze();
+
+    // Get database file size in bytes
+    int64_t get_db_size_bytes();
+
     // Raw SQL execution (public for special cases)
     bool exec_raw(const std::string& sql);
 

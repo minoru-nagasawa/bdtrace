@@ -36,6 +36,7 @@ const char* get_schema_sql() {
         ");"
         "CREATE INDEX IF NOT EXISTS idx_fa_pid ON file_accesses(pid);"
         "CREATE INDEX IF NOT EXISTS idx_fa_filename ON file_accesses(filename);"
+        "CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename);"
         "CREATE TABLE IF NOT EXISTS failed_accesses ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  pid INTEGER NOT NULL,"

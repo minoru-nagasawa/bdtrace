@@ -26,6 +26,18 @@ using namespace bdtrace;
 
 static Database* g_db = NULL;
 static std::string g_static_dir;
+static DependencyGraph* g_dep_graph = NULL;
+
+static const DependencyGraph& get_dep_graph() {
+    if (!g_dep_graph) {
+        g_dep_graph = new DependencyGraph();
+        build_dependency_graph(*g_db, *g_dep_graph);
+        LOG_INFO("Dependency graph built: %d processes, %d files",
+                 (int)g_dep_graph->proc_map.size(),
+                 (int)g_dep_graph->file_to_readers.size());
+    }
+    return *g_dep_graph;
+}
 
 // --- Structs (must be at file scope for C++03 template compatibility) ---
 
@@ -442,23 +454,58 @@ static void handle_process_children(struct mg_connection *c, int pid,
     send_json(c, jw.str());
 }
 
-static void handle_files(struct mg_connection *c) {
+static void handle_files(struct mg_connection *c, const std::string& query) {
+    std::string offset_s = get_query_param(query, "offset");
+    std::string limit_s = get_query_param(query, "limit");
+    int offset = offset_s.empty() ? 0 : std::atoi(offset_s.c_str());
+    int limit = limit_s.empty() ? 0 : std::atoi(limit_s.c_str());
+
     std::vector<FileStatRow> stats;
     g_db->get_file_stats_grouped(stats);
 
-    JsonWriter jw;
-    jw.beginArray();
-    for (size_t i = 0; i < stats.size(); ++i) {
+    int total = (int)stats.size();
+
+    // Apply pagination if limit specified
+    if (limit > 0) {
+        if (offset < 0) offset = 0;
+        if (offset > total) offset = total;
+        int end = offset + limit;
+        if (end > total) end = total;
+
+        JsonWriter jw;
         jw.beginObject();
-        jw.key("path").val(stats[i].filename);
-        jw.key("access_count").val(stats[i].access_count);
-        jw.key("read_count").val(stats[i].read_count);
-        jw.key("write_count").val(stats[i].write_count);
-        jw.key("process_count").val(stats[i].process_count);
+        jw.key("total_count").val(total);
+        jw.key("offset").val(offset);
+        jw.key("limit").val(limit);
+        jw.key("files").beginArray();
+        for (int i = offset; i < end; ++i) {
+            jw.beginObject();
+            jw.key("path").val(stats[i].filename);
+            jw.key("access_count").val(stats[i].access_count);
+            jw.key("read_count").val(stats[i].read_count);
+            jw.key("write_count").val(stats[i].write_count);
+            jw.key("process_count").val(stats[i].process_count);
+            jw.endObject();
+        }
+        jw.endArray();
         jw.endObject();
+        send_json(c, jw.str());
+    } else {
+        // Backward-compatible: return flat array
+        JsonWriter jw;
+        jw.beginArray();
+        for (size_t i = 0; i < stats.size(); ++i) {
+            jw.beginObject();
+            jw.key("path").val(stats[i].filename);
+            jw.key("access_count").val(stats[i].access_count);
+            jw.key("read_count").val(stats[i].read_count);
+            jw.key("write_count").val(stats[i].write_count);
+            jw.key("process_count").val(stats[i].process_count);
+            jw.endObject();
+        }
+        jw.endArray();
+        send_json(c, jw.str());
     }
-    jw.endArray();
-    send_json(c, jw.str());
 }
 
 static void write_proc_info(JsonWriter& jw, const ProcessRecord& proc) {
@@ -679,6 +726,9 @@ static void handle_slowest(struct mg_connection *c, const std::string& query) {
 static void handle_timeline(struct mg_connection *c, const std::string& query) {
     std::string min_dur_str = get_query_param(query, "min_duration_us");
     int64_t min_dur_us = min_dur_str.empty() ? 0 : (int64_t)std::atol(min_dur_str.c_str());
+    std::string limit_str = get_query_param(query, "limit");
+    int limit = limit_str.empty() ? 50000 : std::atoi(limit_str.c_str());
+    if (limit <= 0 || limit > 100000) limit = 50000;
 
     std::vector<ProcessRecord> procs;
     g_db->get_all_processes(procs);
@@ -743,6 +793,8 @@ static void handle_timeline(struct mg_connection *c, const std::string& query) {
     jw.key("min_time_us").val(min_time);
     jw.key("max_time_us").val(max_time);
 
+    int emitted = 0;
+    bool truncated = false;
     jw.key("processes").beginArray();
     for (size_t i = 0; i < ordered.size(); ++i) {
         std::map<int, ProcessRecord>::const_iterator it = proc_map.find(ordered[i].pid);
@@ -752,6 +804,7 @@ static void handle_timeline(struct mg_connection *c, const std::string& query) {
         int64_t dur = p.end_time_us - p.start_time_us;
         if (dur < min_dur_us) continue;
 
+        if (emitted >= limit) { truncated = true; break; }
         jw.beginObject();
         jw.key("pid").val(p.pid);
         jw.key("cmdline").val(p.cmdline);
@@ -760,8 +813,11 @@ static void handle_timeline(struct mg_connection *c, const std::string& query) {
         jw.key("exit_code").val(p.exit_code);
         jw.key("depth").val(ordered[i].depth);
         jw.endObject();
+        ++emitted;
     }
     jw.endArray();
+    jw.key("truncated").val(truncated);
+    jw.key("total_count").val((int)ordered.size());
     jw.endObject();
 
     send_json(c, jw.str());
@@ -1196,8 +1252,7 @@ static void serve_static(struct mg_connection *c, struct http_message *hm) {
 static void handle_process_io(struct mg_connection *c, int pid,
                                const std::string& query) {
     bool tree = get_query_param(query, "tree") == "1";
-    DependencyGraph g;
-    build_dependency_graph(*g_db, g);
+    const DependencyGraph& g = get_dep_graph();
     ProcessIO pio;
     classify_process_io(*g_db, g, pid, tree, pio);
 
@@ -1224,13 +1279,19 @@ static void handle_impact(struct mg_connection *c, const std::string& query) {
     std::string top_s = get_query_param(query, "top");
     if (!top_s.empty()) top_n = std::atoi(top_s.c_str());
 
-    DependencyGraph g;
-    build_dependency_graph(*g_db, g);
-    std::vector<ImpactEntry> entries;
-    compute_impact(g, entries, top_n);
+    std::string timeout_s = get_query_param(query, "timeout");
+    int timeout_sec = timeout_s.empty() ? 30 : std::atoi(timeout_s.c_str());
+    int64_t deadline = now_us() + (int64_t)timeout_sec * 1000000LL;
 
+    const DependencyGraph& g = get_dep_graph();
+    std::vector<ImpactEntry> entries;
+    compute_impact(g, entries, top_n, deadline);
+
+    bool truncated = (now_us() > deadline);
     JsonWriter w;
-    w.beginArray();
+    w.beginObject();
+    w.key("truncated").val(truncated);
+    w.key("results").beginArray();
     for (size_t i = 0; i < entries.size(); ++i) {
         w.beginObject();
         w.key("file").val(entries[i].file);
@@ -1239,18 +1300,23 @@ static void handle_impact(struct mg_connection *c, const std::string& query) {
         w.endObject();
     }
     w.endArray();
+    w.endObject();
     send_json(c, w.str());
 }
 
-static void handle_races(struct mg_connection *c) {
-    DependencyGraph g;
-    build_dependency_graph(*g_db, g);
+static void handle_races(struct mg_connection *c, const std::string& query) {
+    std::string timeout_s = get_query_param(query, "timeout");
+    int timeout_sec = timeout_s.empty() ? 30 : std::atoi(timeout_s.c_str());
+    int64_t deadline = now_us() + (int64_t)timeout_sec * 1000000LL;
+
+    const DependencyGraph& g = get_dep_graph();
     std::vector<RaceEntry> races;
-    detect_races(g, races);
+    bool completed = detect_races(g, races, deadline);
 
     JsonWriter w;
     w.beginObject();
     w.key("count").val((int)races.size());
+    w.key("truncated").val(!completed);
     w.key("races").beginArray();
     for (size_t i = 0; i < races.size(); ++i) {
         w.beginObject();
@@ -1278,8 +1344,7 @@ static void handle_rebuild_api(struct mg_connection *c, const std::string& query
         return;
     }
 
-    DependencyGraph g;
-    build_dependency_graph(*g_db, g);
+    const DependencyGraph& g = get_dep_graph();
 
     // Parse comma-separated changed files
     std::set<std::string> changed_files;
@@ -1452,8 +1517,7 @@ static void handle_rdeps(struct mg_connection *c, const std::string& query) {
     std::string depth_s = get_query_param(query, "depth");
     if (!depth_s.empty()) depth = std::atoi(depth_s.c_str());
 
-    DependencyGraph g;
-    build_dependency_graph(*g_db, g);
+    const DependencyGraph& g = get_dep_graph();
     RdepsNode root;
     compute_rdeps(g, file, depth, root);
 
@@ -1487,7 +1551,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (pid > 0) handle_process_children(c, pid, query);
         else send_error(c, 400, "Bad PID");
     } else if (uri == "/api/files") {
-        handle_files(c);
+        handle_files(c, query);
     } else if (uri == "/api/files/by-path") {
         std::string path = get_query_param(query, "path");
         handle_files_by_path(c, path);
@@ -1515,7 +1579,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     } else if (uri == "/api/impact") {
         handle_impact(c, query);
     } else if (uri == "/api/races") {
-        handle_races(c);
+        handle_races(c, query);
     } else if (uri == "/api/rebuild") {
         handle_rebuild_api(c, query);
     } else if (uri == "/api/rdeps") {
@@ -1532,6 +1596,7 @@ static void usage() {
         "\n"
         "Options:\n"
         "  --port PORT          HTTP port (default: 8080)\n"
+        "  --bind ADDR          Bind address (default: 127.0.0.1)\n"
         "  --static-dir DIR     Serve static files from DIR (dev mode)\n"
     );
 }
@@ -1546,10 +1611,13 @@ int main(int argc, char* argv[]) {
 
     std::string db_path = argv[1];
     int port = 8080;
+    std::string bind_addr = "127.0.0.1";
 
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--static-dir") == 0 && i + 1 < argc) {
             g_static_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -1566,19 +1634,26 @@ int main(int argc, char* argv[]) {
     db.upgrade_schema();
     g_db = &db;
 
-    char listen_addr[32];
-    std::snprintf(listen_addr, sizeof(listen_addr), "%d", port);
+    // P1.6: Build dependency graph once at startup
+    std::printf("Building dependency graph...\n");
+    get_dep_graph();
+    std::printf("Dependency graph ready.\n");
+
+    // P2.8: Bind to specified address (default localhost)
+    char port_buf[16];
+    std::snprintf(port_buf, sizeof(port_buf), "%d", port);
+    std::string listen_addr = bind_addr + ":" + port_buf;
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr, NULL);
-    struct mg_connection *conn = mg_bind(&mgr, listen_addr, ev_handler);
+    struct mg_connection *conn = mg_bind(&mgr, listen_addr.c_str(), ev_handler);
     if (!conn) {
-        std::fprintf(stderr, "Failed to bind on port %d\n", port);
+        std::fprintf(stderr, "Failed to bind on %s\n", listen_addr.c_str());
         return 1;
     }
     mg_set_protocol_http_websocket(conn);
 
-    std::printf("bdview-web: serving %s on http://localhost:%d\n", db_path.c_str(), port);
+    std::printf("bdview-web: serving %s on http://%s:%d\n", db_path.c_str(), bind_addr.c_str(), port);
     if (!g_static_dir.empty()) {
         std::printf("  static files from: %s\n", g_static_dir.c_str());
     }

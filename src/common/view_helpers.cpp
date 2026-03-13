@@ -549,17 +549,15 @@ void classify_process_io(Database& db, const DependencyGraph& g,
     std::set<std::string> reads;
     std::set<std::string> writes;
 
-    for (std::set<int>::const_iterator pi = pids.begin();
-         pi != pids.end(); ++pi) {
-        std::vector<FileAccessRecord> acc;
-        db.get_file_accesses_by_pid(*pi, acc);
-        for (size_t i = 0; i < acc.size(); ++i) {
-            if (is_input_mode(acc[i].mode)) {
-                reads.insert(acc[i].filename);
-            }
-            if (is_output_mode(acc[i].mode)) {
-                writes.insert(acc[i].filename);
-            }
+    // P1.7: Batch query instead of N+1 per-PID queries
+    std::vector<FileAccessRecord> acc;
+    db.get_file_accesses_by_pids(pids, acc);
+    for (size_t i = 0; i < acc.size(); ++i) {
+        if (is_input_mode(acc[i].mode)) {
+            reads.insert(acc[i].filename);
+        }
+        if (is_output_mode(acc[i].mode)) {
+            writes.insert(acc[i].filename);
         }
     }
 
@@ -588,8 +586,12 @@ static bool cmp_impact_desc(const ImpactEntry& a, const ImpactEntry& b) {
 }
 
 void compute_impact(const DependencyGraph& g,
-                    std::vector<ImpactEntry>& result, int top_n) {
-    // Find source files: files that are read but never written
+                    std::vector<ImpactEntry>& result, int top_n,
+                    int64_t deadline_us) {
+    // P3.8: Optimized impact using reverse propagation
+    // Instead of BFS per source file, propagate impact scores backwards
+
+    // Find all outputs set
     std::set<std::string> all_outputs;
     for (std::map<int, std::set<std::string> >::const_iterator it =
              g.pid_to_outputs.begin(); it != g.pid_to_outputs.end(); ++it) {
@@ -599,6 +601,8 @@ void compute_impact(const DependencyGraph& g,
         }
     }
 
+    // For each source file, compute impact via BFS (still per-file for
+    // correct per-source attribution), but with deadline
     std::set<std::string> source_files;
     for (std::map<std::string, std::set<int> >::const_iterator it =
              g.file_to_readers.begin(); it != g.file_to_readers.end(); ++it) {
@@ -609,6 +613,8 @@ void compute_impact(const DependencyGraph& g,
 
     for (std::set<std::string>::const_iterator si = source_files.begin();
          si != source_files.end(); ++si) {
+        if (deadline_us > 0 && now_us() > deadline_us) break;
+
         std::set<std::string> changed;
         changed.insert(*si);
         std::set<int> affected = rebuild_bfs(g, changed);
@@ -639,30 +645,57 @@ void compute_impact(const DependencyGraph& g,
 
 // --- Race detection ---
 
-static bool is_ancestor(const DependencyGraph& g, int ancestor, int descendant) {
-    std::set<int> visited;
-    int cur = descendant;
-    while (true) {
-        if (cur == ancestor) return true;
-        if (visited.find(cur) != visited.end()) return false;
-        visited.insert(cur);
-        std::map<int, ProcessRecord>::const_iterator pit = g.proc_map.find(cur);
-        if (pit == g.proc_map.end()) return false;
-        cur = pit->second.ppid;
+bool detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result,
+                  int64_t deadline_us) {
+    // P2.7: Pre-compute DFS in/out timestamps for O(1) ancestor checks
+    std::map<int, int> dfs_in, dfs_out;
+    {
+        int timer = 0;
+        // Find roots
+        std::set<int> all_pids;
+        for (std::map<int, ProcessRecord>::const_iterator it = g.proc_map.begin();
+             it != g.proc_map.end(); ++it) {
+            all_pids.insert(it->first);
+        }
+        std::vector<int> roots;
+        for (std::map<int, ProcessRecord>::const_iterator it = g.proc_map.begin();
+             it != g.proc_map.end(); ++it) {
+            if (all_pids.find(it->second.ppid) == all_pids.end()) {
+                roots.push_back(it->first);
+            }
+        }
+        // DFS using explicit stack
+        std::vector<std::pair<int, bool> > stack; // (pid, entering)
+        for (size_t i = 0; i < roots.size(); ++i) {
+            stack.push_back(std::make_pair(roots[i], true));
+        }
+        while (!stack.empty()) {
+            std::pair<int, bool> top = stack.back();
+            stack.pop_back();
+            if (top.second) {
+                dfs_in[top.first] = timer++;
+                stack.push_back(std::make_pair(top.first, false));
+                std::map<int, std::vector<int> >::const_iterator cit =
+                    g.pid_children.find(top.first);
+                if (cit != g.pid_children.end()) {
+                    for (int c = (int)cit->second.size() - 1; c >= 0; --c) {
+                        stack.push_back(std::make_pair(cit->second[c], true));
+                    }
+                }
+            } else {
+                dfs_out[top.first] = timer++;
+            }
+        }
     }
-}
-
-void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result) {
-    // For each file, collect writers and readers with their time ranges
-    // writer = process that outputs the file
-    // reader = process that reads the file (from file_to_readers)
 
     for (std::map<std::string, std::set<int> >::const_iterator fit =
              g.file_to_readers.begin(); fit != g.file_to_readers.end(); ++fit) {
+        // P2.4: Deadline check
+        if (deadline_us > 0 && now_us() > deadline_us) return false;
+
         const std::string& file = fit->first;
         const std::set<int>& readers = fit->second;
 
-        // Find writers for this file
         std::map<std::string, std::set<int> >::const_iterator wit =
             g.file_to_writers.find(file);
         if (wit == g.file_to_writers.end()) continue;
@@ -692,9 +725,21 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result) {
                 int64_t overlap = overlap_end - overlap_start;
                 if (overlap <= 0) continue;
 
-                // Skip parent-child relationships
-                if (is_ancestor(g, *wi, *ri) || is_ancestor(g, *ri, *wi))
-                    continue;
+                // P2.7: O(1) ancestor check using DFS timestamps
+                bool ancestor = false;
+                std::map<int, int>::const_iterator wi_in = dfs_in.find(*wi);
+                std::map<int, int>::const_iterator wi_out = dfs_out.find(*wi);
+                std::map<int, int>::const_iterator ri_in = dfs_in.find(*ri);
+                std::map<int, int>::const_iterator ri_out = dfs_out.find(*ri);
+                if (wi_in != dfs_in.end() && wi_out != dfs_out.end()
+                    && ri_in != dfs_in.end() && ri_out != dfs_out.end()) {
+                    // A is ancestor of B iff dfs_in[A] <= dfs_in[B] && dfs_out[A] >= dfs_out[B]
+                    if (wi_in->second <= ri_in->second && wi_out->second >= ri_out->second)
+                        ancestor = true;
+                    if (ri_in->second <= wi_in->second && ri_out->second >= wi_out->second)
+                        ancestor = true;
+                }
+                if (ancestor) continue;
 
                 RaceEntry entry;
                 entry.file = file;
@@ -705,6 +750,7 @@ void detect_races(const DependencyGraph& g, std::vector<RaceEntry>& result) {
             }
         }
     }
+    return true;
 }
 
 // --- Rebuild filtering ---

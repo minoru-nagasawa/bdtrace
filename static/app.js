@@ -1367,13 +1367,30 @@ var App = (function() {
     loadAnalysisTab(0, content);
   }
 
+  var _analysisLoading = false;
   function loadAnalysisTab(idx, content) {
+    if (_analysisLoading) return; // P3.4: prevent duplicate requests
+    _analysisLoading = true;
+    // Disable tab clicks during load
+    var allTabs = content.parentNode ? content.parentNode.querySelectorAll('.analysis-tab') : [];
+    for (var t = 0; t < allTabs.length; t++) allTabs[t].style.pointerEvents = 'none';
     content.innerHTML = '<div class="loading">Loading...</div>';
     var loadTimer = startLoadingTimer(content);
+    var onDone = function() {
+      _analysisLoading = false;
+      for (var t = 0; t < allTabs.length; t++) allTabs[t].style.pointerEvents = '';
+    };
+    // Wrap api to call onDone after callback
+    var apiDone = function(path, cb) {
+      api(path, function(data) {
+        if (loadTimer) clearInterval(loadTimer);
+        onDone();
+        cb(data);
+      });
+    };
 
     if (idx === 0) {
-      api('/api/critical-path', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/critical-path', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Critical Path'));
         if (!data.path || data.path.length === 0) {
@@ -1394,8 +1411,7 @@ var App = (function() {
         }
       });
     } else if (idx === 1) {
-      api('/api/hotspots?top=30&by_dir=0', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/hotspots?top=30&by_dir=0', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'File Access Hotspots'));
         if (!data || data.length === 0) {
@@ -1408,8 +1424,7 @@ var App = (function() {
         content.appendChild(tbl);
       });
     } else if (idx === 2) {
-      api('/api/failures', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/failures', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Failed File Accesses'));
         if (!data.total || data.total === 0) {
@@ -1433,8 +1448,7 @@ var App = (function() {
         }
       });
     } else if (idx === 3) {
-      api('/api/diagnostics', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/diagnostics', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Auto Diagnostics'));
         if (!data.issues || data.issues.length === 0) {
@@ -1451,30 +1465,35 @@ var App = (function() {
         }
       });
     } else if (idx === 4) {
-      api('/api/impact?top=30', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/impact?top=30', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Impact Ranking'));
-        if (!data || data.length === 0) {
+        // Handle both old (array) and new (object with results) formats
+        var items = Array.isArray(data) ? data : (data.results || []);
+        var truncated = data.truncated || false;
+        if (!items || items.length === 0) {
           content.appendChild(el('div', null, 'No impact data'));
           return;
         }
-        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, 'Source files ranked by rebuild impact (affected processes \u00d7 duration)'));
-        var tbl = makeTable(['Procs', 'Duration', 'File'], data.map(function(e) {
+        var desc = 'Source files ranked by rebuild impact (affected processes \u00d7 duration)';
+        if (truncated) desc += ' (results truncated due to timeout)';
+        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, desc));
+        var tbl = makeTable(['Procs', 'Duration', 'File'], items.map(function(e) {
           return [e.affected_procs, formatDuration(e.affected_duration_us), e.file];
         }));
         content.appendChild(tbl);
       });
     } else if (idx === 5) {
-      api('/api/races', function(data) {
-        if (loadTimer) clearInterval(loadTimer);
+      apiDone('/api/races', function(data) {
         content.innerHTML = '';
         content.appendChild(el('div', {className: 'section-title'}, 'Race Condition Detection'));
         if (!data.races || data.races.length === 0) {
           content.appendChild(el('div', {style: 'color:var(--green)'}, 'No race conditions detected.'));
           return;
         }
-        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, data.count + ' potential race(s) found'));
+        var msg = data.count + ' potential race(s) found';
+        if (data.truncated) msg += ' (results truncated due to timeout)';
+        content.appendChild(el('div', {style: 'margin-bottom:12px;color:var(--fg2)'}, msg));
         var tbl = makeTable(['File', 'Writer', 'Reader', 'Overlap'], data.races.map(function(r) {
           return [r.file, '[' + r.writer_pid + '] ' + shortenCmd(r.writer_cmd, 40), '[' + r.reader_pid + '] ' + shortenCmd(r.reader_cmd, 40), formatDuration(r.overlap_us)];
         }));
@@ -1482,6 +1501,7 @@ var App = (function() {
       });
     } else if (idx === 6) {
       if (loadTimer) clearInterval(loadTimer);
+      onDone();
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Rebuild Estimator'));
 
@@ -1741,6 +1761,7 @@ var App = (function() {
       };
     } else if (idx === 7) {
       if (loadTimer) clearInterval(loadTimer);
+      onDone();
       content.innerHTML = '';
       content.appendChild(el('div', {className: 'section-title'}, 'Reverse Dependencies'));
       var row = el('div', {style: 'display:flex;gap:8px;margin-bottom:12px;align-items:center'});
