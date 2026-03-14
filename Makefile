@@ -1,13 +1,16 @@
 CC  = gcc
 CXX = g++
 
+# Check if compiler supports -std=c++03
+CXX_STD := $(shell echo 'int main(){}' | $(CXX) -std=c++03 -x c++ - -o /dev/null 2>/dev/null && echo -std=c++03)
+
 # DEBUG=1 make for debug build
 ifdef DEBUG
   CFLAGS   = -Wall -g -O0
-  CXXFLAGS = -Wall -g -O0 -std=c++03 -Ivendor -Isrc
+  CXXFLAGS = -Wall -g -O0 $(CXX_STD) -Ivendor -Isrc
 else
   CFLAGS   = -Wall -O2
-  CXXFLAGS = -Wall -O2 -std=c++03 -Ivendor -Isrc
+  CXXFLAGS = -Wall -O2 $(CXX_STD) -Ivendor -Isrc
 endif
 
 LDFLAGS  = -lpthread -ldl
