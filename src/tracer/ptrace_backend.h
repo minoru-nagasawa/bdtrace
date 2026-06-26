@@ -7,6 +7,8 @@
 
 #include <map>
 #include <string>
+#include <cstdio>
+#include <stdint.h>
 
 namespace bdtrace {
 
@@ -24,6 +26,20 @@ private:
     std::map<int, ProcessState> procs_;
     int root_pid_;
     volatile bool running_;
+
+    // Diagnostics: stall watchdog + signal/race counters (always on).
+    int64_t last_event_us_;        // timestamp of the most recent waitpid() event
+    int64_t last_stall_report_us_; // 0 = no stall currently being reported
+    long cnt_fork_events_;
+    long cnt_exec_events_;
+    long cnt_sigstop_swallowed_;   // initial SIGSTOPs correctly swallowed
+    long cnt_sig_reinjected_;      // signals re-injected to the tracee
+    long cnt_sigstop_reinjected_;  // SIGSTOPs re-injected (red flag - see run_event_loop)
+    long cnt_race_unknown_first_;  // child seen via waitpid() before its fork/clone event
+
+    void check_stall();
+    void print_diag_counters(FILE* out);
+    std::string read_proc_state(int pid);
 
     void setup_child(int pid);
     void handle_syscall_stop(int pid);
