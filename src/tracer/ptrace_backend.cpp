@@ -174,12 +174,22 @@ int PtraceBackend::run_event_loop() {
             break;
         }
 
-        // New process we haven't seen?
+        // A process we haven't registered yet. This happens when a newly
+        // cloned/forked child's initial SIGSTOP is reported by waitpid() before
+        // the parent's PTRACE_EVENT_{FORK,VFORK,CLONE} stop. The order of those
+        // two events is not guaranteed, notably on Linux 2.6.x (CentOS 5).
+        //
+        // We must NOT mark it traced here: the very first stop of a brand-new
+        // child is its initial SIGSTOP, which has to be SWALLOWED by the SIGSTOP
+        // branch below (which only fires when !traced). If we set traced=true
+        // here, that SIGSTOP falls through to the default branch and gets
+        // re-injected, leaving the child permanently stopped - which deadlocks
+        // multi-threaded tracees (e.g. the JVM waits at a safepoint barrier for
+        // the stopped thread forever, and the tracer then blocks in waitpid()).
         if (procs_.find(pid) == procs_.end()) {
             ProcessState ps(pid, 0);
             procs_[pid] = ps;
             setup_child(pid);
-            procs_[pid].traced = true;
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
@@ -612,22 +622,36 @@ void PtraceBackend::handle_fork_event(int pid) {
 
     LOG_DEBUG("Fork: %d -> %d", pid, (int)child_pid);
 
-    ProcessState ps((int)child_pid, pid);
-    // Inherit parent's cached cwd (fork preserves cwd)
+    // Inherit parent's cached cwd (fork/clone preserves cwd).
+    std::string cwd;
     std::map<int, ProcessState>::iterator parent_it = procs_.find(pid);
     if (parent_it != procs_.end() && !parent_it->second.cached_cwd.empty()) {
-        ps.cached_cwd = parent_it->second.cached_cwd;
+        cwd = parent_it->second.cached_cwd;
     } else {
-        ps.cached_cwd = read_proc_link((int)child_pid, "cwd");
+        cwd = read_proc_link((int)child_pid, "cwd");
     }
-    procs_[(int)child_pid] = ps;
+
+    // The child's initial SIGSTOP and this parent-side fork/clone event may be
+    // reported by waitpid() in either order (see note in run_event_loop). If the
+    // child was already registered via its initial SIGSTOP, update that entry in
+    // place - do NOT overwrite it, or we would reset its 'traced' flag back to
+    // false and mishandle a later stop. Only create a fresh entry if unseen.
+    std::map<int, ProcessState>::iterator child_it = procs_.find((int)child_pid);
+    if (child_it != procs_.end()) {
+        child_it->second.ppid = pid;
+        child_it->second.cached_cwd = cwd;
+    } else {
+        ProcessState ps((int)child_pid, pid);
+        ps.cached_cwd = cwd;
+        procs_[(int)child_pid] = ps;
+    }
 
     ProcessRecord rec;
     rec.pid = (int)child_pid;
     rec.ppid = pid;
     rec.start_time_us = now_us();
     rec.cmdline = read_cmdline((int)child_pid);
-    rec.cwd = ps.cached_cwd;
+    rec.cwd = cwd;
     session_.on_process_start(rec);
 }
 
