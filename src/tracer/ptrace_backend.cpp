@@ -29,8 +29,15 @@ namespace bdtrace {
 
 static volatile sig_atomic_t g_child_pid = 0;
 static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_alarm_fired = 0;
 static struct sigaction g_old_sigint;
 static struct sigaction g_old_sigterm;
+static struct sigaction g_old_sigalrm;
+
+// Stall watchdog tuning.
+static const int     WATCHDOG_TICK_SEC  = 2;            // SIGALRM granularity
+static const int64_t STALL_THRESHOLD_US = 10000000LL;   // 10s w/o events => suspect hang
+static const int64_t STALL_REPEAT_US    = 30000000LL;   // re-dump every 30s while stalled
 
 static void signal_handler(int sig) {
     g_stop_requested = 1;
@@ -39,8 +46,18 @@ static void signal_handler(int sig) {
     }
 }
 
+// Async-signal-safe: only flips a flag. The actual stall check/dump runs back in
+// the event loop, so SIGALRM merely interrupts a blocked waitpid() (EINTR).
+static void alarm_handler(int) {
+    g_alarm_fired = 1;
+}
+
 PtraceBackend::PtraceBackend(TraceSession& session)
     : session_(session), root_pid_(0), running_(false)
+    , last_event_us_(0), last_stall_report_us_(0)
+    , cnt_fork_events_(0), cnt_exec_events_(0)
+    , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
+    , cnt_sigstop_reinjected_(0), cnt_race_unknown_first_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {}
@@ -125,6 +142,14 @@ void PtraceBackend::setup_child(int pid) {
 int PtraceBackend::run_event_loop() {
     int64_t start_time = now_us();
     int64_t last_report_time = start_time;
+    last_event_us_ = start_time;
+
+    // Install the stall-watchdog timer signal. SIGALRM interrupts a blocked
+    // waitpid() so a hang (no events while processes remain) becomes visible.
+    struct sigaction sa_alrm;
+    std::memset(&sa_alrm, 0, sizeof(sa_alrm));
+    sa_alrm.sa_handler = alarm_handler;
+    sigaction(SIGALRM, &sa_alrm, &g_old_sigalrm);
 
     while (running_ && !procs_.empty()) {
         // P1.3: Progress reporting every 60 seconds
@@ -149,6 +174,7 @@ int PtraceBackend::run_event_loop() {
                 std::fprintf(stderr, " | %d errors", session_.write_error_count());
             }
             std::fprintf(stderr, "\n");
+            print_diag_counters(stderr);
             last_report_time = now;
         }
 
@@ -164,14 +190,29 @@ int PtraceBackend::run_event_loop() {
             running_ = false;
         }
 
+        // Arm the watchdog only around the blocking wait, so SIGALRM never
+        // interrupts event processing / DB writes below.
+        alarm(WATCHDOG_TICK_SEC);
         int status;
         pid_t pid = waitpid(-1, &status, __WALL);
+        alarm(0);
 
         if (pid < 0) {
             if (errno == ECHILD) break;
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (g_alarm_fired) { g_alarm_fired = 0; check_stall(); }
+                continue;
+            }
             LOG_ERROR("waitpid failed: %s", strerror(errno));
             break;
+        }
+
+        // An event arrived: the tracer is making progress.
+        g_alarm_fired = 0;
+        last_event_us_ = now_us();
+        if (last_stall_report_us_ != 0) {
+            std::fprintf(stderr, "[bdtrace] STALL CLEARED: events resumed (pid %d)\n", pid);
+            last_stall_report_us_ = 0;
         }
 
         // A process we haven't registered yet. This happens when a newly
@@ -190,6 +231,7 @@ int PtraceBackend::run_event_loop() {
             ProcessState ps(pid, 0);
             procs_[pid] = ps;
             setup_child(pid);
+            ++cnt_race_unknown_first_;
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
@@ -216,9 +258,11 @@ int PtraceBackend::run_event_loop() {
         int event = (status >> 16) & 0xff;
 
         if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+            ++cnt_fork_events_;
             handle_fork_event(pid);
             PT(PTRACE_SYSCALL, pid, 0, 0);
         } else if (event == PTRACE_EVENT_EXEC) {
+            ++cnt_exec_events_;
             handle_exec_event(pid);
             PT(PTRACE_SYSCALL, pid, 0, 0);
         } else if (event == PTRACE_EVENT_EXIT) {
@@ -232,19 +276,103 @@ int PtraceBackend::run_event_loop() {
         } else if (sig == SIGSTOP && !procs_[pid].traced) {
             setup_child(pid);
             procs_[pid].traced = true;
+            ++cnt_sigstop_swallowed_;
             PT(PTRACE_SYSCALL, pid, 0, 0);
         } else {
+            // Re-inject any other signal to the tracee. A SIGSTOP reaching here
+            // (i.e. for an already-traced process) is a red flag: it leaves the
+            // tracee stopped and is the classic cause of a multi-threaded hang.
+            if (sig == SIGSTOP) ++cnt_sigstop_reinjected_;
+            ++cnt_sig_reinjected_;
             PT(PTRACE_SYSCALL, pid, 0, (long)sig);
         }
     }
 
     // Restore original signal handlers and clear stale PID
+    alarm(0);
     g_child_pid = 0;
     sigaction(SIGINT, &g_old_sigint, 0);
     sigaction(SIGTERM, &g_old_sigterm, 0);
+    sigaction(SIGALRM, &g_old_sigalrm, 0);
+
+    std::fprintf(stderr, "[bdtrace] final ");
+    print_diag_counters(stderr);
 
     session_.finalize();
     return 0;
+}
+
+void PtraceBackend::print_diag_counters(FILE* out) {
+    std::fprintf(out,
+        "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
+        "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld\n",
+        cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
+        cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_);
+}
+
+std::string PtraceBackend::read_proc_state(int pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return "";
+
+    char line[256];
+    std::string result;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "State:", 6) == 0) {
+            // e.g. "State:\tT (stopped)\n" -> "T(stopped)"
+            const char* p = line + 6;
+            while (*p == ' ' || *p == '\t') ++p;
+            for (; *p && *p != '\n'; ++p) {
+                if (*p == ' ') continue;
+                result += *p;
+            }
+            break;
+        }
+    }
+    std::fclose(f);
+    return result;
+}
+
+// Called when the watchdog fires (a blocked waitpid was interrupted by SIGALRM).
+// If no ptrace event has arrived for STALL_THRESHOLD_US while processes are still
+// tracked, the tracer is almost certainly hung - dump enough state to find which
+// tracee is stuck and why (notably any process in 'T (stopped)' that we believe
+// we already continued, the signature of a mishandled SIGSTOP).
+void PtraceBackend::check_stall() {
+    int64_t now = now_us();
+    int64_t gap = now - last_event_us_;
+    if (gap < STALL_THRESHOLD_US) return;
+    if (!running_ || procs_.empty()) return;
+    if (last_stall_report_us_ != 0 && (now - last_stall_report_us_) < STALL_REPEAT_US) return;
+    last_stall_report_us_ = now;
+
+    std::fprintf(stderr,
+        "[bdtrace] *** STALL: no ptrace events for %ds, %d process(es) tracked, "
+        "tracer blocked in waitpid() ***\n",
+        (int)(gap / 1000000LL), (int)procs_.size());
+    std::fprintf(stderr, "[bdtrace] ");
+    print_diag_counters(stderr);
+
+    const int MAX_DUMP = 50;
+    int shown = 0;
+    for (std::map<int, ProcessState>::iterator it = procs_.begin();
+         it != procs_.end(); ++it) {
+        if (shown >= MAX_DUMP) {
+            std::fprintf(stderr, "[bdtrace]   ... and %d more process(es)\n",
+                         (int)procs_.size() - shown);
+            break;
+        }
+        ProcessState& p = it->second;
+        std::string st = read_proc_state(it->first);
+        const char* flag = "";
+        if (!st.empty() && st[0] == 'T') flag = "   <-- STOPPED (suspect)";
+        std::fprintf(stderr,
+            "[bdtrace]   pid=%d ppid=%d traced=%d last_syscall=%ld state=%s%s\n",
+            it->first, p.ppid, (int)p.traced, p.pending_syscall,
+            st.empty() ? "?" : st.c_str(), flag);
+        ++shown;
+    }
 }
 
 void PtraceBackend::stop() {
