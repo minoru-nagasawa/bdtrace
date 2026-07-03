@@ -2,6 +2,10 @@
 
 namespace bdtrace {
 
+// Tables only. Indexes are intentionally NOT created here: during a trace,
+// maintaining B-trees on every insert (especially the TEXT filename ones)
+// roughly doubles the write cost. The tracer bulk-loads into bare tables and
+// builds indexes once in finalize; see get_index_sql().
 const char* get_schema_sql() {
     return
         "CREATE TABLE IF NOT EXISTS meta ("
@@ -24,27 +28,36 @@ const char* get_schema_sql() {
         "  file_count INTEGER DEFAULT 0,"
         "  fail_count INTEGER DEFAULT 0"
         ");"
-        "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
-        "CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us);"
+        // Plain INTEGER PRIMARY KEY (rowid alias): AUTOINCREMENT would update
+        // sqlite_sequence on every insert for no benefit here.
         "CREATE TABLE IF NOT EXISTS file_accesses ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  id INTEGER PRIMARY KEY,"
         "  pid INTEGER NOT NULL,"
         "  filename TEXT NOT NULL,"
         "  mode INTEGER NOT NULL,"
         "  fd INTEGER,"
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
         ");"
-        "CREATE INDEX IF NOT EXISTS idx_fa_pid ON file_accesses(pid);"
-        "CREATE INDEX IF NOT EXISTS idx_fa_filename ON file_accesses(filename);"
-        "CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename);"
         "CREATE TABLE IF NOT EXISTS failed_accesses ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  id INTEGER PRIMARY KEY,"
         "  pid INTEGER NOT NULL,"
         "  filename TEXT NOT NULL,"
         "  mode INTEGER NOT NULL,"
         "  errno_val INTEGER NOT NULL,"
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
         ");"
+        ;
+}
+
+// All indexes. Run after bulk load (tracer finalize) and by the viewers on
+// open, so a DB from an interrupted trace still gets indexed. idx_fa_pid was
+// dropped: idx_fa_pid_filename covers pid-only lookups as a prefix.
+const char* get_index_sql() {
+    return
+        "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
+        "CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us);"
+        "CREATE INDEX IF NOT EXISTS idx_fa_filename ON file_accesses(filename);"
+        "CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename);"
         "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
         "CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename);"
         ;

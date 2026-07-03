@@ -109,6 +109,9 @@ void TraceSession::finalize() {
     }
     if (!finalized_) {
         finalized_ = true;
+        // Indexes are deferred during the trace (bulk load into bare tables);
+        // build them now, before populate_counts which groups by pid.
+        db_.create_indexes();
         db_.populate_counts();
         db_.analyze();
     }

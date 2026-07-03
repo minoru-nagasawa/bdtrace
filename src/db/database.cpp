@@ -34,6 +34,9 @@ bool Database::open(const std::string& path) {
     // Enable WAL mode
     exec("PRAGMA journal_mode=WAL");
     exec("PRAGMA synchronous=NORMAL");
+    // 16 MB page cache: cheap even on old boxes, speeds up bulk insert and
+    // the deferred index build in finalize
+    exec("PRAGMA cache_size=-16000");
 
     return true;
 }
@@ -48,9 +51,14 @@ void Database::close() {
 
 bool Database::init_schema() {
     if (!exec(get_schema_sql())) return false;
-    // Set schema version if not set
+    if (!prepare_stmts()) return false;
+    // Set schema version if not set (needs stmt_insert_meta_, so after prepare)
     insert_meta("schema_version", "3");
-    return prepare_stmts();
+    return true;
+}
+
+bool Database::create_indexes() {
+    return exec(get_index_sql());
 }
 
 bool Database::upgrade_schema() {
@@ -120,10 +128,9 @@ bool Database::upgrade_schema() {
         }
     }
 
-    // Ensure retroactive indexes exist
-    exec("CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename)");
-    exec("CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us)");
-    exec("CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename)");
+    // Ensure all indexes exist (the tracer defers index creation to finalize,
+    // so a DB from an interrupted trace arrives here without them)
+    create_indexes();
 
     // P2.6: Re-populate counts if all are zero (interrupted trace recovery)
     {

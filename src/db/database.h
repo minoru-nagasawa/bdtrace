@@ -32,6 +32,9 @@ public:
     void close();
     bool init_schema();
 
+    // Build all indexes; deferred until after bulk load during tracing
+    bool create_indexes();
+
     // Schema upgrade
     bool upgrade_schema();
 
