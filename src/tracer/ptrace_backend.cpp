@@ -1,3 +1,7 @@
+#ifndef _LARGEFILE64_SOURCE
+#define _LARGEFILE64_SOURCE 1  // pread64 for /proc/<pid>/mem on 32-bit builds
+#endif
+
 #include "ptrace_backend.h"
 #include "ptrace_defs.h"
 #include "../common/types.h"
@@ -58,9 +62,22 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_fork_events_(0), cnt_exec_events_(0)
     , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
     , cnt_sigstop_reinjected_(0), cnt_race_unknown_first_(0)
+    , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
 {}
 
-PtraceBackend::~PtraceBackend() {}
+PtraceBackend::~PtraceBackend() {
+    for (std::map<int, ProcessState>::iterator it = procs_.begin();
+         it != procs_.end(); ++it) {
+        close_mem_fd(it->second);
+    }
+}
+
+void PtraceBackend::close_mem_fd(ProcessState& ps) {
+    if (ps.mem_fd >= 0) {
+        close(ps.mem_fd);
+    }
+    ps.mem_fd = -1;
+}
 
 int PtraceBackend::start(const std::vector<std::string>& argv) {
     if (argv.empty()) {
@@ -248,6 +265,7 @@ int PtraceBackend::run_event_loop() {
                 session_.on_process_exit(pid, now_us(), exit_code);
             }
             LOG_DEBUG("Process %d exited with %d", pid, exit_code);
+            if (exit_it != procs_.end()) close_mem_fd(exit_it->second);
             procs_.erase(pid);
             continue;
         }
@@ -305,9 +323,11 @@ int PtraceBackend::run_event_loop() {
 void PtraceBackend::print_diag_counters(FILE* out) {
     std::fprintf(out,
         "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
-        "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld\n",
+        "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
+        "mem reads=%ld peek fallbacks=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
-        cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_);
+        cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
+        cnt_mem_reads_, cnt_peek_fallbacks_);
 }
 
 std::string PtraceBackend::read_proc_state(int pid) {
@@ -804,6 +824,9 @@ void PtraceBackend::handle_exec_event(int pid) {
         it->second.pending_syscall = -1;
         it->second.pending_path_addr = 0;
         it->second.pending_path_addr2 = 0;
+        // The /proc/<pid>/mem fd may be bound to the pre-exec address space on
+        // some kernels; drop it and reopen lazily against the new image.
+        close_mem_fd(it->second);
         // Refresh cached cwd (exec may change via interpreter path)
         it->second.cached_cwd = read_proc_link(pid, "cwd");
     }
@@ -845,9 +868,71 @@ void PtraceBackend::handle_exit_event(int pid, int status) {
     }
 }
 
+// Bulk path read via /proc/<pid>/mem: one pread per page instead of one
+// PTRACE_PEEKDATA per word. Works on Linux 2.6.x because the target is always
+// ptrace-stopped by us when this is called. Reads never cross a page boundary
+// so a string ending just before an unmapped page still succeeds.
+// Returns false if /proc/<pid>/mem is unusable (caller falls back to PEEKDATA).
+bool PtraceBackend::read_string_mem(ProcessState& ps, unsigned long addr,
+                                    size_t max_len, std::string& out) {
+    if (ps.mem_fd == -2) return false;
+    if (ps.mem_fd < 0) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/mem", ps.pid);
+        ps.mem_fd = open(path, O_RDONLY);
+        if (ps.mem_fd < 0) {
+            ps.mem_fd = -2;
+            return false;
+        }
+    }
+
+    static size_t page_size = 0;
+    if (page_size == 0) {
+        long p = sysconf(_SC_PAGESIZE);
+        page_size = (p > 0) ? (size_t)p : 4096;
+    }
+
+    char buf[4096];
+    size_t total = 0;
+    bool first_chunk = true;
+    while (total < max_len) {
+        size_t to_page_end = page_size - ((addr + total) % page_size);
+        size_t chunk = max_len - total;
+        if (chunk > to_page_end) chunk = to_page_end;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+
+        ssize_t n = pread64(ps.mem_fd, buf, chunk, (off64_t)(addr + total));
+        if (n <= 0) {
+            if (first_chunk) return false;  // fd unusable or addr bad: fall back
+            break;  // string runs into unmapped memory: return what we have
+        }
+        first_chunk = false;
+
+        const char* nul = (const char*)std::memchr(buf, '\0', (size_t)n);
+        if (nul) {
+            out.append(buf, nul - buf);
+            return true;
+        }
+        out.append(buf, (size_t)n);
+        total += (size_t)n;
+    }
+    return true;
+}
+
 std::string PtraceBackend::read_string(int pid, unsigned long addr, size_t max_len) {
     if (addr == 0) return std::string();
 
+    std::map<int, ProcessState>::iterator it = procs_.find(pid);
+    if (it != procs_.end()) {
+        std::string result;
+        if (read_string_mem(it->second, addr, max_len, result)) {
+            ++cnt_mem_reads_;
+            return result;
+        }
+    }
+
+    // Fallback: word-by-word PTRACE_PEEKDATA
+    ++cnt_peek_fallbacks_;
     std::string result;
     for (size_t i = 0; i < max_len; i += sizeof(long)) {
         errno = 0;

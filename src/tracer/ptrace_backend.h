@@ -36,6 +36,8 @@ private:
     long cnt_sig_reinjected_;      // signals re-injected to the tracee
     long cnt_sigstop_reinjected_;  // SIGSTOPs re-injected (red flag - see run_event_loop)
     long cnt_race_unknown_first_;  // child seen via waitpid() before its fork/clone event
+    long cnt_mem_reads_;           // path strings read in bulk via /proc/<pid>/mem
+    long cnt_peek_fallbacks_;      // path strings read word-by-word via PEEKDATA
 
     void check_stall();
     void print_diag_counters(FILE* out);
@@ -48,6 +50,9 @@ private:
     void handle_exit_event(int pid, int status);
 
     std::string read_string(int pid, unsigned long addr, size_t max_len = 4096);
+    bool read_string_mem(ProcessState& ps, unsigned long addr, size_t max_len,
+                         std::string& out);
+    void close_mem_fd(ProcessState& ps);
     std::string read_cmdline(int pid);
     std::string read_proc_link(int pid, const char* entry);
     std::string resolve_path_cached(int pid, const std::string& path);
