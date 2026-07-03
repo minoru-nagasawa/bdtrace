@@ -38,6 +38,8 @@ private:
     long cnt_race_unknown_first_;  // child seen via waitpid() before its fork/clone event
     long cnt_mem_reads_;           // path strings read in bulk via /proc/<pid>/mem
     long cnt_peek_fallbacks_;      // path strings read word-by-word via PEEKDATA
+    long cnt_getregs_skipped_;     // uninteresting syscall exits resumed without GETREGS
+    long cnt_phase_resyncs_;       // entry/exit phase toggle disagreed with ENOSYS check
 
     void check_stall();
     void print_diag_counters(FILE* out);

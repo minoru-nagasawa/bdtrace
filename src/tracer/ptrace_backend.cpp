@@ -63,6 +63,7 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
     , cnt_sigstop_reinjected_(0), cnt_race_unknown_first_(0)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
+    , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -324,10 +325,12 @@ void PtraceBackend::print_diag_counters(FILE* out) {
     std::fprintf(out,
         "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
-        "mem reads=%ld peek fallbacks=%ld\n",
+        "mem reads=%ld peek fallbacks=%ld | "
+        "getregs skipped=%ld phase resyncs=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
-        cnt_mem_reads_, cnt_peek_fallbacks_);
+        cnt_mem_reads_, cnt_peek_fallbacks_,
+        cnt_getregs_skipped_, cnt_phase_resyncs_);
 }
 
 std::string PtraceBackend::read_proc_state(int pid) {
@@ -525,6 +528,16 @@ void PtraceBackend::handle_syscall_stop(int pid) {
 
     ProcessState& ps = it->second;
 
+    // Fast path: the exit stop of a syscall we don't record. Nothing in the
+    // registers is needed, so skip PTRACE_GETREGS entirely (one syscall saved
+    // per uninteresting entry/exit pair - the majority during a build).
+    if (ps.sc_phase == SC_PHASE_EXIT_NEXT && !ps.exit_needed) {
+        ps.sc_phase = SC_PHASE_ENTRY_NEXT;
+        ps.pending_syscall = -1;
+        ++cnt_getregs_skipped_;
+        return;
+    }
+
     struct user_regs_struct regs;
     if (PT(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
 
@@ -534,6 +547,13 @@ void PtraceBackend::handle_syscall_stop(int pid) {
     // On syscall entry, rax == -ENOSYS (kernel sets this before dispatch).
     // On syscall exit, rax == actual return value.
     bool is_entry = (rax == -ENOSYS);
+
+    // The phase toggle normally agrees with the ENOSYS heuristic. If they
+    // disagree (e.g. a kernel that doesn't report a syscall-exit stop where we
+    // expected one), trust the registers and resync.
+    if (ps.sc_phase == SC_PHASE_ENTRY_NEXT && !is_entry) ++cnt_phase_resyncs_;
+    else if (ps.sc_phase == SC_PHASE_EXIT_NEXT && is_entry) ++cnt_phase_resyncs_;
+    ps.sc_phase = is_entry ? SC_PHASE_EXIT_NEXT : SC_PHASE_ENTRY_NEXT;
 
     if (is_entry) {
         ps.pending_syscall = syscall_nr;
@@ -605,6 +625,11 @@ void PtraceBackend::handle_syscall_stop(int pid) {
         else if (syscall_nr == SYS_FCHDIR_NR) {
             // No path to save; handled at exit via /proc/pid/cwd
         }
+
+        // Only syscalls that saved a path (plus fchdir) need their exit
+        // inspected; everything else lets the exit stop skip GETREGS.
+        ps.exit_needed = (ps.pending_path_addr != 0
+                          || syscall_nr == SYS_FCHDIR_NR);
     } else {
         // Syscall exit - record based on pending_syscall
         long sc = ps.pending_syscall;
@@ -759,6 +784,7 @@ void PtraceBackend::handle_syscall_stop(int pid) {
         ps.pending_syscall = -1;
         ps.pending_path_addr = 0;
         ps.pending_path_addr2 = 0;
+        ps.exit_needed = false;
     }
 }
 
@@ -824,6 +850,9 @@ void PtraceBackend::handle_exec_event(int pid) {
         it->second.pending_syscall = -1;
         it->second.pending_path_addr = 0;
         it->second.pending_path_addr2 = 0;
+        // The execve that triggered this event still reports a syscall-exit
+        // stop afterwards; nothing to inspect there.
+        it->second.exit_needed = false;
         // The /proc/<pid>/mem fd may be bound to the pre-exec address space on
         // some kernels; drop it and reopen lazily against the new image.
         close_mem_fd(it->second);
