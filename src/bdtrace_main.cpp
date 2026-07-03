@@ -15,20 +15,27 @@ static void usage() {
         "Usage: bdtrace [options] command [args...]\n"
         "\n"
         "Options:\n"
-        "  -o FILE   Output database file (default: bdtrace.db)\n"
-        "  -v        Verbose output (debug logging)\n"
-        "  -h        Show this help\n"
+        "  -o FILE       Output database file (default: bdtrace.db)\n"
+        "  --procs-only  Record only the process tree (no file accesses);\n"
+        "                tracees run at near-native speed\n"
+        "  -v            Verbose output (debug logging)\n"
+        "  -h            Show this help\n"
+        "  --            End of options; the command follows\n"
     );
 }
 
 int main(int argc, char* argv[]) {
     std::string db_path = "bdtrace.db";
     bdtrace::LogLevel log_level = bdtrace::LOG_INFO;
+    bool procs_only = false;
 
     int cmd_start = 1;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             db_path = argv[++i];
+            cmd_start = i + 1;
+        } else if (std::strcmp(argv[i], "--procs-only") == 0) {
+            procs_only = true;
             cmd_start = i + 1;
         } else if (std::strcmp(argv[i], "-v") == 0) {
             log_level = bdtrace::LOG_DEBUG;
@@ -36,6 +43,9 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
+        } else if (std::strcmp(argv[i], "--") == 0) {
+            cmd_start = i + 1;
+            break;
         } else {
             cmd_start = i;
             break;
@@ -64,6 +74,7 @@ int main(int argc, char* argv[]) {
     }
 
     bdtrace::PtraceBackend backend(session);
+    backend.set_procs_only(procs_only);
     if (backend.start(cmd_argv) != 0) {
         std::fprintf(stderr, "bdtrace: failed to start tracing\n");
         return 1;

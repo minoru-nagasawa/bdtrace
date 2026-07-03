@@ -57,7 +57,7 @@ static void alarm_handler(int) {
 }
 
 PtraceBackend::PtraceBackend(TraceSession& session)
-    : session_(session), root_pid_(0), running_(false)
+    : session_(session), root_pid_(0), running_(false), procs_only_(false)
     , last_event_us_(0), last_stall_report_us_(0)
     , cnt_fork_events_(0), cnt_exec_events_(0)
     , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
@@ -138,10 +138,18 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
 
     LOG_INFO("Tracing PID %d: %s", pid, rec.cmdline.c_str());
 
-    PT(PTRACE_SYSCALL, pid, 0, 0);
+    resume(pid, 0);
 
     running_ = true;
     return 0;
+}
+
+// Resume a stopped tracee. Normal mode stops at every syscall entry/exit
+// (PTRACE_SYSCALL); procs-only mode uses PTRACE_CONT, so tracees run at
+// near-native speed and only fork/exec/exit events (which PTRACE_O_TRACE*
+// deliver under CONT as well) reach the tracer.
+void PtraceBackend::resume(int pid, long sig) {
+    PT(procs_only_ ? PTRACE_CONT : PTRACE_SYSCALL, pid, 0, sig);
 }
 
 void PtraceBackend::setup_child(int pid) {
@@ -279,31 +287,31 @@ int PtraceBackend::run_event_loop() {
         if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
             ++cnt_fork_events_;
             handle_fork_event(pid);
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else if (event == PTRACE_EVENT_EXEC) {
             ++cnt_exec_events_;
             handle_exec_event(pid);
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else if (event == PTRACE_EVENT_EXIT) {
             handle_exit_event(pid, status);
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else if (sig == (SIGTRAP | 0x80)) {
             handle_syscall_stop(pid);
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else if (sig == SIGTRAP) {
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else if (sig == SIGSTOP && !procs_[pid].traced) {
             setup_child(pid);
             procs_[pid].traced = true;
             ++cnt_sigstop_swallowed_;
-            PT(PTRACE_SYSCALL, pid, 0, 0);
+            resume(pid, 0);
         } else {
             // Re-inject any other signal to the tracee. A SIGSTOP reaching here
             // (i.e. for an already-traced process) is a red flag: it leaves the
             // tracee stopped and is the classic cause of a multi-threaded hang.
             if (sig == SIGSTOP) ++cnt_sigstop_reinjected_;
             ++cnt_sig_reinjected_;
-            PT(PTRACE_SYSCALL, pid, 0, (long)sig);
+            resume(pid, (long)sig);
         }
     }
 

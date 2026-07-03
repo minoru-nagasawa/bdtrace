@@ -17,6 +17,10 @@ public:
     explicit PtraceBackend(TraceSession& session);
     ~PtraceBackend();
 
+    // Record only the process tree (fork/exec/exit), skipping all syscall
+    // stops: tracees run under PTRACE_CONT at near-native speed.
+    void set_procs_only(bool on) { procs_only_ = on; }
+
     int start(const std::vector<std::string>& argv);
     int run_event_loop();
     void stop();
@@ -26,6 +30,7 @@ private:
     std::map<int, ProcessState> procs_;
     int root_pid_;
     volatile bool running_;
+    bool procs_only_;
 
     // Diagnostics: stall watchdog + signal/race counters (always on).
     int64_t last_event_us_;        // timestamp of the most recent waitpid() event
@@ -46,6 +51,7 @@ private:
     std::string read_proc_state(int pid);
 
     void setup_child(int pid);
+    void resume(int pid, long sig);
     void handle_syscall_stop(int pid);
     void handle_fork_event(int pid);
     void handle_exec_event(int pid);
