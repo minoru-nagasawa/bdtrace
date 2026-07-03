@@ -11,7 +11,17 @@ TraceSession::TraceSession()
     , write_error_count_(0), consecutive_errors_(0)
     , total_event_count_(0)
     , process_count_(0), file_access_count_(0), failed_access_count_(0)
+    , dedup_dropped_(0)
 {}
+
+bool TraceSession::already_seen(int pid, long key, const std::string& filename) {
+    SeenSet& seen = seen_[pid];
+    if (!seen.insert(std::make_pair(key, filename)).second) {
+        ++dedup_dropped_;
+        return true;
+    }
+    return false;
+}
 
 TraceSession::~TraceSession() {
     finalize();
@@ -39,6 +49,8 @@ void TraceSession::check_write_result(bool ok, const char* op) {
 
 void TraceSession::on_process_start(const ProcessRecord& rec) {
     if (has_fatal_errors()) return;
+    // New incarnation of this pid (fork or exec): forget previous accesses
+    seen_.erase(rec.pid);
     if (!in_transaction_) {
         db_.begin_transaction();
         in_transaction_ = true;
@@ -63,12 +75,14 @@ void TraceSession::on_process_exit(int pid, int64_t end_time_us, int exit_code,
                                 user_time_us, sys_time_us, peak_rss_kb,
                                 io_read_bytes, io_write_bytes),
         "update_process_exit");
+    seen_.erase(pid);
     ++event_count_;
     maybe_commit();
 }
 
 void TraceSession::on_file_access(const FileAccessRecord& rec) {
     if (has_fatal_errors()) return;
+    if (already_seen(rec.pid, rec.mode, rec.filename)) return;
     if (!in_transaction_) {
         db_.begin_transaction();
         in_transaction_ = true;
@@ -81,6 +95,9 @@ void TraceSession::on_file_access(const FileAccessRecord& rec) {
 
 void TraceSession::on_failed_access(const FailedAccessRecord& rec) {
     if (has_fatal_errors()) return;
+    // Distinguish failed from successful accesses (and by errno) in the key
+    long key = 0x40000000L | ((long)rec.errno_val << 8) | (long)rec.mode;
+    if (already_seen(rec.pid, key, rec.filename)) return;
     if (!in_transaction_) {
         db_.begin_transaction();
         in_transaction_ = true;
@@ -114,10 +131,14 @@ void TraceSession::finalize() {
         db_.create_indexes();
         db_.populate_counts();
         db_.analyze();
+        if (write_error_count_ > 0) {
+            LOG_WARN("Trace completed with %d DB write errors", write_error_count_);
+        }
+        if (dedup_dropped_ > 0) {
+            LOG_INFO("Dedup: %ld repeated accesses not written", dedup_dropped_);
+        }
     }
-    if (write_error_count_ > 0) {
-        LOG_WARN("Trace completed with %d DB write errors", write_error_count_);
-    }
+    seen_.clear();
 }
 
 void TraceSession::maybe_commit() {

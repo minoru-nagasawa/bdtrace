@@ -1,7 +1,10 @@
 #ifndef BDTRACE_TRACE_SESSION_H
 #define BDTRACE_TRACE_SESSION_H
 
+#include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include "../db/database.h"
 #include "../common/types.h"
 
@@ -52,6 +55,15 @@ private:
     int file_access_count_;
     int failed_access_count_;
 
+    // Dedup: per process (per exec incarnation), remember which accesses were
+    // already written and drop repeats. Key encodes mode (and errno for failed
+    // accesses) alongside the path. Cleared when the pid starts a new
+    // incarnation (fork/exec) and freed when it exits.
+    typedef std::set<std::pair<long, std::string> > SeenSet;
+    std::map<int, SeenSet> seen_;
+    long dedup_dropped_;
+
+    bool already_seen(int pid, long key, const std::string& filename);
     void maybe_commit();
     void check_write_result(bool ok, const char* op);
 };
