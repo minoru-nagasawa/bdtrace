@@ -126,12 +126,13 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
 
     ProcessState ps(pid, getpid());
     ps.cached_cwd = read_proc_link(pid, "cwd");
+    ps.cached_cmdline = read_cmdline(pid);
     procs_[pid] = ps;
 
     ProcessRecord rec;
     rec.pid = pid;
     rec.ppid = getpid();
-    rec.cmdline = read_cmdline(pid);
+    rec.cmdline = ps.cached_cmdline;
     rec.cwd = ps.cached_cwd;
     rec.start_time_us = now_us();
     session_.on_process_start(rec);
@@ -253,29 +254,23 @@ int PtraceBackend::run_event_loop() {
         // re-injected, leaving the child permanently stopped - which deadlocks
         // multi-threaded tracees (e.g. the JVM waits at a safepoint barrier for
         // the stopped thread forever, and the tracer then blocks in waitpid()).
-        if (procs_.find(pid) == procs_.end()) {
-            ProcessState ps(pid, 0);
-            procs_[pid] = ps;
+        std::map<int, ProcessState>::iterator pit = procs_.find(pid);
+        if (pit == procs_.end()) {
+            pit = procs_.insert(std::make_pair(pid, ProcessState(pid, 0))).first;
             setup_child(pid);
             ++cnt_race_unknown_first_;
         }
+        ProcessState& ps = pit->second;
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
-            std::map<int, ProcessState>::iterator exit_it = procs_.find(pid);
-            if (exit_it != procs_.end()) {
-                session_.on_process_exit(pid, now_us(), exit_code,
-                                         exit_it->second.user_time_us,
-                                         exit_it->second.sys_time_us,
-                                         exit_it->second.peak_rss_kb,
-                                         exit_it->second.io_read_bytes,
-                                         exit_it->second.io_write_bytes);
-            } else {
-                session_.on_process_exit(pid, now_us(), exit_code);
-            }
+            session_.on_process_exit(pid, now_us(), exit_code,
+                                     ps.user_time_us, ps.sys_time_us,
+                                     ps.peak_rss_kb,
+                                     ps.io_read_bytes, ps.io_write_bytes);
             LOG_DEBUG("Process %d exited with %d", pid, exit_code);
-            if (exit_it != procs_.end()) close_mem_fd(exit_it->second);
-            procs_.erase(pid);
+            close_mem_fd(ps);
+            procs_.erase(pit);
             continue;
         }
 
@@ -296,13 +291,13 @@ int PtraceBackend::run_event_loop() {
             handle_exit_event(pid, status);
             resume(pid, 0);
         } else if (sig == (SIGTRAP | 0x80)) {
-            handle_syscall_stop(pid);
+            handle_syscall_stop(pid, ps);
             resume(pid, 0);
         } else if (sig == SIGTRAP) {
             resume(pid, 0);
-        } else if (sig == SIGSTOP && !procs_[pid].traced) {
+        } else if (sig == SIGSTOP && !ps.traced) {
             setup_child(pid);
-            procs_[pid].traced = true;
+            ps.traced = true;
             ++cnt_sigstop_swallowed_;
             resume(pid, 0);
         } else {
@@ -530,12 +525,7 @@ void PtraceBackend::record_failed_access(int pid, unsigned long addr, FileAccess
     }
 }
 
-void PtraceBackend::handle_syscall_stop(int pid) {
-    std::map<int, ProcessState>::iterator it = procs_.find(pid);
-    if (it == procs_.end()) return;
-
-    ProcessState& ps = it->second;
-
+void PtraceBackend::handle_syscall_stop(int pid, ProcessState& ps) {
     // Fast path: the exit stop of a syscall we don't record. Nothing in the
     // registers is needed, so skip PTRACE_GETREGS entirely (one syscall saved
     // per uninteresting entry/exit pair - the majority during a build).
@@ -804,13 +794,20 @@ void PtraceBackend::handle_fork_event(int pid) {
 
     LOG_DEBUG("Fork: %d -> %d", pid, (int)child_pid);
 
-    // Inherit parent's cached cwd (fork/clone preserves cwd).
+    // Inherit parent's cached cwd and cmdline (fork/clone preserves both;
+    // they only change on exec, which refreshes the caches).
     std::string cwd;
+    std::string cmdline;
     std::map<int, ProcessState>::iterator parent_it = procs_.find(pid);
     if (parent_it != procs_.end() && !parent_it->second.cached_cwd.empty()) {
         cwd = parent_it->second.cached_cwd;
     } else {
         cwd = read_proc_link((int)child_pid, "cwd");
+    }
+    if (parent_it != procs_.end() && !parent_it->second.cached_cmdline.empty()) {
+        cmdline = parent_it->second.cached_cmdline;
+    } else {
+        cmdline = read_cmdline((int)child_pid);
     }
 
     // The child's initial SIGSTOP and this parent-side fork/clone event may be
@@ -822,9 +819,11 @@ void PtraceBackend::handle_fork_event(int pid) {
     if (child_it != procs_.end()) {
         child_it->second.ppid = pid;
         child_it->second.cached_cwd = cwd;
+        child_it->second.cached_cmdline = cmdline;
     } else {
         ProcessState ps((int)child_pid, pid);
         ps.cached_cwd = cwd;
+        ps.cached_cmdline = cmdline;
         procs_[(int)child_pid] = ps;
     }
 
@@ -832,7 +831,7 @@ void PtraceBackend::handle_fork_event(int pid) {
     rec.pid = (int)child_pid;
     rec.ppid = pid;
     rec.start_time_us = now_us();
-    rec.cmdline = read_cmdline((int)child_pid);
+    rec.cmdline = cmdline;
     rec.cwd = cwd;
     session_.on_process_start(rec);
 }
@@ -866,6 +865,7 @@ void PtraceBackend::handle_exec_event(int pid) {
         close_mem_fd(it->second);
         // Refresh cached cwd (exec may change via interpreter path)
         it->second.cached_cwd = read_proc_link(pid, "cwd");
+        it->second.cached_cmdline = cmdline;
     }
 
     ProcessRecord rec;

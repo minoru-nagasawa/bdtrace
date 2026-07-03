@@ -3,7 +3,7 @@
 
 namespace bdtrace {
 
-static LogLevel g_log_level = LOG_INFO;
+LogLevel g_log_level = LOG_INFO;
 
 void log_init(LogLevel level) {
     g_log_level = level;

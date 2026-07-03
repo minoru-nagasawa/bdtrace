@@ -13,14 +13,21 @@ enum LogLevel {
     LOG_DEBUG = 3
 };
 
+extern LogLevel g_log_level;
+
 void log_init(LogLevel level);
 void log_msg(LogLevel level, const char* fmt, ...);
 
 } // namespace bdtrace
 
-#define LOG_ERROR(...) ::bdtrace::log_msg(::bdtrace::LOG_ERROR, __VA_ARGS__)
-#define LOG_WARN(...)  ::bdtrace::log_msg(::bdtrace::LOG_WARN, __VA_ARGS__)
-#define LOG_INFO(...)  ::bdtrace::log_msg(::bdtrace::LOG_INFO, __VA_ARGS__)
-#define LOG_DEBUG(...) ::bdtrace::log_msg(::bdtrace::LOG_DEBUG, __VA_ARGS__)
+// Check the level in the macro so disabled messages (notably LOG_DEBUG in the
+// per-syscall hot path) cost one integer compare, not a varargs call.
+#define BDTRACE_LOG(lvl, ...) \
+    do { if ((lvl) <= ::bdtrace::g_log_level) ::bdtrace::log_msg((lvl), __VA_ARGS__); } while (0)
+
+#define LOG_ERROR(...) BDTRACE_LOG(::bdtrace::LOG_ERROR, __VA_ARGS__)
+#define LOG_WARN(...)  BDTRACE_LOG(::bdtrace::LOG_WARN, __VA_ARGS__)
+#define LOG_INFO(...)  BDTRACE_LOG(::bdtrace::LOG_INFO, __VA_ARGS__)
+#define LOG_DEBUG(...) BDTRACE_LOG(::bdtrace::LOG_DEBUG, __VA_ARGS__)
 
 #endif // BDTRACE_LOG_H

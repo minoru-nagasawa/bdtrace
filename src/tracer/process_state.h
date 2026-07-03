@@ -28,6 +28,7 @@ struct ProcessState {
     bool traced;           // has been set up with PTRACE_SETOPTIONS
     int mem_fd;            // cached /proc/<pid>/mem fd (-1: not opened, -2: open failed)
     std::string cached_cwd; // cached cwd, updated on chdir/fchdir
+    std::string cached_cmdline; // cmdline as of last fork/exec (children inherit)
     int64_t user_time_us;
     int64_t sys_time_us;
     int64_t peak_rss_kb;
