@@ -28,12 +28,19 @@ const char* get_schema_sql() {
         "  file_count INTEGER DEFAULT 0,"
         "  fail_count INTEGER DEFAULT 0"
         ");"
-        // Plain INTEGER PRIMARY KEY (rowid alias): AUTOINCREMENT would update
-        // sqlite_sequence on every insert for no benefit here.
+        // Filenames are interned in files(id, path): builds touch the same
+        // headers thousands of times, so storing an integer per access keeps
+        // the DB and its indexes small. Plain INTEGER PRIMARY KEY (rowid
+        // alias): AUTOINCREMENT would update sqlite_sequence on every insert
+        // for no benefit here.
+        "CREATE TABLE IF NOT EXISTS files ("
+        "  id INTEGER PRIMARY KEY,"
+        "  path TEXT UNIQUE NOT NULL"
+        ");"
         "CREATE TABLE IF NOT EXISTS file_accesses ("
         "  id INTEGER PRIMARY KEY,"
         "  pid INTEGER NOT NULL,"
-        "  filename TEXT NOT NULL,"
+        "  file_id INTEGER NOT NULL,"
         "  mode INTEGER NOT NULL,"
         "  fd INTEGER,"
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
@@ -41,7 +48,7 @@ const char* get_schema_sql() {
         "CREATE TABLE IF NOT EXISTS failed_accesses ("
         "  id INTEGER PRIMARY KEY,"
         "  pid INTEGER NOT NULL,"
-        "  filename TEXT NOT NULL,"
+        "  file_id INTEGER NOT NULL,"
         "  mode INTEGER NOT NULL,"
         "  errno_val INTEGER NOT NULL,"
         "  timestamp_us INTEGER NOT NULL DEFAULT 0"
@@ -50,16 +57,17 @@ const char* get_schema_sql() {
 }
 
 // All indexes. Run after bulk load (tracer finalize) and by the viewers on
-// open, so a DB from an interrupted trace still gets indexed. idx_fa_pid was
-// dropped: idx_fa_pid_filename covers pid-only lookups as a prefix.
+// open, so a DB from an interrupted trace still gets indexed. Path lookups go
+// through files.path, whose UNIQUE constraint provides the index; pid-only
+// lookups use idx_fa_pid_file as a prefix.
 const char* get_index_sql() {
     return
         "CREATE INDEX IF NOT EXISTS idx_proc_ppid ON processes(ppid);"
         "CREATE INDEX IF NOT EXISTS idx_proc_start ON processes(start_time_us);"
-        "CREATE INDEX IF NOT EXISTS idx_fa_filename ON file_accesses(filename);"
-        "CREATE INDEX IF NOT EXISTS idx_fa_pid_filename ON file_accesses(pid, filename);"
+        "CREATE INDEX IF NOT EXISTS idx_fa_file ON file_accesses(file_id);"
+        "CREATE INDEX IF NOT EXISTS idx_fa_pid_file ON file_accesses(pid, file_id);"
         "CREATE INDEX IF NOT EXISTS idx_failed_pid ON failed_accesses(pid);"
-        "CREATE INDEX IF NOT EXISTS idx_failed_filename ON failed_accesses(filename);"
+        "CREATE INDEX IF NOT EXISTS idx_failed_file ON failed_accesses(file_id);"
         ;
 }
 

@@ -102,6 +102,16 @@ public:
 private:
     bool exec(const char* sql);
     bool prepare(const char* sql, sqlite3_stmt** stmt);
+    bool has_column(const char* table, const char* column);
+
+    // Filenames are interned: files(id, path UNIQUE) with integer file_id
+    // FKs in file_accesses/failed_accesses. Returns the id for a path,
+    // inserting it if unseen; caches path->id to avoid a SELECT per insert.
+    int64_t intern_path(const std::string& path, bool& ok);
+
+    // One-time physical migration of a pre-v6 DB (TEXT filename columns) to
+    // the interned layout. No-op if already migrated.
+    bool migrate_to_interned();
 
     sqlite3* db_;
     std::string last_error_;
@@ -113,6 +123,10 @@ private:
     sqlite3_stmt* stmt_insert_meta_;
     sqlite3_stmt* stmt_insert_failed_;
     sqlite3_stmt* stmt_delete_process_;
+    sqlite3_stmt* stmt_intern_insert_;
+    sqlite3_stmt* stmt_intern_select_;
+
+    std::map<std::string, int64_t> intern_cache_;
 
     void finalize_stmts();
     bool prepare_stmts();

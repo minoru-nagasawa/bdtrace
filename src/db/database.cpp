@@ -17,6 +17,8 @@ Database::Database()
     , stmt_insert_meta_(0)
     , stmt_insert_failed_(0)
     , stmt_delete_process_(0)
+    , stmt_intern_insert_(0)
+    , stmt_intern_select_(0)
 {}
 
 Database::~Database() {
@@ -51,10 +53,65 @@ void Database::close() {
 
 bool Database::init_schema() {
     if (!exec(get_schema_sql())) return false;
+    // Re-tracing into a pre-v6 DB: convert to interned filenames before the
+    // insert statements (which reference file_id) are prepared.
+    if (!migrate_to_interned()) return false;
     if (!prepare_stmts()) return false;
     // Set schema version if not set (needs stmt_insert_meta_, so after prepare)
-    insert_meta("schema_version", "3");
+    insert_meta("schema_version", "6");
     return true;
+}
+
+bool Database::has_column(const char* table, const char* column) {
+    char sql[256];
+    std::snprintf(sql, sizeof(sql), "SELECT %s FROM %s LIMIT 0", column, table);
+    sqlite3_stmt* stmt = 0;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) != SQLITE_OK) return false;
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool Database::migrate_to_interned() {
+    bool fa_old = has_table("file_accesses") && has_column("file_accesses", "filename");
+    bool failed_old = has_table("failed_accesses") && has_column("failed_accesses", "filename");
+    if (!fa_old && !failed_old) return true;
+
+    LOG_INFO("Migrating database to interned filenames (schema v6)...");
+    if (!exec("BEGIN TRANSACTION")) return false;
+    bool ok = exec("CREATE TABLE IF NOT EXISTS files ("
+                   "id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL)");
+    if (ok && fa_old) {
+        ok = exec("INSERT OR IGNORE INTO files(path) "
+                  "SELECT DISTINCT filename FROM file_accesses")
+          && exec("CREATE TABLE file_accesses_v6 ("
+                  "id INTEGER PRIMARY KEY, pid INTEGER NOT NULL,"
+                  "file_id INTEGER NOT NULL, mode INTEGER NOT NULL,"
+                  "fd INTEGER, timestamp_us INTEGER NOT NULL DEFAULT 0)")
+          && exec("INSERT INTO file_accesses_v6 (id, pid, file_id, mode, fd, timestamp_us) "
+                  "SELECT a.id, a.pid, f.id, a.mode, a.fd, a.timestamp_us "
+                  "FROM file_accesses a JOIN files f ON f.path = a.filename")
+          && exec("DROP TABLE file_accesses")
+          && exec("ALTER TABLE file_accesses_v6 RENAME TO file_accesses");
+    }
+    if (ok && failed_old) {
+        ok = exec("INSERT OR IGNORE INTO files(path) "
+                  "SELECT DISTINCT filename FROM failed_accesses")
+          && exec("CREATE TABLE failed_accesses_v6 ("
+                  "id INTEGER PRIMARY KEY, pid INTEGER NOT NULL,"
+                  "file_id INTEGER NOT NULL, mode INTEGER NOT NULL,"
+                  "errno_val INTEGER NOT NULL, timestamp_us INTEGER NOT NULL DEFAULT 0)")
+          && exec("INSERT INTO failed_accesses_v6 (id, pid, file_id, mode, errno_val, timestamp_us) "
+                  "SELECT a.id, a.pid, f.id, a.mode, a.errno_val, a.timestamp_us "
+                  "FROM failed_accesses a JOIN files f ON f.path = a.filename")
+          && exec("DROP TABLE failed_accesses")
+          && exec("ALTER TABLE failed_accesses_v6 RENAME TO failed_accesses");
+    }
+    if (!ok) {
+        exec("ROLLBACK");
+        LOG_ERROR("Schema v6 migration failed: %s", last_error_.c_str());
+        return false;
+    }
+    return exec("COMMIT");
 }
 
 bool Database::create_indexes() {
@@ -127,6 +184,10 @@ bool Database::upgrade_schema() {
             sqlite3_finalize(stmt);
         }
     }
+
+    // v6: interned filenames (must precede index creation, which references
+    // the file_id columns)
+    if (!migrate_to_interned()) return false;
 
     // Ensure all indexes exist (the tracer defers index creation to finalize,
     // so a DB from an interrupted trace arrives here without them)
@@ -210,15 +271,52 @@ bool Database::prepare_stmts() {
         return false;
     if (!prepare("UPDATE processes SET end_time_us = ?, exit_code = ?, user_time_us = ?, sys_time_us = ?, peak_rss_kb = ?, io_read_bytes = ?, io_write_bytes = ? WHERE pid = ?", &stmt_update_exit_))
         return false;
-    if (!prepare("INSERT INTO file_accesses (pid, filename, mode, fd, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_file_))
+    if (!prepare("INSERT INTO file_accesses (pid, file_id, mode, fd, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_file_))
         return false;
     if (!prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", &stmt_insert_meta_))
         return false;
-    if (!prepare("INSERT INTO failed_accesses (pid, filename, mode, errno_val, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_failed_))
+    if (!prepare("INSERT INTO failed_accesses (pid, file_id, mode, errno_val, timestamp_us) VALUES (?, ?, ?, ?, ?)", &stmt_insert_failed_))
         return false;
     if (!prepare("DELETE FROM processes WHERE pid = ?", &stmt_delete_process_))
         return false;
+    if (!prepare("INSERT OR IGNORE INTO files (path) VALUES (?)", &stmt_intern_insert_))
+        return false;
+    if (!prepare("SELECT id FROM files WHERE path = ?", &stmt_intern_select_))
+        return false;
     return true;
+}
+
+int64_t Database::intern_path(const std::string& path, bool& ok) {
+    std::map<std::string, int64_t>::iterator it = intern_cache_.find(path);
+    if (it != intern_cache_.end()) {
+        ok = true;
+        return it->second;
+    }
+    sqlite3_reset(stmt_intern_insert_);
+    sqlite3_bind_text(stmt_intern_insert_, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt_intern_insert_) != SQLITE_DONE) {
+        last_error_ = sqlite3_errmsg(db_);
+        ok = false;
+        return 0;
+    }
+    int64_t id;
+    if (sqlite3_changes(db_) > 0) {
+        id = sqlite3_last_insert_rowid(db_);
+    } else {
+        // Row already existed (e.g. cache lost across sessions): look it up
+        sqlite3_reset(stmt_intern_select_);
+        sqlite3_bind_text(stmt_intern_select_, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt_intern_select_) != SQLITE_ROW) {
+            last_error_ = sqlite3_errmsg(db_);
+            ok = false;
+            return 0;
+        }
+        id = sqlite3_column_int64(stmt_intern_select_, 0);
+        sqlite3_reset(stmt_intern_select_);
+    }
+    intern_cache_[path] = id;
+    ok = true;
+    return id;
 }
 
 void Database::finalize_stmts() {
@@ -228,6 +326,8 @@ void Database::finalize_stmts() {
     if (stmt_insert_meta_)    { sqlite3_finalize(stmt_insert_meta_);    stmt_insert_meta_ = 0; }
     if (stmt_insert_failed_)  { sqlite3_finalize(stmt_insert_failed_);  stmt_insert_failed_ = 0; }
     if (stmt_delete_process_) { sqlite3_finalize(stmt_delete_process_); stmt_delete_process_ = 0; }
+    if (stmt_intern_insert_)  { sqlite3_finalize(stmt_intern_insert_);  stmt_intern_insert_ = 0; }
+    if (stmt_intern_select_)  { sqlite3_finalize(stmt_intern_select_);  stmt_intern_select_ = 0; }
 }
 
 bool Database::insert_meta(const std::string& key, const std::string& value) {
@@ -281,9 +381,12 @@ bool Database::update_process_exit(int pid, int64_t end_time_us, int exit_code,
 }
 
 bool Database::insert_file_access(const FileAccessRecord& rec) {
+    bool ok = false;
+    int64_t file_id = intern_path(rec.filename, ok);
+    if (!ok) return false;
     sqlite3_reset(stmt_insert_file_);
     sqlite3_bind_int(stmt_insert_file_, 1, rec.pid);
-    sqlite3_bind_text(stmt_insert_file_, 2, rec.filename.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt_insert_file_, 2, file_id);
     sqlite3_bind_int(stmt_insert_file_, 3, rec.mode);
     sqlite3_bind_int(stmt_insert_file_, 4, rec.fd);
     sqlite3_bind_int64(stmt_insert_file_, 5, rec.timestamp_us);
@@ -307,9 +410,12 @@ bool Database::delete_process(int pid) {
 }
 
 bool Database::insert_failed_access(const FailedAccessRecord& rec) {
+    bool ok = false;
+    int64_t file_id = intern_path(rec.filename, ok);
+    if (!ok) return false;
     sqlite3_reset(stmt_insert_failed_);
     sqlite3_bind_int(stmt_insert_failed_, 1, rec.pid);
-    sqlite3_bind_text(stmt_insert_failed_, 2, rec.filename.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt_insert_failed_, 2, file_id);
     sqlite3_bind_int(stmt_insert_failed_, 3, rec.mode);
     sqlite3_bind_int(stmt_insert_failed_, 4, rec.errno_val);
     sqlite3_bind_int64(stmt_insert_failed_, 5, rec.timestamp_us);
@@ -474,7 +580,9 @@ static FileAccessRecord row_to_file_access(sqlite3_stmt* stmt) {
 
 bool Database::get_file_accesses_by_pid(int pid, std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE pid = ?", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode, a.fd, a.timestamp_us "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+                 "WHERE a.pid = ?", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, pid);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -486,7 +594,9 @@ bool Database::get_file_accesses_by_pid(int pid, std::vector<FileAccessRecord>& 
 
 bool Database::get_file_accesses_by_name(const std::string& filename, std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE filename = ?", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode, a.fd, a.timestamp_us "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+                 "WHERE a.file_id = (SELECT id FROM files WHERE path = ?)", &stmt))
         return false;
     sqlite3_bind_text(stmt, 1, filename.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -498,7 +608,8 @@ bool Database::get_file_accesses_by_name(const std::string& filename, std::vecto
 
 bool Database::get_all_file_accesses(std::vector<FileAccessRecord>& out) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode, a.fd, a.timestamp_us "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         out.push_back(row_to_file_access(stmt));
@@ -510,7 +621,8 @@ bool Database::get_all_file_accesses(std::vector<FileAccessRecord>& out) {
 bool Database::get_all_failed_accesses(std::vector<FailedAccessRecord>& out) {
     if (!has_table("failed_accesses")) return true;
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, errno_val, timestamp_us FROM failed_accesses", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode, a.errno_val, a.timestamp_us "
+                 "FROM failed_accesses a JOIN files f ON f.id = a.file_id", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         FailedAccessRecord r;
@@ -568,7 +680,9 @@ bool Database::get_file_accesses_by_prefix(const std::string& prefix, std::vecto
         upper[upper.size() - 1] = upper[upper.size() - 1] + 1;
     }
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode, fd, timestamp_us FROM file_accesses WHERE filename >= ? AND filename < ?", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode, a.fd, a.timestamp_us "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+                 "WHERE f.path >= ? AND f.path < ?", &stmt))
         return false;
     sqlite3_bind_text(stmt, 1, pfx.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, upper.c_str(), -1, SQLITE_TRANSIENT);
@@ -594,8 +708,9 @@ int Database::scan_file_accesses_by_prefix(const std::string& prefix,
         upper[upper.size() - 1] = upper[upper.size() - 1] + 1;
     }
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode FROM file_accesses "
-                 "WHERE filename >= ? AND filename < ?", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+                 "WHERE f.path >= ? AND f.path < ?", &stmt))
         return -1;
     sqlite3_bind_text(stmt, 1, pfx.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, upper.c_str(), -1, SQLITE_TRANSIENT);
@@ -613,7 +728,8 @@ int Database::scan_file_accesses_by_prefix(const std::string& prefix,
 
 int Database::scan_all_file_accesses(FileScanCallback cb, void* user_data) {
     sqlite3_stmt* stmt = 0;
-    if (!prepare("SELECT pid, filename, mode FROM file_accesses", &stmt))
+    if (!prepare("SELECT a.pid, f.path, a.mode "
+                 "FROM file_accesses a JOIN files f ON f.id = a.file_id", &stmt))
         return -1;
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -630,11 +746,12 @@ int Database::scan_all_file_accesses(FileScanCallback cb, void* user_data) {
 bool Database::get_file_stats_grouped(std::vector<FileStatRow>& out) {
     sqlite3_stmt* stmt = 0;
     if (!prepare(
-            "SELECT filename, COUNT(*), "
-            "SUM(CASE WHEN mode IN (0,2,3,4,5,9) THEN 1 ELSE 0 END), "
-            "SUM(CASE WHEN mode IN (1,2,8,10,12,14,17,18) THEN 1 ELSE 0 END), "
-            "COUNT(DISTINCT pid) "
-            "FROM file_accesses GROUP BY filename", &stmt))
+            "SELECT f.path, COUNT(*), "
+            "SUM(CASE WHEN a.mode IN (0,2,3,4,5,9) THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN a.mode IN (1,2,8,10,12,14,17,18) THEN 1 ELSE 0 END), "
+            "COUNT(DISTINCT a.pid) "
+            "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+            "GROUP BY a.file_id", &stmt))
         return false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         FileStatRow r;
@@ -653,8 +770,9 @@ bool Database::get_file_stats_grouped(std::vector<FileStatRow>& out) {
 bool Database::get_file_accesses_by_pids(const std::set<int>& pids,
                                           std::vector<FileAccessRecord>& out) {
     if (pids.empty()) return true;
-    std::string sql = "SELECT pid, filename, mode, fd, timestamp_us "
-                      "FROM file_accesses WHERE pid IN (";
+    std::string sql = "SELECT a.pid, f.path, a.mode, a.fd, a.timestamp_us "
+                      "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+                      "WHERE a.pid IN (";
     bool first = true;
     for (std::set<int>::const_iterator it = pids.begin(); it != pids.end(); ++it) {
         if (!first) sql += ",";
@@ -705,11 +823,11 @@ bool Database::get_hotfile_stats(int min_procs, int& file_count,
     worst_file.clear();
     sqlite3_stmt* stmt = 0;
     if (!prepare(
-            "SELECT filename, COUNT(DISTINCT pid) as num_procs "
-            "FROM file_accesses "
-            "WHERE mode IN (0,2,3,4,5,9) "
-            "GROUP BY filename "
-            "HAVING COUNT(DISTINCT pid) > ? "
+            "SELECT f.path, COUNT(DISTINCT a.pid) as num_procs "
+            "FROM file_accesses a JOIN files f ON f.id = a.file_id "
+            "WHERE a.mode IN (0,2,3,4,5,9) "
+            "GROUP BY a.file_id "
+            "HAVING COUNT(DISTINCT a.pid) > ? "
             "ORDER BY num_procs DESC", &stmt))
         return false;
     sqlite3_bind_int(stmt, 1, min_procs);
