@@ -183,7 +183,7 @@ int PtraceBackend::run_event_loop() {
             if (elapsed_us > 0) {
                 ev_per_sec = (int)((int64_t)(procs + files) * 1000000LL / elapsed_us);
             }
-            int64_t db_bytes = session_.db().get_db_size_bytes();
+            int64_t db_bytes = session_.db_size_bytes();
             int db_mb = (int)(db_bytes / (1024 * 1024));
             std::fprintf(stderr,
                 "[bdtrace] %02d:%02d:%02d | %d procs | %d files | %d ev/s | DB: %d MB",
