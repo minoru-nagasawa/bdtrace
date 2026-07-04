@@ -146,4 +146,11 @@ make test-openssl-transparency   # optional: same for OpenSSL
 ```
 
 The transparency tests download and build real projects with and without tracing
-and compare the results.
+and compare the results byte-for-byte (and report the timing overhead).
+
+To run them in `--procs-only` mode — or with any other bdtrace options:
+
+```sh
+make test-lua-transparency-procs-only        # shorthand targets (also -gmake-, -openssl-)
+make test-lua-transparency BDTRACE_ARGS=--procs-only   # equivalent, any options work
+```

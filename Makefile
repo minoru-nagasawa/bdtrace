@@ -33,7 +33,9 @@ MONGOOSE_OBJ = vendor/mongoose.o
 ALL_OBJS = $(COMMON_OBJS) $(DB_OBJS) $(TRACER_OBJS) $(SQLITE_OBJ)
 
 # Targets
-.PHONY: all clean test test-lua-transparency test-gmake-transparency test-openssl-transparency fetch_sqlite fetch_mongoose embed_static
+.PHONY: all clean test test-lua-transparency test-gmake-transparency test-openssl-transparency \
+        test-lua-transparency-procs-only test-gmake-transparency-procs-only test-openssl-transparency-procs-only \
+        fetch_sqlite fetch_mongoose embed_static
 
 all: bdtrace bdview bdview-web
 
@@ -79,14 +81,26 @@ test_all: $(TEST_OBJS) $(TEST_LIBS) $(TRACER_OBJS)
 test: test_all
 	./test_all
 
+# Transparency tests. BDTRACE_ARGS passes extra bdtrace options through, e.g.
+#   make test-lua-transparency BDTRACE_ARGS=--procs-only
+# The *-procs-only targets are shorthand for exactly that.
 test-lua-transparency: bdtrace
-	bash scripts/test_lua_transparency.sh ./bdtrace
+	BDTRACE_ARGS="$(BDTRACE_ARGS)" bash scripts/test_lua_transparency.sh ./bdtrace
 
 test-gmake-transparency: bdtrace
-	bash scripts/test_gmake_transparency.sh ./bdtrace
+	BDTRACE_ARGS="$(BDTRACE_ARGS)" bash scripts/test_gmake_transparency.sh ./bdtrace
 
 test-openssl-transparency: bdtrace
-	bash scripts/test_openssl_transparency.sh ./bdtrace
+	BDTRACE_ARGS="$(BDTRACE_ARGS)" bash scripts/test_openssl_transparency.sh ./bdtrace
+
+test-lua-transparency-procs-only: bdtrace
+	BDTRACE_ARGS="--procs-only" bash scripts/test_lua_transparency.sh ./bdtrace
+
+test-gmake-transparency-procs-only: bdtrace
+	BDTRACE_ARGS="--procs-only" bash scripts/test_gmake_transparency.sh ./bdtrace
+
+test-openssl-transparency-procs-only: bdtrace
+	BDTRACE_ARGS="--procs-only" bash scripts/test_openssl_transparency.sh ./bdtrace
 
 fetch_sqlite:
 	bash scripts/fetch_sqlite.sh
