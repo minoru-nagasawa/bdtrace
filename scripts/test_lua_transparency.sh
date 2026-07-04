@@ -6,6 +6,7 @@
 #
 # Usage: scripts/test_build_transparency.sh [path-to-bdtrace]
 #        Default: ./bdtrace
+#        BDTRACE_ARGS="--procs-only" adds extra bdtrace options.
 
 set -euo pipefail
 
@@ -75,7 +76,7 @@ echo "--- Build 2: traced (with bdtrace) ---"
 cp -a "${LUA_DIR}" build-traced
 cd build-traced
 T2_START=$(date +%s%N)
-"${BDTRACE}" -o "${WORKDIR}/trace.db" make -j1 linux 2>&1 | tail -3
+"${BDTRACE}" ${BDTRACE_ARGS:-} -o "${WORKDIR}/trace.db" -- make -j1 linux 2>&1 | tail -3
 T2_END=$(date +%s%N)
 cd "${WORKDIR}"
 

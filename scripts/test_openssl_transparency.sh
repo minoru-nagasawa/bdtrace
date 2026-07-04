@@ -9,6 +9,7 @@
 #
 # Usage: scripts/test_openssl_transparency.sh [path-to-bdtrace]
 #        Default: ./bdtrace
+#        BDTRACE_ARGS="--procs-only" adds extra bdtrace options.
 
 set -euo pipefail
 
@@ -105,7 +106,7 @@ cd "${BUILDDIR}"
 cp "${WORKDIR}/build-baseline/crypto/buildinf.h" crypto/buildinf.h
 touch crypto/buildinf.h
 T2_START=$(date +%s%N)
-"${BDTRACE}" -o "${WORKDIR}/trace.db" make -j1 2>&1 | tail -3
+"${BDTRACE}" ${BDTRACE_ARGS:-} -o "${WORKDIR}/trace.db" -- make -j1 2>&1 | tail -3
 T2_END=$(date +%s%N)
 cd "${WORKDIR}"
 mv "${BUILDDIR}" build-traced

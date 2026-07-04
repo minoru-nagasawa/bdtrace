@@ -9,6 +9,7 @@
 #
 # Usage: scripts/test_gmake_transparency.sh [path-to-bdtrace]
 #        Default: ./bdtrace
+#        BDTRACE_ARGS="--procs-only" adds extra bdtrace options.
 
 set -euo pipefail
 
@@ -87,7 +88,7 @@ cp -a "${GMAKE_DIR}" "${BUILDDIR}"
 cd "${BUILDDIR}"
 ./configure --disable-nls --without-guile >/dev/null 2>&1
 T2_START=$(date +%s%N)
-"${BDTRACE}" -o "${WORKDIR}/trace.db" make -j1 2>&1 | tail -3
+"${BDTRACE}" ${BDTRACE_ARGS:-} -o "${WORKDIR}/trace.db" -- make -j1 2>&1 | tail -3
 T2_END=$(date +%s%N)
 cd "${WORKDIR}"
 mv "${BUILDDIR}" build-traced
