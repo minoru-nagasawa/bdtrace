@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <stdint.h>
 
+struct user_regs_struct;
+
 namespace bdtrace {
 
 class PtraceBackend : public ITracerBackend {
@@ -21,6 +23,11 @@ public:
     // stops: tracees run under PTRACE_CONT at near-native speed.
     void set_procs_only(bool on) { procs_only_ = on; }
 
+    // Allow the seccomp-BPF fast path (default on). It self-enables only on
+    // kernels >= 3.5; on Linux 2.6.x behavior is the classic PTRACE_SYSCALL
+    // loop either way.
+    void set_seccomp_allowed(bool on) { seccomp_allowed_ = on; }
+
     int start(const std::vector<std::string>& argv);
     int run_event_loop();
     void stop();
@@ -31,6 +38,8 @@ private:
     int root_pid_;
     volatile bool running_;
     bool procs_only_;
+    bool seccomp_allowed_;  // user permits trying the seccomp fast path
+    bool seccomp_mode_;     // fast path active: filter installed, CONT resume
 
     // Diagnostics: stall watchdog + signal/race counters (always on).
     int64_t last_event_us_;        // timestamp of the most recent waitpid() event
@@ -45,14 +54,19 @@ private:
     long cnt_peek_fallbacks_;      // path strings read word-by-word via PEEKDATA
     long cnt_getregs_skipped_;     // uninteresting syscall exits resumed without GETREGS
     long cnt_phase_resyncs_;       // entry/exit phase toggle disagreed with ENOSYS check
+    long cnt_seccomp_stops_;       // PTRACE_EVENT_SECCOMP stops (fast path)
 
     void check_stall();
     void print_diag_counters(FILE* out);
     std::string read_proc_state(int pid);
 
     void setup_child(int pid);
+    bool set_ptrace_options(int pid);
     void resume(int pid, long sig);
     void handle_syscall_stop(int pid, ProcessState& ps);
+    void handle_seccomp_stop(int pid, ProcessState& ps);
+    void decode_syscall_entry(ProcessState& ps, const user_regs_struct& regs,
+                              long syscall_nr);
     void handle_fork_event(int pid);
     void handle_exec_event(int pid);
     void handle_exit_event(int pid, int status);

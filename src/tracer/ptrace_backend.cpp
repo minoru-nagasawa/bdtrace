@@ -11,6 +11,8 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <sys/prctl.h>
 #include <linux/ptrace.h>
 #include <unistd.h>
 #include <signal.h>
@@ -29,7 +31,124 @@
 #define PT(req, pid, addr, data) \
     ptrace(static_cast<__ptrace_request>(req), (pid), (void*)(addr), (void*)(data))
 
+// ---------------------------------------------------------------------------
+// seccomp-BPF fast path.
+//
+// On kernels >= 3.5 the traced child installs (pre-exec, inherited by every
+// descendant) a BPF filter that returns SECCOMP_RET_TRACE for the syscalls we
+// record and SECCOMP_RET_ALLOW for everything else. Tracees then run under
+// PTRACE_CONT at near-native speed; only interesting syscalls stop the tracer
+// (PTRACE_EVENT_SECCOMP at entry, plus one PTRACE_SYSCALL-requested exit
+// stop). On Linux 2.6.x none of this activates and the classic PTRACE_SYSCALL
+// loop is used unchanged.
+//
+// All constants and structs are defined locally: CentOS 5 headers predate
+// seccomp filtering, and this code must still COMPILE there even though it
+// only RUNS on newer kernels.
+// ---------------------------------------------------------------------------
+
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+#ifndef PR_SET_SECCOMP
+#define PR_SET_SECCOMP 22
+#endif
+#define BD_SECCOMP_MODE_FILTER 2
+#define BD_SECCOMP_RET_TRACE   0x7ff00000u
+#define BD_SECCOMP_RET_ALLOW   0x7fff0000u
+
+// Classic BPF opcodes (BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_RET|BPF_K)
+#define BD_BPF_LD_W_ABS 0x20
+#define BD_BPF_JEQ_K    0x15
+#define BD_BPF_RET_K    0x06
+
+struct bd_sock_filter {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+};
+
+struct bd_sock_fprog {
+    uint16_t len;
+    struct bd_sock_filter* filter;
+};
+
 namespace bdtrace {
+
+// Syscalls the tracer records; everything else runs untraced under seccomp
+// mode. Must cover every syscall decode_syscall_entry() cares about.
+static const long BD_TRACED_SYSCALLS[] = {
+    SYS_OPEN_NR, SYS_CREAT_NR, SYS_OPENAT_NR, SYS_OPENAT2_NR,
+    SYS_STAT_NR, SYS_LSTAT_NR, SYS_NEWFSTATAT_NR, SYS_STATX_NR,
+    SYS_ACCESS_NR, SYS_FACCESSAT_NR, SYS_FACCESSAT2_NR,
+    SYS_CHDIR_NR, SYS_FCHDIR_NR,
+    SYS_RENAME_NR, SYS_RENAMEAT_NR, SYS_RENAMEAT2_NR,
+    SYS_MKDIR_NR, SYS_MKDIRAT_NR,
+    SYS_LINK_NR, SYS_LINKAT_NR,
+    SYS_UNLINK_NR, SYS_UNLINKAT_NR,
+    SYS_SYMLINK_NR, SYS_SYMLINKAT_NR,
+    SYS_READLINK_NR, SYS_READLINKAT_NR,
+    SYS_CHMOD_NR, SYS_FCHMODAT_NR,
+    SYS_CHOWN_NR, SYS_FCHOWNAT_NR,
+    SYS_MKNOD_NR, SYS_MKNODAT_NR,
+    SYS_TRUNCATE_NR, SYS_UTIMENSAT_NR,
+    SYS_EXECVE_NR, SYS_EXECVEAT_NR,
+};
+
+// Runs in the forked child, pre-exec. Only async-signal-safe calls.
+static int install_seccomp_filter() {
+    const int n = (int)(sizeof(BD_TRACED_SYSCALLS) / sizeof(BD_TRACED_SYSCALLS[0]));
+    struct bd_sock_filter prog[3 + (sizeof(BD_TRACED_SYSCALLS) / sizeof(BD_TRACED_SYSCALLS[0])) + 2];
+    int idx = 0;
+
+    // [0] load seccomp_data.arch
+    prog[idx].code = BD_BPF_LD_W_ABS; prog[idx].jt = 0; prog[idx].jf = 0;
+    prog[idx].k = 4; ++idx;
+    // [1] foreign architecture (e.g. x32/i386 tracee under x86_64): ALLOW,
+    //     i.e. untraced - matching the classic path, which cannot decode
+    //     foreign-arch syscall numbers either.
+    prog[idx].code = BD_BPF_JEQ_K; prog[idx].jt = 0;
+    prog[idx].jf = (uint8_t)(n + 1); prog[idx].k = BD_AUDIT_ARCH; ++idx;
+    // [2] load seccomp_data.nr
+    prog[idx].code = BD_BPF_LD_W_ABS; prog[idx].jt = 0; prog[idx].jf = 0;
+    prog[idx].k = 0; ++idx;
+    // [3 .. 3+n-1] one JEQ per traced syscall, jumping to RET_TRACE at [4+n]
+    for (int i = 0; i < n; ++i) {
+        prog[idx].code = BD_BPF_JEQ_K;
+        prog[idx].jt = (uint8_t)(n - i);
+        prog[idx].jf = 0;
+        prog[idx].k = (uint32_t)BD_TRACED_SYSCALLS[i];
+        ++idx;
+    }
+    // [3+n] RET ALLOW
+    prog[idx].code = BD_BPF_RET_K; prog[idx].jt = 0; prog[idx].jf = 0;
+    prog[idx].k = BD_SECCOMP_RET_ALLOW; ++idx;
+    // [4+n] RET TRACE
+    prog[idx].code = BD_BPF_RET_K; prog[idx].jt = 0; prog[idx].jf = 0;
+    prog[idx].k = BD_SECCOMP_RET_TRACE; ++idx;
+
+    struct bd_sock_fprog fprog;
+    fprog.len = (uint16_t)idx;
+    fprog.filter = prog;
+
+    // NO_NEW_PRIVS lets an unprivileged process install the filter. Side
+    // effect: setuid binaries in the traced tree won't elevate - they don't
+    // under plain ptrace either.
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+    if (prctl(PR_SET_SECCOMP, BD_SECCOMP_MODE_FILTER, &fprog) != 0) return -1;
+    return 0;
+}
+
+// SECCOMP_RET_TRACE + PTRACE_EVENT_SECCOMP need Linux 3.5.
+static bool kernel_supports_seccomp_trace() {
+    struct utsname u;
+    if (uname(&u) != 0) return false;
+    int maj = 0, min = 0;
+    if (std::sscanf(u.release, "%d.%d", &maj, &min) < 2) return false;
+    if (maj > 3) return true;
+    return maj == 3 && min >= 5;
+}
 
 static volatile sig_atomic_t g_child_pid = 0;
 static volatile sig_atomic_t g_stop_requested = 0;
@@ -58,12 +177,14 @@ static void alarm_handler(int) {
 
 PtraceBackend::PtraceBackend(TraceSession& session)
     : session_(session), root_pid_(0), running_(false), procs_only_(false)
+    , seccomp_allowed_(true), seccomp_mode_(false)
     , last_event_us_(0), last_stall_report_us_(0)
     , cnt_fork_events_(0), cnt_exec_events_(0)
     , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
     , cnt_sigstop_reinjected_(0), cnt_race_unknown_first_(0)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
+    , cnt_seccomp_stops_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -86,6 +207,16 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
         return -1;
     }
 
+    // Try the seccomp fast path only when the kernel can support it; on
+    // Linux 2.6.x this is always false and nothing below changes behavior.
+    bool attempt_seccomp = seccomp_allowed_ && !procs_only_
+        && !std::getenv("BDTRACE_NO_SECCOMP")
+        && kernel_supports_seccomp_trace();
+    int sfd[2] = { -1, -1 };
+    if (attempt_seccomp && pipe(sfd) != 0) {
+        attempt_seccomp = false;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         LOG_ERROR("fork failed: %s", strerror(errno));
@@ -95,6 +226,16 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     if (pid == 0) {
         // Child process
         PT(PTRACE_TRACEME, 0, 0, 0);
+        if (attempt_seccomp) {
+            // Install the (inheritable) filter pre-exec and report the result
+            // to the parent. Written before SIGSTOP, so the parent's read
+            // after waitpid() cannot block.
+            char ack = (install_seccomp_filter() == 0) ? 'S' : 'F';
+            ssize_t w = write(sfd[1], &ack, 1);
+            (void)w;
+            close(sfd[0]);
+            close(sfd[1]);
+        }
         raise(SIGSTOP);
 
         std::vector<char*> c_argv;
@@ -122,7 +263,30 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     int status;
     waitpid(pid, &status, 0);
 
-    setup_child(pid);
+    if (attempt_seccomp) {
+        close(sfd[1]);
+        char ack = 'F';
+        ssize_t n = read(sfd[0], &ack, 1);
+        close(sfd[0]);
+        if (n == 1 && ack == 'S') {
+            seccomp_mode_ = true;
+            if (!set_ptrace_options(pid)) {
+                // Filter is installed but we cannot receive its stops: the
+                // tracee's traced syscalls would all fail with ENOSYS.
+                LOG_ERROR("kernel accepted the seccomp filter but refused "
+                          "PTRACE_O_TRACESECCOMP; aborting (use --no-seccomp)");
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                return -1;
+            }
+            LOG_INFO("seccomp-BPF fast path enabled");
+        } else {
+            LOG_WARN("seccomp filter install failed, using full syscall tracing");
+            setup_child(pid);
+        }
+    } else {
+        setup_child(pid);
+    }
 
     ProcessState ps(pid, getpid());
     ps.cached_cwd = read_proc_link(pid, "cwd");
@@ -145,15 +309,16 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
     return 0;
 }
 
-// Resume a stopped tracee. Normal mode stops at every syscall entry/exit
-// (PTRACE_SYSCALL); procs-only mode uses PTRACE_CONT, so tracees run at
-// near-native speed and only fork/exec/exit events (which PTRACE_O_TRACE*
-// deliver under CONT as well) reach the tracer.
+// Resume a stopped tracee. Classic mode stops at every syscall entry/exit
+// (PTRACE_SYSCALL); procs-only and seccomp modes use PTRACE_CONT, so tracees
+// run at near-native speed and only the requested events (fork/exec/exit,
+// plus seccomp stops in seccomp mode) reach the tracer.
 void PtraceBackend::resume(int pid, long sig) {
-    PT(procs_only_ ? PTRACE_CONT : PTRACE_SYSCALL, pid, 0, sig);
+    PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
+       pid, 0, sig);
 }
 
-void PtraceBackend::setup_child(int pid) {
+bool PtraceBackend::set_ptrace_options(int pid) {
     long opts = PTRACE_O_TRACESYSGOOD
               | PTRACE_O_TRACEFORK
               | PTRACE_O_TRACEVFORK
@@ -161,7 +326,20 @@ void PtraceBackend::setup_child(int pid) {
               | PTRACE_O_TRACEEXEC
               | PTRACE_O_TRACEEXIT;
 
-    if (PT(PTRACE_SETOPTIONS, pid, 0, opts) < 0) {
+    if (seccomp_mode_) {
+        // EXITKILL (3.8+) is best-effort: if the tracer dies, tracees are
+        // killed instead of being left with a filter whose RET_TRACE turns
+        // every traced syscall into ENOSYS.
+        if (PT(PTRACE_SETOPTIONS, pid, 0,
+               opts | PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL) == 0)
+            return true;
+        return PT(PTRACE_SETOPTIONS, pid, 0, opts | PTRACE_O_TRACESECCOMP) == 0;
+    }
+    return PT(PTRACE_SETOPTIONS, pid, 0, opts) == 0;
+}
+
+void PtraceBackend::setup_child(int pid) {
+    if (!set_ptrace_options(pid)) {
         LOG_WARN("PTRACE_SETOPTIONS failed for %d: %s", pid, strerror(errno));
     }
 }
@@ -290,6 +468,9 @@ int PtraceBackend::run_event_loop() {
         } else if (event == PTRACE_EVENT_EXIT) {
             handle_exit_event(pid, status);
             resume(pid, 0);
+        } else if (event == PTRACE_EVENT_SECCOMP) {
+            ++cnt_seccomp_stops_;
+            handle_seccomp_stop(pid, ps);  // resumes the tracee itself
         } else if (sig == (SIGTRAP | 0x80)) {
             handle_syscall_stop(pid, ps);
             resume(pid, 0);
@@ -329,11 +510,11 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
-        "getregs skipped=%ld phase resyncs=%ld\n",
+        "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
-        cnt_getregs_skipped_, cnt_phase_resyncs_);
+        cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_);
 }
 
 std::string PtraceBackend::read_proc_state(int pid) {
@@ -371,6 +552,23 @@ void PtraceBackend::check_stall() {
     if (gap < STALL_THRESHOLD_US) return;
     if (!running_ || procs_.empty()) return;
     if (last_stall_report_us_ != 0 && (now - last_stall_report_us_) < STALL_REPEAT_US) return;
+
+    // In seccomp/procs-only modes, long gaps without events are normal (a
+    // compiler can crunch for minutes without touching a traced syscall).
+    // Only report if some tracee is actually sitting in 'T (stopped)'.
+    if (seccomp_mode_ || procs_only_) {
+        bool any_stopped = false;
+        int checked = 0;
+        for (std::map<int, ProcessState>::iterator it = procs_.begin();
+             it != procs_.end() && checked < 256; ++it, ++checked) {
+            std::string st = read_proc_state(it->first);
+            if (!st.empty() && st[0] == 'T') { any_stopped = true; break; }
+        }
+        if (!any_stopped) {
+            last_stall_report_us_ = now;  // throttle the rescan
+            return;
+        }
+    }
     last_stall_report_us_ = now;
 
     std::fprintf(stderr,
@@ -525,35 +723,15 @@ void PtraceBackend::record_failed_access(int pid, unsigned long addr, FileAccess
     }
 }
 
-void PtraceBackend::handle_syscall_stop(int pid, ProcessState& ps) {
-    // Fast path: the exit stop of a syscall we don't record. Nothing in the
-    // registers is needed, so skip PTRACE_GETREGS entirely (one syscall saved
-    // per uninteresting entry/exit pair - the majority during a build).
-    if (ps.sc_phase == SC_PHASE_EXIT_NEXT && !ps.exit_needed) {
-        ps.sc_phase = SC_PHASE_ENTRY_NEXT;
-        ps.pending_syscall = -1;
-        ++cnt_getregs_skipped_;
-        return;
-    }
-
-    struct user_regs_struct regs;
-    if (PT(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
-
-    long syscall_nr = REG_SYSCALL(regs);
-    long rax = REG_RETVAL(regs);
-
-    // On syscall entry, rax == -ENOSYS (kernel sets this before dispatch).
-    // On syscall exit, rax == actual return value.
-    bool is_entry = (rax == -ENOSYS);
-
-    // The phase toggle normally agrees with the ENOSYS heuristic. If they
-    // disagree (e.g. a kernel that doesn't report a syscall-exit stop where we
-    // expected one), trust the registers and resync.
-    if (ps.sc_phase == SC_PHASE_ENTRY_NEXT && !is_entry) ++cnt_phase_resyncs_;
-    else if (ps.sc_phase == SC_PHASE_EXIT_NEXT && is_entry) ++cnt_phase_resyncs_;
-    ps.sc_phase = is_entry ? SC_PHASE_EXIT_NEXT : SC_PHASE_ENTRY_NEXT;
-
-    if (is_entry) {
+// Record what we need from a syscall entry: pending syscall number, path
+// argument addresses, open flags, and whether the exit stop must be
+// inspected. Shared by the classic PTRACE_SYSCALL entry stop and the
+// seccomp-mode PTRACE_EVENT_SECCOMP stop (both occur at syscall entry with
+// the argument registers intact).
+void PtraceBackend::decode_syscall_entry(ProcessState& ps,
+                                         const user_regs_struct& regs,
+                                         long syscall_nr) {
+    {
         ps.pending_syscall = syscall_nr;
         ps.pending_path_addr = 0;
         ps.pending_path_addr2 = 0;
@@ -628,6 +806,61 @@ void PtraceBackend::handle_syscall_stop(int pid, ProcessState& ps) {
         // inspected; everything else lets the exit stop skip GETREGS.
         ps.exit_needed = (ps.pending_path_addr != 0
                           || syscall_nr == SYS_FCHDIR_NR);
+    }
+}
+
+// seccomp mode: the filter trapped an interesting syscall at entry. Decode
+// it, then request this one syscall's exit stop with PTRACE_SYSCALL; all
+// other syscalls run untraced under PTRACE_CONT.
+void PtraceBackend::handle_seccomp_stop(int pid, ProcessState& ps) {
+    struct user_regs_struct regs;
+    if (PT(PTRACE_GETREGS, pid, 0, &regs) < 0) {
+        PT(PTRACE_CONT, pid, 0, 0);
+        return;
+    }
+
+    decode_syscall_entry(ps, regs, REG_SYSCALL(regs));
+
+    if (ps.exit_needed) {
+        ps.sc_phase = SC_PHASE_EXIT_NEXT;
+        PT(PTRACE_SYSCALL, pid, 0, 0);
+    } else {
+        ps.sc_phase = SC_PHASE_ENTRY_NEXT;
+        ps.pending_syscall = -1;
+        PT(PTRACE_CONT, pid, 0, 0);
+    }
+}
+
+void PtraceBackend::handle_syscall_stop(int pid, ProcessState& ps) {
+    // Fast path: the exit stop of a syscall we don't record. Nothing in the
+    // registers is needed, so skip PTRACE_GETREGS entirely (one syscall saved
+    // per uninteresting entry/exit pair - the majority during a build).
+    if (ps.sc_phase == SC_PHASE_EXIT_NEXT && !ps.exit_needed) {
+        ps.sc_phase = SC_PHASE_ENTRY_NEXT;
+        ps.pending_syscall = -1;
+        ++cnt_getregs_skipped_;
+        return;
+    }
+
+    struct user_regs_struct regs;
+    if (PT(PTRACE_GETREGS, pid, 0, &regs) < 0) return;
+
+    long syscall_nr = REG_SYSCALL(regs);
+    long rax = REG_RETVAL(regs);
+
+    // On syscall entry, rax == -ENOSYS (kernel sets this before dispatch).
+    // On syscall exit, rax == actual return value.
+    bool is_entry = (rax == -ENOSYS);
+
+    // The phase toggle normally agrees with the ENOSYS heuristic. If they
+    // disagree (e.g. a kernel that doesn't report a syscall-exit stop where we
+    // expected one), trust the registers and resync.
+    if (ps.sc_phase == SC_PHASE_ENTRY_NEXT && !is_entry) ++cnt_phase_resyncs_;
+    else if (ps.sc_phase == SC_PHASE_EXIT_NEXT && is_entry) ++cnt_phase_resyncs_;
+    ps.sc_phase = is_entry ? SC_PHASE_EXIT_NEXT : SC_PHASE_ENTRY_NEXT;
+
+    if (is_entry) {
+        decode_syscall_entry(ps, regs, syscall_nr);
     } else {
         // Syscall exit - record based on pending_syscall
         long sc = ps.pending_syscall;

@@ -113,4 +113,24 @@
 #error "Unsupported architecture"
 #endif
 
+// seccomp-related ptrace constants. Absent from Linux 2.6-era headers
+// (CentOS 5), so define them ourselves; they are used only after a runtime
+// kernel check confirms support (3.5+).
+#ifndef PTRACE_O_TRACESECCOMP
+#define PTRACE_O_TRACESECCOMP 0x00000080
+#endif
+#ifndef PTRACE_EVENT_SECCOMP
+#define PTRACE_EVENT_SECCOMP 7
+#endif
+#ifndef PTRACE_O_EXITKILL
+#define PTRACE_O_EXITKILL 0x00100000
+#endif
+
+// AUDIT_ARCH_* for the seccomp filter's architecture check
+#ifdef __x86_64__
+#define BD_AUDIT_ARCH 0xC000003Eu  // AUDIT_ARCH_X86_64
+#else
+#define BD_AUDIT_ARCH 0x40000003u  // AUDIT_ARCH_I386
+#endif
+
 #endif // BDTRACE_PTRACE_DEFS_H

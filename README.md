@@ -60,9 +60,25 @@ SQLite database. Trace overhead depends on how syscall-heavy the build is; the
 |---|---|
 | `-o FILE` | Output database file. Default: `bdtrace.db` |
 | `--procs-only` | Record only the process tree (fork/exec/exit, durations, CPU/RSS/I/O). File accesses are not traced — tracees run under `PTRACE_CONT` at near-native speed. The exec'd binary of each process is still recorded. |
+| `--no-seccomp` | Disable the seccomp-BPF fast path and always use classic full syscall tracing (see below). The `BDTRACE_NO_SECCOMP` environment variable does the same. |
 | `-v` | Verbose output (debug logging) |
 | `-h` | Show help |
 | `--` | End of options; everything after is the command to trace |
+
+### seccomp-BPF fast path
+
+On kernels 3.5 and newer, bdtrace automatically installs a seccomp-BPF filter
+in the traced command (inherited by all descendants) so that only the ~36
+recorded syscalls stop the tracer; everything else (read/write/mmap/futex/...)
+runs at native speed. This typically cuts full-trace overhead by 2–8× on
+syscall-heavy builds. On Linux 2.6.x the fast path is skipped entirely and the
+classic `PTRACE_SYSCALL` loop is used — behavior there is unchanged. The mode
+in use is logged at startup (`seccomp-BPF fast path enabled`).
+
+Caveat: the filter requires `no_new_privs`, so setuid binaries inside the
+traced tree will not elevate privileges (they don't under plain ptrace
+either). Use `--no-seccomp` if this — or anything else about the filter —
+causes trouble.
 
 Notes:
 
