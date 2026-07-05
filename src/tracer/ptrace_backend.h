@@ -55,6 +55,7 @@ private:
     long cnt_getregs_skipped_;     // uninteresting syscall exits resumed without GETREGS
     long cnt_phase_resyncs_;       // entry/exit phase toggle disagreed with ENOSYS check
     long cnt_seccomp_stops_;       // PTRACE_EVENT_SECCOMP stops (fast path)
+    long cnt_plain_sigtrap_;       // SIGTRAP stops without the TRACESYSGOOD 0x80 bit
 
     void check_stall();
     void print_diag_counters(FILE* out);

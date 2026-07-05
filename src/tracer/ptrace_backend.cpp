@@ -184,7 +184,7 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_sigstop_reinjected_(0), cnt_race_unknown_first_(0)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
-    , cnt_seccomp_stops_(0)
+    , cnt_seccomp_stops_(0), cnt_plain_sigtrap_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -340,7 +340,13 @@ bool PtraceBackend::set_ptrace_options(int pid) {
 
 void PtraceBackend::setup_child(int pid) {
     if (!set_ptrace_options(pid)) {
-        LOG_WARN("PTRACE_SETOPTIONS failed for %d: %s", pid, strerror(errno));
+        if (errno == ESRCH) {
+            // Process died between the wait and here; common for short-lived
+            // children under heavy fork churn, and nothing is lost.
+            LOG_DEBUG("PTRACE_SETOPTIONS: process %d already gone", pid);
+        } else {
+            LOG_WARN("PTRACE_SETOPTIONS failed for %d: %s", pid, strerror(errno));
+        }
     }
 }
 
@@ -435,7 +441,10 @@ int PtraceBackend::run_event_loop() {
         std::map<int, ProcessState>::iterator pit = procs_.find(pid);
         if (pit == procs_.end()) {
             pit = procs_.insert(std::make_pair(pid, ProcessState(pid, 0))).first;
-            setup_child(pid);
+            // Only set options if this report is a stop. A very short-lived
+            // child's first (and only) report can already be its death, and
+            // PTRACE_SETOPTIONS on the zombie would just fail with ESRCH.
+            if (WIFSTOPPED(status)) setup_child(pid);
             ++cnt_race_unknown_first_;
         }
         ProcessState& ps = pit->second;
@@ -475,6 +484,11 @@ int PtraceBackend::run_event_loop() {
             handle_syscall_stop(pid, ps);
             resume(pid, 0);
         } else if (sig == SIGTRAP) {
+            // Plain SIGTRAP without the 0x80 bit. A large count here in full
+            // tracing mode means syscall stops are arriving WITHOUT
+            // TRACESYSGOOD marking (options not in effect) and are being
+            // dropped - i.e. file accesses are silently not recorded.
+            ++cnt_plain_sigtrap_;
             resume(pid, 0);
         } else if (sig == SIGSTOP && !ps.traced) {
             setup_child(pid);
@@ -510,11 +524,13 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
-        "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld\n",
+        "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
+        "plain sigtrap=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
-        cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_);
+        cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
+        cnt_plain_sigtrap_);
 }
 
 std::string PtraceBackend::read_proc_state(int pid) {
