@@ -185,6 +185,7 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
     , cnt_seccomp_stops_(0), cnt_plain_sigtrap_(0)
+    , cnt_stuck_kicked_(0), resume_count_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -314,6 +315,19 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
 // run at near-native speed and only the requested events (fork/exec/exit,
 // plus seccomp stops in seccomp mode) reach the tracer.
 void PtraceBackend::resume(int pid, long sig) {
+    // Fault injection for testing the stall watchdog's self-healing:
+    // BDTRACE_TEST_DROP_RESUME=N silently drops the Nth resume, leaving that
+    // tracee in ptrace-stop exactly like a lost-resume kernel race would.
+    static long drop_nth = -2;
+    if (drop_nth == -2) {
+        const char* e = std::getenv("BDTRACE_TEST_DROP_RESUME");
+        drop_nth = e ? std::atol(e) : -1;
+    }
+    if (drop_nth >= 0 && ++resume_count_ == drop_nth) {
+        LOG_WARN("TEST: dropping resume #%ld for pid %d", drop_nth, pid);
+        return;
+    }
+
     PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
        pid, 0, sig);
 }
@@ -525,12 +539,12 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
         "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
-        "plain sigtrap=%ld\n",
+        "plain sigtrap=%ld | stuck kicked=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
         cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
-        cnt_plain_sigtrap_);
+        cnt_plain_sigtrap_, cnt_stuck_kicked_);
 }
 
 // Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".
@@ -583,20 +597,42 @@ void PtraceBackend::check_stall() {
     if (!running_ || procs_.empty()) return;
     if (last_stall_report_us_ != 0 && (now - last_stall_report_us_) < STALL_REPEAT_US) return;
 
-    // In seccomp/procs-only modes, long gaps without events are normal (a
-    // compiler can crunch for minutes without touching a traced syscall).
-    // Dump the full suspect list only if some tracee is actually sitting in
-    // 'T (stopped)' - the signature of a mishandled ptrace stop. Otherwise
-    // print a brief throttled note so a stalled build is still visible.
-    if (seccomp_mode_ || procs_only_) {
-        bool any_stopped = false;
+    // Scan tracee states first. "tracing stop" is reported as 'T' on older
+    // kernels and 't' on newer ones - match the words, not the letter. A
+    // tracee sitting in ptrace-stop while the tracer has been idle in
+    // waitpid() for STALL_THRESHOLD_US means its stop notification was
+    // consumed but our resume never took effect (races of this kind exist in
+    // RHEL 2.6.x utrace-based ptrace); with a multi-threaded tracee (JVM)
+    // every other thread then waits on it forever. Self-heal: re-issue the
+    // mode-appropriate resume and report what we did.
+    bool any_ptrace_stopped = false;
+    {
         int checked = 0;
         for (std::map<int, ProcessState>::iterator it = procs_.begin();
              it != procs_.end() && checked < 256; ++it, ++checked) {
             std::string st = read_proc_state(it->first);
-            if (!st.empty() && st[0] == 'T') { any_stopped = true; break; }
+            if (st.find("tracing") != std::string::npos) {
+                any_ptrace_stopped = true;
+                ++cnt_stuck_kicked_;
+                std::fprintf(stderr,
+                    "[bdtrace] WARNING: pid %d stuck in ptrace-stop (state=%s) "
+                    "with no pending events - re-resuming it\n",
+                    it->first, st.c_str());
+                resume(it->first, 0);
+            } else if (!st.empty() && (st[0] == 'T' || st[0] == 't')) {
+                // Group-stop (job control): suspicious enough to report the
+                // full dump below, but not ours to auto-resume.
+                any_ptrace_stopped = true;
+            }
         }
-        if (!any_stopped) {
+    }
+
+    // In seccomp/procs-only modes, long gaps without events are normal (a
+    // compiler can crunch for minutes without touching a traced syscall).
+    // Dump the full suspect list only if some tracee was in a stopped state;
+    // otherwise print a brief throttled note so a stalled build is visible.
+    if (seccomp_mode_ || procs_only_) {
+        if (!any_ptrace_stopped) {
             last_stall_report_us_ = now;  // throttle the rescan
             std::fprintf(stderr,
                 "[bdtrace] note: no ptrace events for %ds; %d process(es) "
@@ -650,7 +686,8 @@ void PtraceBackend::check_stall() {
         ProcessState& p = it->second;
         std::string st = read_proc_state(it->first);
         const char* flag = "";
-        if (!st.empty() && st[0] == 'T') flag = "   <-- STOPPED (suspect)";
+        if (!st.empty() && (st[0] == 'T' || st[0] == 't'))
+            flag = "   <-- STOPPED (suspect)";
         std::fprintf(stderr,
             "[bdtrace]   pid=%d ppid=%d traced=%d last_syscall=%ld state=%s%s\n",
             it->first, p.ppid, (int)p.traced, p.pending_syscall,

@@ -56,6 +56,8 @@ private:
     long cnt_phase_resyncs_;       // entry/exit phase toggle disagreed with ENOSYS check
     long cnt_seccomp_stops_;       // PTRACE_EVENT_SECCOMP stops (fast path)
     long cnt_plain_sigtrap_;       // SIGTRAP stops without the TRACESYSGOOD 0x80 bit
+    long cnt_stuck_kicked_;        // tracees found stuck in ptrace-stop and re-resumed
+    long resume_count_;            // total resumes issued (for fault injection)
 
     void check_stall();
     void print_diag_counters(FILE* out);
