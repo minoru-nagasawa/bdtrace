@@ -614,10 +614,10 @@ void PtraceBackend::check_stall() {
             if (st.find("tracing") != std::string::npos) {
                 any_ptrace_stopped = true;
                 ++cnt_stuck_kicked_;
-                std::fprintf(stderr,
-                    "[bdtrace] WARNING: pid %d stuck in ptrace-stop (state=%s) "
-                    "with no pending events - re-resuming it\n",
-                    it->first, st.c_str());
+                // LOG_WARN so this also lands in the <db>.log error file
+                LOG_WARN("pid %d stuck in ptrace-stop (state=%s) with no "
+                         "events for %ds - re-resuming it",
+                         it->first, st.c_str(), (int)(gap / 1000000LL));
                 resume(it->first, 0);
             } else if (!st.empty() && (st[0] == 'T' || st[0] == 't')) {
                 // Group-stop (job control): suspicious enough to report the
