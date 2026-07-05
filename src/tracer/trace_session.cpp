@@ -1,6 +1,8 @@
 #include "trace_session.h"
 #include "../common/log.h"
 
+#include <signal.h>
+
 namespace bdtrace {
 
 static const int BATCH_SIZE = 5000;
@@ -37,6 +39,21 @@ bool TraceSession::open(const std::string& db_path) {
     // Hand the sqlite connection to a dedicated writer thread so the ptrace
     // event loop never waits on commits/checkpoints. If thread creation
     // fails, fall back to synchronous writes.
+    //
+    // The tracer's stall watchdog and Ctrl-C handling rely on SIGALRM /
+    // SIGINT / SIGTERM interrupting the event loop's blocked waitpid()
+    // (EINTR). Process-directed signals are delivered to ANY thread that
+    // doesn't block them, so block them here before pthread_create (the mask
+    // is inherited by the new thread) and restore afterwards - otherwise the
+    // writer thread can swallow SIGALRM and the watchdog, progress reports,
+    // and graceful stop all go silent while the loop waits for events.
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGALRM);
+    sigaddset(&block_set, SIGINT);
+    sigaddset(&block_set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &block_set, &old_set);
+
     stop_requested_ = false;
     if (pthread_create(&writer_thread_, 0, writer_thread_main, this) == 0) {
         async_ = true;
@@ -44,6 +61,8 @@ bool TraceSession::open(const std::string& db_path) {
         LOG_WARN("Could not start DB writer thread, using synchronous writes");
         async_ = false;
     }
+
+    pthread_sigmask(SIG_SETMASK, &old_set, 0);
     return true;
 }
 

@@ -571,7 +571,9 @@ void PtraceBackend::check_stall() {
 
     // In seccomp/procs-only modes, long gaps without events are normal (a
     // compiler can crunch for minutes without touching a traced syscall).
-    // Only report if some tracee is actually sitting in 'T (stopped)'.
+    // Dump the full suspect list only if some tracee is actually sitting in
+    // 'T (stopped)' - the signature of a mishandled ptrace stop. Otherwise
+    // print a brief throttled note so a stalled build is still visible.
     if (seccomp_mode_ || procs_only_) {
         bool any_stopped = false;
         int checked = 0;
@@ -582,6 +584,11 @@ void PtraceBackend::check_stall() {
         }
         if (!any_stopped) {
             last_stall_report_us_ = now;  // throttle the rescan
+            std::fprintf(stderr,
+                "[bdtrace] note: no ptrace events for %ds; %d process(es) "
+                "alive, none ptrace-stopped - the build itself appears to be "
+                "waiting (idle, I/O, or its own deadlock)\n",
+                (int)(gap / 1000000LL), (int)procs_.size());
             return;
         }
     }
