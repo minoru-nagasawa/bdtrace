@@ -27,6 +27,31 @@ const char* log_file_path() {
     return g_log_file ? g_log_file_path.c_str() : "";
 }
 
+// Lazy open shared by log_msg and log_file_raw
+static bool ensure_log_file_open() {
+    if (g_log_file_path.empty()) return false;
+    if (!g_log_file) {
+        g_log_file = std::fopen(g_log_file_path.c_str(), "a");
+        if (!g_log_file) {
+            std::fprintf(stderr, "[bdtrace] could not open log file %s\n",
+                         g_log_file_path.c_str());
+            g_log_file_path.clear();  // don't retry forever
+            return false;
+        }
+    }
+    return true;
+}
+
+void log_file_raw(const char* fmt, ...) {
+    if (!ensure_log_file_open()) return;
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(g_log_file, fmt, args);
+    va_end(args);
+    std::fputc('\n', g_log_file);
+    std::fflush(g_log_file);
+}
+
 void log_msg(LogLevel level, const char* fmt, ...) {
     bool to_console = (level <= g_log_level);
     bool to_file = (level <= LOG_WARN && !g_log_file_path.empty());
@@ -61,20 +86,9 @@ void log_msg(LogLevel level, const char* fmt, ...) {
     if (to_console) {
         std::fprintf(stderr, "%s%s%s\n", ts, prefix, msg);
     }
-    if (to_file) {
-        // Lazy open: no file is created unless something actually goes wrong
-        if (!g_log_file) {
-            g_log_file = std::fopen(g_log_file_path.c_str(), "a");
-            if (!g_log_file) {
-                std::fprintf(stderr, "[bdtrace] could not open log file %s\n",
-                             g_log_file_path.c_str());
-                g_log_file_path.clear();  // don't retry forever
-            }
-        }
-        if (g_log_file) {
-            std::fprintf(g_log_file, "%s%s%s\n", ts, prefix, msg);
-            std::fflush(g_log_file);
-        }
+    if (to_file && ensure_log_file_open()) {
+        std::fprintf(g_log_file, "%s%s%s\n", ts, prefix, msg);
+        std::fflush(g_log_file);
     }
 }
 

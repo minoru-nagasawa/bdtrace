@@ -64,6 +64,7 @@ private:
     long resume_count_;            // total resumes issued (for fault injection)
 
     void check_stall();
+    void diag_counters_line(char* buf, size_t len);
     void print_diag_counters(FILE* out);
     std::string read_proc_state(int pid);
     std::string read_proc_wchan(int pid);

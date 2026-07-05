@@ -21,6 +21,9 @@ void log_init(LogLevel level);
 void log_set_file(const char* path);
 // Non-empty once something was actually written to the log file.
 const char* log_file_path();
+// Append a raw line to the log file only (no stderr, no prefix). Used for
+// multi-line diagnostic dumps whose headline went through LOG_WARN.
+void log_file_raw(const char* fmt, ...);
 void log_msg(LogLevel level, const char* fmt, ...);
 
 } // namespace bdtrace

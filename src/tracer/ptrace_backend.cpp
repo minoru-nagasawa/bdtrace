@@ -529,6 +529,7 @@ int PtraceBackend::run_event_loop() {
         last_event_us_ = now_us();
         if (last_stall_report_us_ != 0) {
             std::fprintf(stderr, "[bdtrace] STALL CLEARED: events resumed (pid %d)\n", pid);
+            log_file_raw("[bdtrace] STALL CLEARED: events resumed (pid %d)", pid);
             last_stall_report_us_ = 0;
         }
 
@@ -628,20 +629,26 @@ int PtraceBackend::run_event_loop() {
     return 0;
 }
 
-void PtraceBackend::print_diag_counters(FILE* out) {
-    std::fprintf(out,
+void PtraceBackend::diag_counters_line(char* buf, size_t len) {
+    std::snprintf(buf, len,
         "events: fork/clone=%ld exec=%ld | sigstop swallowed=%ld | "
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
         "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
         "plain sigtrap=%ld | stuck kicked=%ld resume retries=%ld | "
-        "internal sigs ignored=%ld | stale entries=%ld\n",
+        "internal sigs ignored=%ld | stale entries=%ld",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
         cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
         cnt_plain_sigtrap_, cnt_stuck_kicked_, cnt_resume_retries_,
         cnt_sig_ignored_, cnt_stale_entries_);
+}
+
+void PtraceBackend::print_diag_counters(FILE* out) {
+    char buf[512];
+    diag_counters_line(buf, sizeof(buf));
+    std::fprintf(out, "%s\n", buf);
 }
 
 // Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".
@@ -743,25 +750,33 @@ void PtraceBackend::check_stall() {
                      (int)(gap / 1000000LL), (int)procs_.size());
             // Dump what each survivor is blocked on so the deadlock (or the
             // slow step) can be identified from the trace output alone.
+            // Lines go to stderr AND the <db>.log file (the headline above
+            // already opened it).
             const int MAX_IDLE_DUMP = 50;
             int shown = 0;
+            char line[512];
             for (std::map<int, ProcessState>::iterator it = procs_.begin();
                  it != procs_.end(); ++it) {
                 if (shown >= MAX_IDLE_DUMP) {
-                    std::fprintf(stderr, "[bdtrace]   ... and %d more process(es)\n",
-                                 (int)procs_.size() - shown);
+                    std::snprintf(line, sizeof(line),
+                                  "[bdtrace]   ... and %d more process(es)",
+                                  (int)procs_.size() - shown);
+                    std::fprintf(stderr, "%s\n", line);
+                    log_file_raw("%s", line);
                     break;
                 }
                 std::string st = read_proc_state(it->first);
                 std::string wc = read_proc_wchan(it->first);
                 std::string cmd = it->second.cached_cmdline;
                 if (cmd.size() > 60) cmd = cmd.substr(0, 57) + "...";
-                std::fprintf(stderr,
-                    "[bdtrace]   pid=%d ppid=%d state=%s wchan=%s cmd=%s\n",
+                std::snprintf(line, sizeof(line),
+                    "[bdtrace]   pid=%d ppid=%d state=%s wchan=%s cmd=%s",
                     it->first, it->second.ppid,
                     st.empty() ? "?" : st.c_str(),
                     wc.empty() ? "?" : wc.c_str(),
                     cmd.empty() ? "?" : cmd.c_str());
+                std::fprintf(stderr, "%s\n", line);
+                log_file_raw("%s", line);
                 ++shown;
             }
             return;
@@ -772,16 +787,24 @@ void PtraceBackend::check_stall() {
     LOG_WARN("STALL: no ptrace events for %ds, %d process(es) tracked, "
              "tracer blocked in waitpid()",
              (int)(gap / 1000000LL), (int)procs_.size());
-    std::fprintf(stderr, "[bdtrace] ");
-    print_diag_counters(stderr);
+    {
+        char buf[512];
+        diag_counters_line(buf, sizeof(buf));
+        std::fprintf(stderr, "[bdtrace] %s\n", buf);
+        log_file_raw("[bdtrace] %s", buf);
+    }
 
     const int MAX_DUMP = 50;
     int shown = 0;
+    char line[512];
     for (std::map<int, ProcessState>::iterator it = procs_.begin();
          it != procs_.end(); ++it) {
         if (shown >= MAX_DUMP) {
-            std::fprintf(stderr, "[bdtrace]   ... and %d more process(es)\n",
-                         (int)procs_.size() - shown);
+            std::snprintf(line, sizeof(line),
+                          "[bdtrace]   ... and %d more process(es)",
+                          (int)procs_.size() - shown);
+            std::fprintf(stderr, "%s\n", line);
+            log_file_raw("%s", line);
             break;
         }
         ProcessState& p = it->second;
@@ -789,10 +812,12 @@ void PtraceBackend::check_stall() {
         const char* flag = "";
         if (!st.empty() && (st[0] == 'T' || st[0] == 't'))
             flag = "   <-- STOPPED (suspect)";
-        std::fprintf(stderr,
-            "[bdtrace]   pid=%d ppid=%d traced=%d last_syscall=%ld state=%s%s\n",
+        std::snprintf(line, sizeof(line),
+            "[bdtrace]   pid=%d ppid=%d traced=%d last_syscall=%ld state=%s%s",
             it->first, p.ppid, (int)p.traced, p.pending_syscall,
             st.empty() ? "?" : st.c_str(), flag);
+        std::fprintf(stderr, "%s\n", line);
+        log_file_raw("%s", line);
         ++shown;
     }
 }
