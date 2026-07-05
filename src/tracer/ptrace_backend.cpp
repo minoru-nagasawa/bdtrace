@@ -13,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/prctl.h>
+#include <sys/time.h>
 #include <linux/ptrace.h>
 #include <unistd.h>
 #include <signal.h>
@@ -159,10 +160,21 @@ static struct sigaction g_old_sigint;
 static struct sigaction g_old_sigterm;
 static struct sigaction g_old_sigalrm;
 
-// Stall watchdog tuning.
-static const int     WATCHDOG_TICK_SEC  = 2;            // SIGALRM granularity
-static const int64_t STALL_THRESHOLD_US = 10000000LL;   // 10s w/o events => suspect hang
-static const int64_t STALL_REPEAT_US    = 30000000LL;   // re-dump every 30s while stalled
+// Stall watchdog tuning. The tick is the granularity at which stuck tracees
+// are detected and re-resumed, i.e. the worst-case pause a lost resume or
+// lost stop notification inflicts on the build.
+static const long    WATCHDOG_TICK_US   = 500000;       // SIGALRM granularity
+static const int64_t STALL_THRESHOLD_US = 10000000LL;   // 10s w/o events => report
+static const int64_t STALL_REPEAT_US    = 30000000LL;   // re-report every 30s
+
+static void arm_watchdog(long usec) {
+    struct itimerval itv;
+    itv.it_interval.tv_sec = 0;
+    itv.it_interval.tv_usec = 0;
+    itv.it_value.tv_sec = usec / 1000000;
+    itv.it_value.tv_usec = usec % 1000000;
+    setitimer(ITIMER_REAL, &itv, 0);
+}
 
 // Async-signal-safe: only records what arrived and from whom. The decision -
 // stop the trace or ignore a build-internal group signal - and the forwarding
@@ -193,7 +205,7 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
     , cnt_seccomp_stops_(0), cnt_plain_sigtrap_(0)
     , cnt_stuck_kicked_(0), cnt_resume_retries_(0), cnt_sig_ignored_(0)
-    , resume_count_(0)
+    , cnt_stale_entries_(0), resume_count_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -497,10 +509,10 @@ int PtraceBackend::run_event_loop() {
 
         // Arm the watchdog only around the blocking wait, so SIGALRM never
         // interrupts event processing / DB writes below.
-        alarm(WATCHDOG_TICK_SEC);
+        arm_watchdog(WATCHDOG_TICK_US);
         int status;
         pid_t pid = waitpid(-1, &status, __WALL);
-        alarm(0);
+        arm_watchdog(0);
 
         if (pid < 0) {
             if (errno == ECHILD) break;
@@ -604,7 +616,7 @@ int PtraceBackend::run_event_loop() {
     }
 
     // Restore original signal handlers
-    alarm(0);
+    arm_watchdog(0);
     sigaction(SIGINT, &g_old_sigint, 0);
     sigaction(SIGTERM, &g_old_sigterm, 0);
     sigaction(SIGALRM, &g_old_sigalrm, 0);
@@ -623,13 +635,13 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "mem reads=%ld peek fallbacks=%ld | "
         "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
         "plain sigtrap=%ld | stuck kicked=%ld resume retries=%ld | "
-        "internal sigs ignored=%ld\n",
+        "internal sigs ignored=%ld | stale entries=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
         cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
         cnt_plain_sigtrap_, cnt_stuck_kicked_, cnt_resume_retries_,
-        cnt_sig_ignored_);
+        cnt_sig_ignored_, cnt_stale_entries_);
 }
 
 // Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".
@@ -724,11 +736,11 @@ void PtraceBackend::check_stall() {
     if (seccomp_mode_ || procs_only_) {
         if (!any_ptrace_stopped) {
             last_stall_report_us_ = now;  // throttle the rescan
-            std::fprintf(stderr,
-                "[bdtrace] note: no ptrace events for %ds; %d process(es) "
-                "alive, none ptrace-stopped - the build itself appears to be "
-                "waiting (idle, I/O, or its own deadlock)\n",
-                (int)(gap / 1000000LL), (int)procs_.size());
+            // LOG_WARN so long quiet spells are traceable in <db>.log too
+            LOG_WARN("no ptrace events for %ds; %d process(es) alive, none "
+                     "ptrace-stopped - the build itself appears to be waiting "
+                     "(idle, I/O, or its own deadlock)",
+                     (int)(gap / 1000000LL), (int)procs_.size());
             // Dump what each survivor is blocked on so the deadlock (or the
             // slow step) can be identified from the trace output alone.
             const int MAX_IDLE_DUMP = 50;
@@ -757,10 +769,9 @@ void PtraceBackend::check_stall() {
     }
     last_stall_report_us_ = now;
 
-    std::fprintf(stderr,
-        "[bdtrace] *** STALL: no ptrace events for %ds, %d process(es) tracked, "
-        "tracer blocked in waitpid() ***\n",
-        (int)(gap / 1000000LL), (int)procs_.size());
+    LOG_WARN("STALL: no ptrace events for %ds, %d process(es) tracked, "
+             "tracer blocked in waitpid()",
+             (int)(gap / 1000000LL), (int)procs_.size());
     std::fprintf(stderr, "[bdtrace] ");
     print_diag_counters(stderr);
 
@@ -1236,6 +1247,19 @@ void PtraceBackend::handle_fork_event(int pid) {
     // place - do NOT overwrite it, or we would reset its 'traced' flag back to
     // false and mishandle a later stop. Only create a fresh entry if unseen.
     std::map<int, ProcessState>::iterator child_it = procs_.find((int)child_pid);
+    if (child_it != procs_.end() && child_it->second.ppid != 0) {
+        // Stale entry: a previous owner of this pid died but its exit report
+        // was lost (2.6.x utrace), and the kernel has reused the pid. A
+        // SIGSTOP-first race child would still have ppid == 0 here, so a
+        // filled-in ppid identifies leftovers. Drop it: keeping traced=true
+        // would re-inject the new child's initial SIGSTOP and stop it
+        // forever - the JVM-hang signature.
+        ++cnt_stale_entries_;
+        LOG_DEBUG("Dropping stale state for reused pid %d", (int)child_pid);
+        close_mem_fd(child_it->second);
+        procs_.erase(child_it);
+        child_it = procs_.end();
+    }
     if (child_it != procs_.end()) {
         child_it->second.ppid = pid;
         child_it->second.cached_cwd = cwd;

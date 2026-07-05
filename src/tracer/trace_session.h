@@ -110,6 +110,7 @@ private:
     std::set<int> live_pids_;       // pids whose current incarnation is alive
     std::set<int> expect_reinsert_; // delete_process'd, awaiting exec re-insert
     long pid_recycles_;
+    long lost_exit_starts_;  // pid reused while our books said it was alive
     int current_synth(int pid);
 
     // Writer thread state

@@ -16,7 +16,7 @@ TraceSession::TraceSession()
     , write_error_count_(0), consecutive_errors_(0)
     , total_event_count_(0)
     , process_count_(0), file_access_count_(0), failed_access_count_(0)
-    , dedup_dropped_(0), pid_recycles_(0)
+    , dedup_dropped_(0), pid_recycles_(0), lost_exit_starts_(0)
     , async_(false), stop_requested_(false)
     , db_size_cache_(0)
 {
@@ -218,11 +218,17 @@ void TraceSession::on_process_start(const ProcessRecord& rec) {
     std::map<int, int>::iterator g = pid_gen_.find(rec.pid);
     if (g == pid_gen_.end()) {
         pid_gen_.insert(std::make_pair(rec.pid, 0));
-    } else if (expect_reinsert_.erase(rec.pid) > 0 || live_pids_.count(rec.pid)) {
-        // exec re-image of the live incarnation: keep the same synthetic id
+    } else if (expect_reinsert_.erase(rec.pid) > 0) {
+        // exec re-image of the live incarnation (delete_process was just
+        // called for it): keep the same synthetic id
     } else {
         // The kernel recycled the pid of an exited process: new incarnation,
-        // or the pid row would collide with the finished one.
+        // or the pid row would collide with the finished one. This holds
+        // even if our books say the pid is still live - a start without the
+        // exec delete/insert sequence means the previous incarnation's exit
+        // report was lost (seen on 2.6.x utrace), because the kernel never
+        // reuses the pid of a process that is actually alive.
+        if (live_pids_.count(rec.pid)) ++lost_exit_starts_;
         ++g->second;
         ++pid_recycles_;
     }
@@ -325,6 +331,10 @@ void TraceSession::finalize() {
         if (pid_recycles_ > 0) {
             LOG_INFO("PID reuse: %ld recycled pids remapped to synthetic ids",
                      pid_recycles_);
+        }
+        if (lost_exit_starts_ > 0) {
+            LOG_WARN("%ld process exit reports were lost by the kernel; "
+                     "those rows have no end time", lost_exit_starts_);
         }
     }
     seen_.clear();

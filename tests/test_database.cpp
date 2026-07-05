@@ -249,6 +249,45 @@ void test_pid_recycle() {
     cleanup();
 }
 
+// 2.6.x utrace can lose exit reports entirely: the pid is reused while our
+// books still say the old incarnation is alive. A start without the exec
+// delete/insert sequence must still bump the generation (the kernel never
+// reuses a genuinely live pid), or the insert collides with the old row.
+void test_lost_exit_recycle() {
+    cleanup();
+    TraceSession session;
+    ASSERT_TRUE(session.open(TEST_DB));
+
+    ProcessRecord rec;
+    rec.pid = 700;
+    rec.ppid = 1;
+    rec.cmdline = "first-no-exit";
+    rec.start_time_us = 1000;
+    session.on_process_start(rec);
+
+    // No on_process_exit: the exit report was lost. Kernel reuses the pid.
+    rec.cmdline = "second-after-lost-exit";
+    rec.start_time_us = 2000;
+    session.on_process_start(rec);
+
+    session.on_process_exit(700, 3000, 0);
+    session.finalize();
+
+    Database& db = session.db();
+    ASSERT_EQ(db.get_process_count(), 2);
+
+    ProcessRecord first, second;
+    ASSERT_TRUE(db.get_process(700, first));
+    ASSERT_STR_EQ(first.cmdline.c_str(), "first-no-exit");
+    ASSERT_EQ(first.end_time_us, 0);  // its end was never seen
+
+    ASSERT_TRUE(db.get_process(10000700, second));
+    ASSERT_STR_EQ(second.cmdline.c_str(), "second-after-lost-exit");
+    ASSERT_EQ(second.end_time_us, 3000);
+
+    cleanup();
+}
+
 void run_database_tests() {
     std::printf("=== Database Tests ===\n");
 
@@ -260,4 +299,5 @@ void run_database_tests() {
     RUN_TEST(test_transaction);
     RUN_TEST(test_meta);
     RUN_TEST(test_pid_recycle);
+    RUN_TEST(test_lost_exit_recycle);
 }

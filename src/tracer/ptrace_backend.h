@@ -60,6 +60,7 @@ private:
     long cnt_stuck_kicked_;        // tracees found stuck in ptrace-stop by the watchdog
     long cnt_resume_retries_;      // lost resumes detected and retried on the spot
     long cnt_sig_ignored_;         // build-internal signals to bdtrace ignored
+    long cnt_stale_entries_;       // reused-pid leftovers dropped (lost exit reports)
     long resume_count_;            // total resumes issued (for fault injection)
 
     void check_stall();
