@@ -40,6 +40,7 @@ private:
     bool procs_only_;
     bool seccomp_allowed_;  // user permits trying the seccomp fast path
     bool seccomp_mode_;     // fast path active: filter installed, CONT resume
+    int64_t drain_deadline_us_; // 0 = not draining; else give up after this
 
     // Diagnostics: stall watchdog + signal/race counters (always on).
     int64_t last_event_us_;        // timestamp of the most recent waitpid() event
@@ -58,6 +59,7 @@ private:
     long cnt_plain_sigtrap_;       // SIGTRAP stops without the TRACESYSGOOD 0x80 bit
     long cnt_stuck_kicked_;        // tracees found stuck in ptrace-stop by the watchdog
     long cnt_resume_retries_;      // lost resumes detected and retried on the spot
+    long cnt_sig_ignored_;         // build-internal signals to bdtrace ignored
     long resume_count_;            // total resumes issued (for fault injection)
 
     void check_stall();

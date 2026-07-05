@@ -150,8 +150,10 @@ static bool kernel_supports_seccomp_trace() {
     return maj == 3 && min >= 5;
 }
 
-static volatile sig_atomic_t g_child_pid = 0;
-static volatile sig_atomic_t g_stop_requested = 0;
+static volatile sig_atomic_t g_sig_num = 0;    // last SIGINT/SIGTERM received
+static volatile sig_atomic_t g_sig_pid = 0;    // its sender pid (siginfo)
+static volatile sig_atomic_t g_sig_code = 0;   // its si_code
+static volatile sig_atomic_t g_sig_count = 0;  // unprocessed signal count
 static volatile sig_atomic_t g_alarm_fired = 0;
 static struct sigaction g_old_sigint;
 static struct sigaction g_old_sigterm;
@@ -162,11 +164,15 @@ static const int     WATCHDOG_TICK_SEC  = 2;            // SIGALRM granularity
 static const int64_t STALL_THRESHOLD_US = 10000000LL;   // 10s w/o events => suspect hang
 static const int64_t STALL_REPEAT_US    = 30000000LL;   // re-dump every 30s while stalled
 
-static void signal_handler(int sig) {
-    g_stop_requested = 1;
-    if (g_child_pid > 0) {
-        kill(g_child_pid, sig);
-    }
+// Async-signal-safe: only records what arrived and from whom. The decision -
+// stop the trace or ignore a build-internal group signal - and the forwarding
+// to the tracee happen in the event loop, which the EINTR from this handler
+// wakes up immediately.
+static void signal_handler(int sig, siginfo_t* info, void*) {
+    g_sig_num = sig;
+    g_sig_pid = info ? (sig_atomic_t)info->si_pid : 0;
+    g_sig_code = info ? (sig_atomic_t)info->si_code : 0;
+    if (g_sig_count < 100) ++g_sig_count;
 }
 
 // Async-signal-safe: only flips a flag. The actual stall check/dump runs back in
@@ -178,6 +184,7 @@ static void alarm_handler(int) {
 PtraceBackend::PtraceBackend(TraceSession& session)
     : session_(session), root_pid_(0), running_(false), procs_only_(false)
     , seccomp_allowed_(true), seccomp_mode_(false)
+    , drain_deadline_us_(0)
     , last_event_us_(0), last_stall_report_us_(0)
     , cnt_fork_events_(0), cnt_exec_events_(0)
     , cnt_sigstop_swallowed_(0), cnt_sig_reinjected_(0)
@@ -185,7 +192,8 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
     , cnt_seccomp_stops_(0), cnt_plain_sigtrap_(0)
-    , cnt_stuck_kicked_(0), cnt_resume_retries_(0), resume_count_(0)
+    , cnt_stuck_kicked_(0), cnt_resume_retries_(0), cnt_sig_ignored_(0)
+    , resume_count_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -252,11 +260,11 @@ int PtraceBackend::start(const std::vector<std::string>& argv) {
 
     // Parent
     root_pid_ = pid;
-    g_child_pid = pid;
 
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
+    sa.sa_sigaction = signal_handler;
+    sa.sa_flags = SA_SIGINFO;  // no SA_RESTART: waitpid must see EINTR
     sigaction(SIGINT, &sa, &g_old_sigint);
     sigaction(SIGTERM, &sa, &g_old_sigterm);
 
@@ -407,7 +415,11 @@ int PtraceBackend::run_event_loop() {
     sa_alrm.sa_handler = alarm_handler;
     sigaction(SIGALRM, &sa_alrm, &g_old_sigalrm);
 
-    while (running_ && !procs_.empty()) {
+    // Keep going until the traced tree is gone (waitpid ECHILD also breaks
+    // out). After a stop request, running_ goes false and the loop DRAINS:
+    // it keeps consuming events so the tracees' exits are recorded and no
+    // tracee is abandoned inside a ptrace-stop.
+    while (!procs_.empty()) {
         // P1.3: Progress reporting every 60 seconds
         int64_t now = now_us();
         if (now - last_report_time >= 60000000LL) {
@@ -440,10 +452,42 @@ int PtraceBackend::run_event_loop() {
             break;
         }
 
-        // P2.6: Graceful stop on signal - set running_ to false for natural drain
-        if (g_stop_requested && running_) {
-            LOG_INFO("Signal received, draining remaining events...");
-            running_ = false;
+        // Signals aimed at bdtrace itself. If the sender is one of our own
+        // tracees, this is a build-internal group-directed kill (e.g. a
+        // cleanup step doing "kill 0") that would not exist without bdtrace
+        // in the process group - ignore it or it aborts a build that
+        // completes fine untraced. Signals from outside the traced tree
+        // (terminal Ctrl-C: si_code SI_KERNEL; user kill: untraced sender)
+        // stop the trace as before.
+        if (g_sig_count > 0) {
+            int snum = (int)g_sig_num;
+            int spid = (int)g_sig_pid;
+            int scode = (int)g_sig_code;
+            g_sig_count = 0;
+            std::map<int, ProcessState>::iterator sit =
+                (scode <= 0 && spid > 0) ? procs_.find(spid) : procs_.end();
+            if (sit != procs_.end()) {
+                LOG_WARN("ignoring signal %d sent by traced pid %d (%s) - "
+                         "build-internal signal, trace continues",
+                         snum, spid, sit->second.cached_cmdline.c_str());
+                ++cnt_sig_ignored_;
+            } else if (running_) {
+                LOG_INFO("Signal %d received (sender pid %d, si_code %d): "
+                         "stopping trace, draining remaining events...",
+                         snum, spid, scode);
+                kill(root_pid_, snum);
+                running_ = false;
+                drain_deadline_us_ = now_us() + 30000000LL;
+            } else {
+                LOG_WARN("Second signal received, abandoning drain with %d "
+                         "process(es) still tracked", (int)procs_.size());
+                break;
+            }
+        }
+        if (!running_ && drain_deadline_us_ != 0 && now_us() > drain_deadline_us_) {
+            LOG_WARN("Drain timed out with %d process(es) still tracked",
+                     (int)procs_.size());
+            break;
         }
 
         // Arm the watchdog only around the blocking wait, so SIGALRM never
@@ -554,9 +598,8 @@ int PtraceBackend::run_event_loop() {
         }
     }
 
-    // Restore original signal handlers and clear stale PID
+    // Restore original signal handlers
     alarm(0);
-    g_child_pid = 0;
     sigaction(SIGINT, &g_old_sigint, 0);
     sigaction(SIGTERM, &g_old_sigterm, 0);
     sigaction(SIGALRM, &g_old_sigalrm, 0);
@@ -574,12 +617,14 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
         "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
-        "plain sigtrap=%ld | stuck kicked=%ld resume retries=%ld\n",
+        "plain sigtrap=%ld | stuck kicked=%ld resume retries=%ld | "
+        "internal sigs ignored=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
         cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
-        cnt_plain_sigtrap_, cnt_stuck_kicked_, cnt_resume_retries_);
+        cnt_plain_sigtrap_, cnt_stuck_kicked_, cnt_resume_retries_,
+        cnt_sig_ignored_);
 }
 
 // Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".

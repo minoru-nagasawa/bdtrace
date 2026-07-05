@@ -91,8 +91,12 @@ Notes:
   `generation × 10,000,000 + pid`. First uses keep the real pid, so short
   traces are unaffected; e.g. `10032417` in bdview means the second process
   that ran as pid 32417.
-- `SIGINT`/`SIGTERM` are forwarded to the traced command and the trace is drained
-  and finalized gracefully.
+- `SIGINT`/`SIGTERM` sent to bdtrace from outside the build (terminal Ctrl-C, a
+  user `kill`) are forwarded to the traced command and the trace is drained and
+  finalized gracefully (up to 30 s; a second signal aborts the drain). Signals
+  whose sender is one of the traced processes — e.g. a build step that kills its
+  own process group — are ignored and logged, so they don't abort a build that
+  would complete fine untraced.
 - Progress (processes, files, events/s, DB size) is printed to stderr every 60 s,
   plus diagnostic counters at exit.
 - Indexes are built when the trace finishes; a database from an interrupted trace
