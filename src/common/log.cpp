@@ -21,6 +21,12 @@ void log_set_file(const char* path) {
     g_log_file_path = (path && *path) ? path : "";
 }
 
+const char* log_file_path() {
+    // Only meaningful once the lazy open actually happened (= something
+    // was written); otherwise no file exists.
+    return g_log_file ? g_log_file_path.c_str() : "";
+}
+
 void log_msg(LogLevel level, const char* fmt, ...) {
     bool to_console = (level <= g_log_level);
     bool to_file = (level <= LOG_WARN && !g_log_file_path.empty());
@@ -59,7 +65,11 @@ void log_msg(LogLevel level, const char* fmt, ...) {
         // Lazy open: no file is created unless something actually goes wrong
         if (!g_log_file) {
             g_log_file = std::fopen(g_log_file_path.c_str(), "a");
-            if (!g_log_file) g_log_file_path.clear();  // don't retry forever
+            if (!g_log_file) {
+                std::fprintf(stderr, "[bdtrace] could not open log file %s\n",
+                             g_log_file_path.c_str());
+                g_log_file_path.clear();  // don't retry forever
+            }
         }
         if (g_log_file) {
             std::fprintf(g_log_file, "%s%s%s\n", ts, prefix, msg);

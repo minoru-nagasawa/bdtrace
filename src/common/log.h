@@ -19,6 +19,8 @@ void log_init(LogLevel level);
 // Append WARN/ERROR messages to this file as well as stderr (pass 0/empty to
 // disable). The file is created lazily on the first warning or error.
 void log_set_file(const char* path);
+// Non-empty once something was actually written to the log file.
+const char* log_file_path();
 void log_msg(LogLevel level, const char* fmt, ...);
 
 } // namespace bdtrace

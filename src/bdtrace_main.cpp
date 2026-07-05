@@ -100,5 +100,9 @@ int main(int argc, char* argv[]) {
     int rc = backend.run_event_loop();
 
     LOG_INFO("Trace complete. Database: %s", db_path.c_str());
+    if (*bdtrace::log_file_path()) {
+        LOG_INFO("Warnings/errors were also saved to: %s",
+                 bdtrace::log_file_path());
+    }
     return rc;
 }

@@ -353,22 +353,27 @@ void PtraceBackend::resume(int pid, long sig) {
 // Harmless if racing with a genuine wake-up: PTRACE_CONT on a running task
 // just fails with ESRCH. Returns true if a retry was issued.
 bool PtraceBackend::kick_if_stuck(int pid, long sig) {
-    std::string st = read_proc_state(pid);
-    if (st.find("tracing") == std::string::npos) return false;
+    bool kicked = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::string st = read_proc_state(pid);
+        if (st.find("tracing") == std::string::npos) return kicked;
 
-    siginfo_t si;
-    std::memset(&si, 0, sizeof(si));
-    if (waitid(P_PID, (id_t)pid, &si,
-               WEXITED | WSTOPPED | WNOHANG | WNOWAIT) == 0
-        && si.si_pid == pid) {
-        return false;  // it stopped again; the event loop will handle it
+        siginfo_t si;
+        std::memset(&si, 0, sizeof(si));
+        if (waitid(P_PID, (id_t)pid, &si,
+                   WEXITED | WSTOPPED | WNOHANG | WNOWAIT) == 0
+            && si.si_pid == pid) {
+            return kicked;  // it stopped again; the event loop will handle it
+        }
+
+        ++cnt_resume_retries_;
+        LOG_DEBUG("resume lost for pid %d (state=%s), retrying", pid, st.c_str());
+        PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
+           pid, 0, sig);
+        kicked = true;
+        usleep(1000);  // give the wake-up a moment, then re-verify
     }
-
-    ++cnt_resume_retries_;
-    LOG_DEBUG("resume lost for pid %d (state=%s), retrying", pid, st.c_str());
-    PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
-       pid, 0, sig);
-    return true;
+    return kicked;
 }
 
 bool PtraceBackend::set_ptrace_options(int pid) {
@@ -671,20 +676,19 @@ std::string PtraceBackend::read_proc_state(int pid) {
 // tracee is stuck and why (notably any process in 'T (stopped)' that we believe
 // we already continued, the signature of a mishandled SIGSTOP).
 void PtraceBackend::check_stall() {
+    if (procs_.empty()) return;
     int64_t now = now_us();
     int64_t gap = now - last_event_us_;
-    if (gap < STALL_THRESHOLD_US) return;
-    if (!running_ || procs_.empty()) return;
-    if (last_stall_report_us_ != 0 && (now - last_stall_report_us_) < STALL_REPEAT_US) return;
 
-    // Scan tracee states first. "tracing stop" is reported as 'T' on older
-    // kernels and 't' on newer ones - match the words, not the letter. A
-    // tracee sitting in ptrace-stop while the tracer has been idle in
-    // waitpid() for STALL_THRESHOLD_US means its stop notification was
-    // consumed but our resume never took effect (races of this kind exist in
-    // RHEL 2.6.x utrace-based ptrace); with a multi-threaded tracee (JVM)
-    // every other thread then waits on it forever. Self-heal: re-issue the
-    // mode-appropriate resume and report what we did.
+    // --- Recovery scan: runs on EVERY watchdog tick (we only get here after
+    // the blocked waitpid went >= 2s without events). "tracing stop" is 'T'
+    // on older kernels, 't' on newer ones - match the word. A tracee sitting
+    // in ptrace-stop with no queued notification while the tracer idles is
+    // stuck: 2.6.x utrace ptrace can lose both resumes and stop
+    // notifications, and with a multi-threaded tracee (JVM) every other
+    // thread then waits on it forever. Kicking at tick granularity instead
+    // of the 10s report threshold keeps the wall-clock distortion to a
+    // couple of seconds. Also runs while draining after a stop request.
     bool any_ptrace_stopped = false;
     {
         int checked = 0;
@@ -696,8 +700,8 @@ void PtraceBackend::check_stall() {
                 if (kick_if_stuck(it->first, 0)) {
                     ++cnt_stuck_kicked_;
                     // LOG_WARN so this also lands in the <db>.log error file
-                    LOG_WARN("pid %d stuck in ptrace-stop (state=%s) with no "
-                             "events for %ds - re-resuming it",
+                    LOG_WARN("pid %d was stuck in ptrace-stop (state=%s, no "
+                             "events for %ds) - re-resumed it",
                              it->first, st.c_str(), (int)(gap / 1000000LL));
                 }
             } else if (!st.empty() && (st[0] == 'T' || st[0] == 't')) {
@@ -707,6 +711,11 @@ void PtraceBackend::check_stall() {
             }
         }
     }
+
+    // --- Reporting: throttled, and only for long gaps. ---
+    if (gap < STALL_THRESHOLD_US) return;
+    if (!running_) return;
+    if (last_stall_report_us_ != 0 && (now - last_stall_report_us_) < STALL_REPEAT_US) return;
 
     // In seccomp/procs-only modes, long gaps without events are normal (a
     // compiler can crunch for minutes without touching a traced syscall).
