@@ -56,7 +56,8 @@ private:
     long cnt_phase_resyncs_;       // entry/exit phase toggle disagreed with ENOSYS check
     long cnt_seccomp_stops_;       // PTRACE_EVENT_SECCOMP stops (fast path)
     long cnt_plain_sigtrap_;       // SIGTRAP stops without the TRACESYSGOOD 0x80 bit
-    long cnt_stuck_kicked_;        // tracees found stuck in ptrace-stop and re-resumed
+    long cnt_stuck_kicked_;        // tracees found stuck in ptrace-stop by the watchdog
+    long cnt_resume_retries_;      // lost resumes detected and retried on the spot
     long resume_count_;            // total resumes issued (for fault injection)
 
     void check_stall();
@@ -67,6 +68,7 @@ private:
     void setup_child(int pid);
     bool set_ptrace_options(int pid);
     void resume(int pid, long sig);
+    bool kick_if_stuck(int pid, long sig);
     void handle_syscall_stop(int pid, ProcessState& ps);
     void handle_seccomp_stop(int pid, ProcessState& ps);
     void decode_syscall_entry(ProcessState& ps, const user_regs_struct& regs,

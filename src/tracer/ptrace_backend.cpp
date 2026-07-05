@@ -185,7 +185,7 @@ PtraceBackend::PtraceBackend(TraceSession& session)
     , cnt_mem_reads_(0), cnt_peek_fallbacks_(0)
     , cnt_getregs_skipped_(0), cnt_phase_resyncs_(0)
     , cnt_seccomp_stops_(0), cnt_plain_sigtrap_(0)
-    , cnt_stuck_kicked_(0), resume_count_(0)
+    , cnt_stuck_kicked_(0), cnt_resume_retries_(0), resume_count_(0)
 {}
 
 PtraceBackend::~PtraceBackend() {
@@ -324,12 +324,43 @@ void PtraceBackend::resume(int pid, long sig) {
         drop_nth = e ? std::atol(e) : -1;
     }
     if (drop_nth >= 0 && ++resume_count_ == drop_nth) {
+        // Skip only the ptrace call itself, like a kernel-side lost resume:
+        // the on-the-spot verification below must still run.
         LOG_WARN("TEST: dropping resume #%ld for pid %d", drop_nth, pid);
-        return;
+    } else {
+        PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
+           pid, 0, sig);
     }
 
+    // In procs-only mode resumes are rare (a handful per process), so verify
+    // each one on the spot instead of waiting for the 10s watchdog.
+    if (procs_only_) kick_if_stuck(pid, sig);
+}
+
+// A resume can be lost on 2.6.x utrace-based ptrace (seen in the field right
+// after attaching a fresh JVM thread), leaving the tracee in tracing-stop
+// forever. Check whether the tracee is still in ptrace-stop; if so - and only
+// if no new stop notification is already queued for the event loop (peeked
+// with WNOWAIT, which does not consume it) - issue the resume again.
+// Harmless if racing with a genuine wake-up: PTRACE_CONT on a running task
+// just fails with ESRCH. Returns true if a retry was issued.
+bool PtraceBackend::kick_if_stuck(int pid, long sig) {
+    std::string st = read_proc_state(pid);
+    if (st.find("tracing") == std::string::npos) return false;
+
+    siginfo_t si;
+    std::memset(&si, 0, sizeof(si));
+    if (waitid(P_PID, (id_t)pid, &si,
+               WEXITED | WSTOPPED | WNOHANG | WNOWAIT) == 0
+        && si.si_pid == pid) {
+        return false;  // it stopped again; the event loop will handle it
+    }
+
+    ++cnt_resume_retries_;
+    LOG_DEBUG("resume lost for pid %d (state=%s), retrying", pid, st.c_str());
     PT((procs_only_ || seccomp_mode_) ? PTRACE_CONT : PTRACE_SYSCALL,
        pid, 0, sig);
+    return true;
 }
 
 bool PtraceBackend::set_ptrace_options(int pid) {
@@ -509,6 +540,10 @@ int PtraceBackend::run_event_loop() {
             ps.traced = true;
             ++cnt_sigstop_swallowed_;
             resume(pid, 0);
+            // The first resume of a freshly attached child is where 2.6.x
+            // utrace loses resumes; verify it in every mode (cheap: once per
+            // process). procs-only already verified inside resume().
+            if (!procs_only_) kick_if_stuck(pid, 0);
         } else {
             // Re-inject any other signal to the tracee. A SIGSTOP reaching here
             // (i.e. for an already-traced process) is a red flag: it leaves the
@@ -539,12 +574,12 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         "reinjected=%ld (sigstop=%ld) | unknown-pid-first races=%ld | "
         "mem reads=%ld peek fallbacks=%ld | "
         "getregs skipped=%ld phase resyncs=%ld | seccomp stops=%ld | "
-        "plain sigtrap=%ld | stuck kicked=%ld\n",
+        "plain sigtrap=%ld | stuck kicked=%ld resume retries=%ld\n",
         cnt_fork_events_, cnt_exec_events_, cnt_sigstop_swallowed_,
         cnt_sig_reinjected_, cnt_sigstop_reinjected_, cnt_race_unknown_first_,
         cnt_mem_reads_, cnt_peek_fallbacks_,
         cnt_getregs_skipped_, cnt_phase_resyncs_, cnt_seccomp_stops_,
-        cnt_plain_sigtrap_, cnt_stuck_kicked_);
+        cnt_plain_sigtrap_, cnt_stuck_kicked_, cnt_resume_retries_);
 }
 
 // Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".
@@ -613,12 +648,13 @@ void PtraceBackend::check_stall() {
             std::string st = read_proc_state(it->first);
             if (st.find("tracing") != std::string::npos) {
                 any_ptrace_stopped = true;
-                ++cnt_stuck_kicked_;
-                // LOG_WARN so this also lands in the <db>.log error file
-                LOG_WARN("pid %d stuck in ptrace-stop (state=%s) with no "
-                         "events for %ds - re-resuming it",
-                         it->first, st.c_str(), (int)(gap / 1000000LL));
-                resume(it->first, 0);
+                if (kick_if_stuck(it->first, 0)) {
+                    ++cnt_stuck_kicked_;
+                    // LOG_WARN so this also lands in the <db>.log error file
+                    LOG_WARN("pid %d stuck in ptrace-stop (state=%s) with no "
+                             "events for %ds - re-resuming it",
+                             it->first, st.c_str(), (int)(gap / 1000000LL));
+                }
             } else if (!st.empty() && (st[0] == 'T' || st[0] == 't')) {
                 // Group-stop (job control): suspicious enough to report the
                 // full dump below, but not ours to auto-resume.
