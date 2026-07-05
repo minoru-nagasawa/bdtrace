@@ -100,6 +100,18 @@ private:
     std::map<int, SeenSet> seen_;
     long dedup_dropped_;
 
+    // PID recycling: kernel pids wrap (pid_max defaults to 32768 on Linux
+    // 2.6), so a long build reuses pids of exited processes while
+    // processes.pid is the primary key. Track a generation per real pid and
+    // remap every event to a synthetic id (generation * 10,000,000 + pid;
+    // generation 0 keeps the real pid, so short traces are unaffected). An
+    // exec re-image (delete_process + on_process_start) keeps its generation.
+    std::map<int, int> pid_gen_;
+    std::set<int> live_pids_;       // pids whose current incarnation is alive
+    std::set<int> expect_reinsert_; // delete_process'd, awaiting exec re-insert
+    long pid_recycles_;
+    int current_synth(int pid);
+
     // Writer thread state
     bool async_;                    // writer thread running; enqueue instead of write
     bool stop_requested_;

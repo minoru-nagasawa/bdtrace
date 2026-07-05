@@ -61,6 +61,7 @@ SQLite database. Trace overhead depends on how syscall-heavy the build is; the
 | `-o FILE` | Output database file. Default: `bdtrace.db` |
 | `--procs-only` | Record only the process tree (fork/exec/exit, durations, CPU/RSS/I/O). File accesses are not traced — tracees run under `PTRACE_CONT` at near-native speed. The exec'd binary of each process is still recorded. |
 | `--no-seccomp` | Disable the seccomp-BPF fast path and always use classic full syscall tracing (see below). The `BDTRACE_NO_SECCOMP` environment variable does the same. |
+| `--log-file F` | Also append WARN/ERROR messages to F. Default: `<output db>.log`; pass an empty string to disable. The file is only created if something is actually logged. |
 | `-v` | Verbose output (debug logging) |
 | `-h` | Show help |
 | `--` | End of options; everything after is the command to trace |
@@ -85,6 +86,11 @@ Notes:
 - Repeated identical accesses (same path + mode, per process incarnation) are
   deduplicated in memory and stored once.
 - Accesses under `/dev/`, `/proc/`, and `/sys/` are filtered out.
+- Kernel pid reuse (pids wrap at `pid_max`, 32768 on Linux 2.6, so long builds
+  recycle them) is handled by remapping each reuse to a synthetic id:
+  `generation × 10,000,000 + pid`. First uses keep the real pid, so short
+  traces are unaffected; e.g. `10032417` in bdview means the second process
+  that ran as pid 32417.
 - `SIGINT`/`SIGTERM` are forwarded to the traced command and the trace is drained
   and finalized gracefully.
 - Progress (processes, files, events/s, DB size) is printed to stderr every 60 s,

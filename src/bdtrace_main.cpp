@@ -20,6 +20,8 @@ static void usage() {
         "                tracees run at near-native speed\n"
         "  --no-seccomp  Disable the seccomp-BPF fast path (kernel >= 3.5);\n"
         "                always use classic full syscall tracing\n"
+        "  --log-file F  Also append WARN/ERROR messages to F\n"
+        "                (default: <output db>.log; \"\" disables)\n"
         "  -v            Verbose output (debug logging)\n"
         "  -h            Show this help\n"
         "  --            End of options; the command follows\n"
@@ -31,6 +33,8 @@ int main(int argc, char* argv[]) {
     bdtrace::LogLevel log_level = bdtrace::LOG_INFO;
     bool procs_only = false;
     bool no_seccomp = false;
+    std::string log_file;
+    bool log_file_set = false;
 
     int cmd_start = 1;
     for (int i = 1; i < argc; ++i) {
@@ -42,6 +46,10 @@ int main(int argc, char* argv[]) {
             cmd_start = i + 1;
         } else if (std::strcmp(argv[i], "--no-seccomp") == 0) {
             no_seccomp = true;
+            cmd_start = i + 1;
+        } else if (std::strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            log_file = argv[++i];
+            log_file_set = true;
             cmd_start = i + 1;
         } else if (std::strcmp(argv[i], "-v") == 0) {
             log_level = bdtrace::LOG_DEBUG;
@@ -67,6 +75,8 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
     bdtrace::log_init(log_level);
+    if (!log_file_set) log_file = db_path + ".log";
+    bdtrace::log_set_file(log_file.c_str());
 
     std::vector<std::string> cmd_argv;
     for (int i = cmd_start; i < argc; ++i) {

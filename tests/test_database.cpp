@@ -2,6 +2,7 @@
 #include "../src/common/types.h"
 #include "../src/common/log.h"
 #include "../src/db/database.h"
+#include "../src/tracer/trace_session.h"
 
 #include <unistd.h>
 #include <string>
@@ -181,6 +182,73 @@ void test_meta() {
     cleanup();
 }
 
+// Kernel pid recycling: a long build reuses pids of exited processes
+// (pid_max is 32768 on Linux 2.6). TraceSession must remap the reused pid to
+// a fresh synthetic id instead of colliding with the finished row, while an
+// exec re-image (delete + start) keeps its id.
+void test_pid_recycle() {
+    cleanup();
+    TraceSession session;
+    ASSERT_TRUE(session.open(TEST_DB));
+
+    ProcessRecord rec;
+    rec.pid = 500;
+    rec.ppid = 1;
+    rec.cmdline = "first-incarnation";
+    rec.start_time_us = 1000;
+    session.on_process_start(rec);
+
+    FileAccessRecord fa;
+    fa.pid = 500;
+    fa.filename = "/tmp/first.txt";
+    fa.mode = FA_READ;
+    fa.timestamp_us = 1500;
+    session.on_file_access(fa);
+
+    // exec re-image: same process, record replaced under the SAME id
+    session.delete_process(500);
+    rec.cmdline = "first-execed";
+    rec.start_time_us = 2000;
+    session.on_process_start(rec);
+
+    session.on_process_exit(500, 3000, 0);
+
+    // kernel reuses pid 500 for a brand-new process
+    rec.cmdline = "second-incarnation";
+    rec.start_time_us = 4000;
+    session.on_process_start(rec);
+
+    fa.filename = "/tmp/second.txt";
+    fa.timestamp_us = 4500;
+    session.on_file_access(fa);
+
+    session.on_process_exit(500, 5000, 0);
+    session.finalize();
+
+    Database& db = session.db();
+    ASSERT_EQ(db.get_process_count(), 2);
+
+    ProcessRecord first, second;
+    ASSERT_TRUE(db.get_process(500, first));
+    ASSERT_STR_EQ(first.cmdline.c_str(), "first-execed");
+    ASSERT_EQ(first.end_time_us, 3000);
+
+    ASSERT_TRUE(db.get_process(10000500, second));  // gen 1 synthetic id
+    ASSERT_STR_EQ(second.cmdline.c_str(), "second-incarnation");
+    ASSERT_EQ(second.end_time_us, 5000);
+
+    // File accesses attach to the right incarnation
+    std::vector<FileAccessRecord> fa1, fa2;
+    ASSERT_TRUE(db.get_file_accesses_by_pid(500, fa1));
+    ASSERT_EQ((int)fa1.size(), 1);
+    ASSERT_STR_EQ(fa1[0].filename.c_str(), "/tmp/first.txt");
+    ASSERT_TRUE(db.get_file_accesses_by_pid(10000500, fa2));
+    ASSERT_EQ((int)fa2.size(), 1);
+    ASSERT_STR_EQ(fa2[0].filename.c_str(), "/tmp/second.txt");
+
+    cleanup();
+}
+
 void run_database_tests() {
     std::printf("=== Database Tests ===\n");
 
@@ -191,4 +259,5 @@ void run_database_tests() {
     RUN_TEST(test_children);
     RUN_TEST(test_transaction);
     RUN_TEST(test_meta);
+    RUN_TEST(test_pid_recycle);
 }

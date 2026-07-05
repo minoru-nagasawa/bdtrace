@@ -16,6 +16,9 @@ enum LogLevel {
 extern LogLevel g_log_level;
 
 void log_init(LogLevel level);
+// Append WARN/ERROR messages to this file as well as stderr (pass 0/empty to
+// disable). The file is created lazily on the first warning or error.
+void log_set_file(const char* path);
 void log_msg(LogLevel level, const char* fmt, ...);
 
 } // namespace bdtrace

@@ -16,7 +16,7 @@ TraceSession::TraceSession()
     , write_error_count_(0), consecutive_errors_(0)
     , total_event_count_(0)
     , process_count_(0), file_access_count_(0), failed_access_count_(0)
-    , dedup_dropped_(0)
+    , dedup_dropped_(0), pid_recycles_(0)
     , async_(false), stop_requested_(false)
     , db_size_cache_(0)
 {
@@ -64,6 +64,14 @@ bool TraceSession::open(const std::string& db_path) {
 
     pthread_sigmask(SIG_SETMASK, &old_set, 0);
     return true;
+}
+
+static const int PID_GEN_STRIDE = 10000000;  // > pid_max on any Linux
+
+int TraceSession::current_synth(int pid) {
+    std::map<int, int>::iterator it = pid_gen_.find(pid);
+    if (it == pid_gen_.end() || it->second == 0) return pid;
+    return it->second * PID_GEN_STRIDE + pid;
 }
 
 bool TraceSession::already_seen(int pid, long key, const std::string& filename) {
@@ -206,9 +214,25 @@ void TraceSession::on_process_start(const ProcessRecord& rec) {
     if (has_fatal_errors()) return;
     // New incarnation of this pid (fork or exec): forget previous accesses
     seen_.erase(rec.pid);
+
+    std::map<int, int>::iterator g = pid_gen_.find(rec.pid);
+    if (g == pid_gen_.end()) {
+        pid_gen_.insert(std::make_pair(rec.pid, 0));
+    } else if (expect_reinsert_.erase(rec.pid) > 0 || live_pids_.count(rec.pid)) {
+        // exec re-image of the live incarnation: keep the same synthetic id
+    } else {
+        // The kernel recycled the pid of an exited process: new incarnation,
+        // or the pid row would collide with the finished one.
+        ++g->second;
+        ++pid_recycles_;
+    }
+    live_pids_.insert(rec.pid);
+
     QueuedEvent ev;
     ev.type = QueuedEvent::EV_PROC_START;
     ev.proc = rec;
+    ev.proc.pid = current_synth(rec.pid);
+    ev.proc.ppid = current_synth(rec.ppid);
     enqueue(ev);
     ++process_count_;
 }
@@ -221,7 +245,9 @@ void TraceSession::on_process_exit(int pid, int64_t end_time_us, int exit_code,
     seen_.erase(pid);
     QueuedEvent ev;
     ev.type = QueuedEvent::EV_PROC_EXIT;
-    ev.pid = pid;
+    ev.pid = current_synth(pid);
+    live_pids_.erase(pid);
+    expect_reinsert_.erase(pid);
     ev.end_time_us = end_time_us;
     ev.exit_code = exit_code;
     ev.user_time_us = user_time_us;
@@ -238,6 +264,7 @@ void TraceSession::on_file_access(const FileAccessRecord& rec) {
     QueuedEvent ev;
     ev.type = QueuedEvent::EV_FILE_ACCESS;
     ev.fa = rec;
+    ev.fa.pid = current_synth(rec.pid);
     enqueue(ev);
     ++file_access_count_;
 }
@@ -250,6 +277,7 @@ void TraceSession::on_failed_access(const FailedAccessRecord& rec) {
     QueuedEvent ev;
     ev.type = QueuedEvent::EV_FAILED_ACCESS;
     ev.failed = rec;
+    ev.failed.pid = current_synth(rec.pid);
     enqueue(ev);
     ++failed_access_count_;
 }
@@ -258,7 +286,10 @@ void TraceSession::delete_process(int pid) {
     if (has_fatal_errors()) return;
     QueuedEvent ev;
     ev.type = QueuedEvent::EV_DELETE_PROC;
-    ev.pid = pid;
+    ev.pid = current_synth(pid);
+    // The exec flow re-inserts this pid right after; that re-insert belongs
+    // to the SAME incarnation, not a kernel pid reuse.
+    expect_reinsert_.insert(pid);
     enqueue(ev);
 }
 
@@ -290,6 +321,10 @@ void TraceSession::finalize() {
         }
         if (dedup_dropped_ > 0) {
             LOG_INFO("Dedup: %ld repeated accesses not written", dedup_dropped_);
+        }
+        if (pid_recycles_ > 0) {
+            LOG_INFO("PID reuse: %ld recycled pids remapped to synthetic ids",
+                     pid_recycles_);
         }
     }
     seen_.clear();
