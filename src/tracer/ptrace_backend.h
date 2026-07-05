@@ -60,6 +60,7 @@ private:
     void check_stall();
     void print_diag_counters(FILE* out);
     std::string read_proc_state(int pid);
+    std::string read_proc_wchan(int pid);
 
     void setup_child(int pid);
     bool set_ptrace_options(int pid);

@@ -533,6 +533,20 @@ void PtraceBackend::print_diag_counters(FILE* out) {
         cnt_plain_sigtrap_);
 }
 
+// Symbolic wait channel, e.g. "pipe_wait", "do_wait", "futex_wait_queue_me".
+// Tells what a sleeping process is blocked on; empty/"0" while running.
+std::string PtraceBackend::read_proc_wchan(int pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/wchan", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return "";
+    char buf[128];
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    return std::string(buf);
+}
+
 std::string PtraceBackend::read_proc_state(int pid) {
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -589,6 +603,29 @@ void PtraceBackend::check_stall() {
                 "alive, none ptrace-stopped - the build itself appears to be "
                 "waiting (idle, I/O, or its own deadlock)\n",
                 (int)(gap / 1000000LL), (int)procs_.size());
+            // Dump what each survivor is blocked on so the deadlock (or the
+            // slow step) can be identified from the trace output alone.
+            const int MAX_IDLE_DUMP = 50;
+            int shown = 0;
+            for (std::map<int, ProcessState>::iterator it = procs_.begin();
+                 it != procs_.end(); ++it) {
+                if (shown >= MAX_IDLE_DUMP) {
+                    std::fprintf(stderr, "[bdtrace]   ... and %d more process(es)\n",
+                                 (int)procs_.size() - shown);
+                    break;
+                }
+                std::string st = read_proc_state(it->first);
+                std::string wc = read_proc_wchan(it->first);
+                std::string cmd = it->second.cached_cmdline;
+                if (cmd.size() > 60) cmd = cmd.substr(0, 57) + "...";
+                std::fprintf(stderr,
+                    "[bdtrace]   pid=%d ppid=%d state=%s wchan=%s cmd=%s\n",
+                    it->first, it->second.ppid,
+                    st.empty() ? "?" : st.c_str(),
+                    wc.empty() ? "?" : wc.c_str(),
+                    cmd.empty() ? "?" : cmd.c_str());
+                ++shown;
+            }
             return;
         }
     }
