@@ -1668,7 +1668,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 // --- Main ---
 static void usage() {
     std::fprintf(stderr,
-        "Usage: bdview-web <database.db> [options]\n"
+        "Usage: bdview-web [options] <database.db> [options]\n"
         "\n"
         "Options:\n"
         "  --port PORT          HTTP port (default: 8080)\n"
@@ -1680,16 +1680,11 @@ static void usage() {
 int main(int argc, char* argv[]) {
     bdtrace::log_init(bdtrace::LOG_WARN);
 
-    if (argc < 2) {
-        usage();
-        return 1;
-    }
-
-    std::string db_path = argv[1];
+    std::string db_path;
     int port = 8080;
     std::string bind_addr = "127.0.0.1";
 
-    for (int i = 2; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -1699,7 +1694,22 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
+        } else if (argv[i][0] == '-') {
+            std::fprintf(stderr, "Unknown or incomplete option: %s\n\n", argv[i]);
+            usage();
+            return 1;
+        } else if (db_path.empty()) {
+            db_path = argv[i];
+        } else {
+            std::fprintf(stderr, "Unexpected extra argument: %s\n\n", argv[i]);
+            usage();
+            return 1;
         }
+    }
+
+    if (db_path.empty()) {
+        usage();
+        return 1;
     }
 
     Database db;
